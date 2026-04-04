@@ -1,0 +1,36 @@
+{
+    "UI": {
+      "JointSpace": {
+        "Joint1": {
+          "name": "Joint 1",
+          "min": -180,
+          "max": 180
+        },
+        "Joint2": {
+          "name": "Joint 2",
+          "min": -180,
+          "max": 180
+        },
+        "Joint3": {
+          "name": "Joint 3",
+          "min": -180,
+          "max": 180
+        },
+        "Joint4": {
+          "name": "Joint 4",
+          "min": -180,
+          "max": 180
+        },
+        "Joint5": {
+          "name": "Joint 5",
+          "min": -180,
+          "max": 180
+        },
+        "Joint6": {
+          "name": "Joint 6",
+          "min": -180,
+          "max": 180
+        }
+      }
+    }
+  }

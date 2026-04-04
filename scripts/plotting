@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+
+import sys 
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import numpy as np
+from numpy.random import rand
+
+
+def onpick1(event):
+    if isinstance(event.artist, Line2D):
+        thisline = event.artist
+        xdata = thisline.get_xdata()
+        ydata = thisline.get_ydata()
+        ind = event.ind
+        points = tuple(zip(xdata[ind], ydata[ind]))
+        print('onpick points:', points)
+
+
+strFilename = "DataLog.csv"
+if len(sys.argv) > 1:
+    strFilename = str(sys.argv[1])
+
+
+with open(strFilename) as f:
+    lines = f.readlines()
+    dt = [float(line.split()[0]) for line in lines]
+    timestamp = [int(line.split()[1]) for line in lines]
+    tarpos = [float(line.split()[2]) for line in lines]
+    actpos = [float(line.split()[3]) for line in lines]
+    acttor = [float(line.split()[4]) for line in lines]
+
+dt = np.array(dt)
+ts = np.array(timestamp)
+tarposs = np.array(tarpos)
+actposs = np.array(actpos)
+acttors = np.array(acttor)
+zero_array = np.zeros(tarposs.size)
+
+plt.ion()
+fig = plt.figure()
+ax1 = fig.add_subplot(2,1,1)
+ax1.plot(ts, zero_array, 'k:')
+ax1.plot(ts, actposs, 'r', marker=".", markersize=0.5, picker=True, pickradius=1)
+ax1.plot(ts, tarposs, 'b')
+
+ax2 = fig.add_subplot(2,1,2)
+ax2.plot(ts, zero_array, 'k:')
+ax2.plot(ts, acttors, ':r', picker=True, pickradius=1)
+
+fig.canvas.mpl_connect('pick_event', onpick1)
+plt.show(block=False)
+
+while True:
+    plt.pause(1)
+    pass
