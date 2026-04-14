@@ -560,4 +560,4 @@ obj/Indy7Ctrl.o: Indy7Ctrl.cpp /usr/include/stdc-predef.h Indy7Ctrl.h \
  /usr/local/include/rbdl/Constraint_Contact.h \
  /usr/local/include/rbdl/Constraint_Loop.h \
  /usr/local/include/rbdl/rbdl_utils.h \
- /usr/local/include/rbdl/addons/urdfreader/urdfreader.h
+ /usr/local/include/rbdl/addons/urdfreader/urdfreader.h DataRecorder.h

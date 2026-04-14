@@ -15,7 +15,8 @@
 #include "AxisNRMKCore.h"
 #include "SensorNRMKEndTool.h"
 #include "FullDynControllerRT.h"
-
+//jieun
+#include "DataRecorder.h"
 
 typedef std::vector<double> VECDOUBLE;
 typedef std::list<UINT64>   LISTULONG;
@@ -96,5 +97,9 @@ private:
     std::vector<double> m_vCurrentVel;
     std::vector<double> m_vCurrentTor;
     std::vector<double> m_vOutputTorque;
+
+	//jiuen
+    LogRingBuffer m_logBuffer;
+
 }; 
 #endif //__ROBOT_EXAMPLE_APP__

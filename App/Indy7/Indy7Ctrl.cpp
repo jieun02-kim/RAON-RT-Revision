@@ -21,6 +21,7 @@ void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
 
 
+
 /****************************************************************************/
 CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
 {
@@ -632,6 +633,21 @@ void proc_main_control(void* apRobot)
             }
         }
 
+
+        // jieun
+        //======================================================================                
+        ST_LOG_ENTRY entry;
+        entry.timestamp_ns = read_timer();
+        for (int i = 0; i < udof; ++i) {
+            entry.q[i]     = pRobot->m_vCurrentPos[i];
+            entry.qd[i]    = pRobot->m_vCurrentVel[i];
+            entry.tau[i]   = pRobot->m_vOutputTorque[i];
+            // q_ref는 controller에서 getter로
+        }
+        entry.ctrl_mode = (uint8_t)pRTController->GetControlMode();
+        pRobot->m_logBuffer.push(entry);  // atomic push, 블로킹 없음
+        //======================================================================
+
         /* Turn On LED depending on control mode */
         BOOL bBlink = pRobot->IsMoving();
         switch(pRTController->GetControlMode())
@@ -836,8 +852,52 @@ proc_terminal_output(void* apRobot)
 void
 proc_logger(void* apRobot)
 {
+    CRobotIndy7* pRobot = (CRobotIndy7*)apRobot;
+    const char* log_dir = "./rt_log_results";
+    mkdir(log_dir, 0777);
 
-    return;
+    // 파일명 생성
+    char time_str[64];
+    time_t t = time(nullptr);
+    strftime(time_str, sizeof(time_str), "log_%Y%m%d_%H%M%S.csv", localtime(&t));
+
+    // 최종 경로: ./rt_log_results/log_20260415_143210.csv
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s/%s", log_dir, time_str);
+
+    FILE* fp = fopen(fname, "w");
+    if (!fp) {
+        perror("fopen failed");
+        return;   
+    }
+    fprintf(fp, "timestamp_ns,q0,q1,q2,q3,q4,q5,"
+                "qd0,qd1,qd2,qd3,qd4,qd5,"
+                "tau0,tau1,tau2,tau3,tau4,tau5,"
+                "tcp_x,tcp_y,tcp_z,ctrl_mode\n");
+
+    ST_LOG_ENTRY entry{};
+    while (!pRobot->CheckStopTask()) {
+        usleep(5000);  // drain per 5ms
+        while (pRobot->m_logBuffer.pop(entry)) {
+            fprintf(fp,
+                "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%d\n",
+                (unsigned long long)entry.timestamp_ns,
+                entry.q[0],entry.q[1],entry.q[2],
+                entry.q[3],entry.q[4],entry.q[5],
+                entry.qd[0],entry.qd[1],entry.qd[2],
+                entry.qd[3],entry.qd[4],entry.qd[5],
+                entry.tau[0],entry.tau[1],entry.tau[2],
+                entry.tau[3],entry.tau[4],entry.tau[5],
+                entry.tcp_x,entry.tcp_y,entry.tcp_z,
+                (int)entry.ctrl_mode);
+        }
+        fflush(fp);  //fp에 써둔 내용들 바로 파일에 반영
+    }
+    fclose(fp);
+
 }
 
 
