@@ -19,7 +19,7 @@ void proc_ethercat_control(void* apRobot);
 void proc_keyboard_control(void* apRobot);
 void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
-
+FILE* make_csv(CRobotIndy7* pRobot);   
 
 
 /****************************************************************************/
@@ -495,7 +495,14 @@ CRobotIndy7::DoInput()
             m_pEcatSensor[0]->LED_RED(TRUE);
             DBG_LOG_INFO(">>> RT Controller: Computed Inverse Kinematics Mode");
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+            m_pController->m_bIkTrigger = TRUE;
             break;
+        case 'l':
+        case 'L':
+            DBG_LOG_INFO(">>> RT Controller: Logging");
+            m_bLogTrigger = TRUE;
+            break;
+
         default:
             break;
     }
@@ -587,7 +594,6 @@ void proc_main_control(void* apRobot)
         // Read current joint states
         for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
         {   
-
             auto ax = static_cast<CAxisNRMKCore*>(pRobot->m_pEcatAxis[nCnt]);
             
             if (bUseRTController) {
@@ -601,7 +607,6 @@ void proc_main_control(void* apRobot)
         // Compute control torques
         if (bUseRTController)
         {
-
             // Use RT Controller - it handles all RT optimizations internally
             if (pRTController->Update(pRobot->m_vCurrentPos, pRobot->m_vCurrentVel, 
                                      pRobot->m_vCurrentTor, pRobot->m_vOutputTorque))
@@ -634,17 +639,24 @@ void proc_main_control(void* apRobot)
         }
 
 
-        // jieun
         //======================================================================                
-        ST_LOG_ENTRY entry;
+        ST_LOG_ENTRY entry{};
+        
         entry.timestamp_ns = read_timer();
         for (int i = 0; i < udof; ++i) {
             entry.q[i]     = pRobot->m_vCurrentPos[i];
+            entry.q_ref[i] = pRTController->GetQRef()[i];
             entry.qd[i]    = pRobot->m_vCurrentVel[i];
             entry.tau[i]   = pRobot->m_vOutputTorque[i];
-            // q_ref는 controller에서 getter로
+            
         }
+
+        const CControllerFullDynamicsRT::Pose& tcp = pRTController->GetTcpPose();         
+        entry.tcp_x    = tcp.m_position[0];
+        entry.tcp_y    = tcp.m_position[1];                                   
+        entry.tcp_z    = tcp.m_position[2];
         entry.ctrl_mode = (uint8_t)pRTController->GetControlMode();
+
         pRobot->m_logBuffer.push(entry);  // atomic push, 블로킹 없음
         //======================================================================
 
@@ -664,7 +676,7 @@ void proc_main_control(void* apRobot)
                 break;
             case CControllerFullDynamicsRT::eAdaptiveControl:
             default:
-                pRobot->m_pEcatSensor[0]->LED_RED(FALSE);
+                pRobot->m_pEcatSensor[0]->LED_RED(bBlink);
                 break;
         }
 
@@ -781,12 +793,12 @@ proc_keyboard_control(void* apRobot)
             break;
         }
 
-        if ((cKeyPress == 'i' || cKeyPress == 'I')&& pRTController != NULL)
-        {
-            //pRTController->SetControlMode(CControllerFullDynamicsRT::eInverseKinematics);
-            pRTController->m_bIkTrigger = TRUE;
+        // if ((cKeyPress == 'i' || cKeyPress == 'I')&& pRTController != NULL)
+        // {
+        //     //pRTController->SetControlMode(CControllerFullDynamicsRT::eInverseKinematics);
+        //     pRTController->m_bIkTrigger = TRUE;
 
-        }
+        // }
     }
     
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_keyboard_control");
@@ -805,43 +817,40 @@ proc_terminal_output(void* apRobot)
     {
         wait_next_period(NULL);
 
-        // /* TODO: Last slave is Sensor, we must do this only for Axis */
-        for (int nMotCnt = 0; nMotCnt < pRobot->GetTotalAxis(); nMotCnt++)
-        {
+    //     // /* TODO: Last slave is Sensor, we must do this only for Axis */
+    //     for (int nMotCnt = 0; nMotCnt < pRobot->GetTotalAxis(); nMotCnt++)
+    //     {
         //  DBG_LOG_TRACE("[SLAVE %d]", nMotCnt);
         //     DBG_LOG_TRACE("TargetPos: %d, RawPos:%d", pRobot->m_pEcatAxis[nMotCnt]->GetTargetRawPos(), pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawPos());
         //     DBG_LOG_TRACE("RawVel:%d RawTor: %d",pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawVel(), pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawTor());
                                 
-             DBG_LOG_TRACE("ControlWord %04x, StatusWord %04x", pRobot->m_pEcatAxis[nMotCnt]->GetControlWord(), pRobot->m_pEcatAxis[nMotCnt]->GetStatusWord());
+        //      DBG_LOG_TRACE("ControlWord %04x, StatusWord %04x", pRobot->m_pEcatAxis[nMotCnt]->GetControlWord(), pRobot->m_pEcatAxis[nMotCnt]->GetStatusWord());
         //     DBG_LOG_TRACE("CurrentPos: %lf", pRobot->m_pEcatAxis[nMotCnt]->GetCurrentPosD());
         //     DBG_LOG_TRACE("HomePosition: %d StartPos:%d", pRobot->m_pEcatAxis[nMotCnt]->GetHomePosition(), pRobot->m_pEcatAxis[nMotCnt]->GetStartRawPos());
-             DBG_LOG_TRACE("IsServoOn: %d\n", pRobot->m_pEcatAxis[nMotCnt]->IsServoOn());
-             DBG_LOG_TRACE("DriveMode: %s\n", GetCIA402DriveMode(pRobot->m_pEcatAxis[nMotCnt]->GetDriveMode()).c_str());
-        }
+        //      DBG_LOG_TRACE("IsServoOn: %d\n", pRobot->m_pEcatAxis[nMotCnt]->IsServoOn());
+        //      DBG_LOG_TRACE("DriveMode: %s\n", GetCIA402DriveMode(pRobot->m_pEcatAxis[nMotCnt]->GetDriveMode()).c_str());
+    //     }
 
 
                 //==================================================================================
         // jieun
-        // pRTController->ComputeTcpFK();
-        // printf("X: %f, Y: %f, Z: %f\n", 
-        // pRTController->tcpPose.m_position[0], 
-        // pRTController->tcpPose.m_position[1], 
-        // pRTController->tcpPose.m_position[2]);
-        // printf("0: %f, 1: %f, 2: %f\n", 
-        // pRTController->tcpPose.m_rotation(0,0), 
-        // pRTController->tcpPose.m_rotation(0,1), 
-        // pRTController->tcpPose.m_rotation(0,2));
-        // printf("0: %f, 1: %f, 2: %f\n",
-        // pRTController->tcpPose.m_rotation(1,0), 
-        // pRTController->tcpPose.m_rotation(1,1), 
-        // pRTController->tcpPose.m_rotation(1,2));
-        // printf("0: %f, 1: %f, 2: %f\n",
-        // pRTController->tcpPose.m_rotation(2,0), 
-        // pRTController->tcpPose.m_rotation(2,1), 
-        // pRTController->tcpPose.m_rotation(2,2));
-
-        
-
+        pRTController->ComputeTcpFK();
+        printf("X: %f, Y: %f, Z: %f\n", 
+        pRTController->tcpPose.m_position[0], 
+        pRTController->tcpPose.m_position[1], 
+        pRTController->tcpPose.m_position[2]);
+        printf("0: %f, 1: %f, 2: %f\n", 
+        pRTController->tcpPose.m_rotation(0,0), 
+        pRTController->tcpPose.m_rotation(0,1), 
+        pRTController->tcpPose.m_rotation(0,2));
+        printf("0: %f, 1: %f, 2: %f\n",
+        pRTController->tcpPose.m_rotation(1,0), 
+        pRTController->tcpPose.m_rotation(1,1), 
+        pRTController->tcpPose.m_rotation(1,2));
+        printf("0: %f, 1: %f, 2: %f\n",
+        pRTController->tcpPose.m_rotation(2,0), 
+        pRTController->tcpPose.m_rotation(2,1), 
+        pRTController->tcpPose.m_rotation(2,2));
         //==================================================================================          
 
         DBG_LOG_NOTHING("\n");
@@ -849,54 +858,92 @@ proc_terminal_output(void* apRobot)
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_terminal_output");
 }
 
+
+
 void
 proc_logger(void* apRobot)
 {
     CRobotIndy7* pRobot = (CRobotIndy7*)apRobot;
-    const char* log_dir = "./rt_log_results";
-    mkdir(log_dir, 0777);
+    ST_LOG_ENTRY entry;                                                                         
+    int nCount = 0;
 
-    // 파일명 생성
-    char time_str[64];
-    time_t t = time(nullptr);
-    strftime(time_str, sizeof(time_str), "log_%Y%m%d_%H%M%S.csv", localtime(&t));
 
-    // 최종 경로: ./rt_log_results/log_20260415_143210.csv
-    char fname[256];
-    snprintf(fname, sizeof(fname), "%s/%s", log_dir, time_str);
-
-    FILE* fp = fopen(fname, "w");
-    if (!fp) {
-        perror("fopen failed");
-        return;   
+    while (!pRobot->CheckStopTask())
+    {       
+        if(pRobot->m_bLogTrigger.load(std::memory_order_acquire)) 
+        break;    
+        usleep(10000);  // drain per 10ms
     }
-    fprintf(fp, "timestamp_ns,q0,q1,q2,q3,q4,q5,"
-                "qd0,qd1,qd2,qd3,qd4,qd5,"
-                "tau0,tau1,tau2,tau3,tau4,tau5,"
-                "tcp_x,tcp_y,tcp_z,ctrl_mode\n");
+    if (pRobot->CheckStopTask()) return;
 
-    ST_LOG_ENTRY entry{};
-    while (!pRobot->CheckStopTask()) {
-        usleep(5000);  // drain per 5ms
-        while (pRobot->m_logBuffer.pop(entry)) {
-            fprintf(fp,
-                "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-                "%.6f,%.6f,%.6f,%d\n",
-                (unsigned long long)entry.timestamp_ns,
-                entry.q[0],entry.q[1],entry.q[2],
-                entry.q[3],entry.q[4],entry.q[5],
-                entry.qd[0],entry.qd[1],entry.qd[2],
-                entry.qd[3],entry.qd[4],entry.qd[5],
-                entry.tau[0],entry.tau[1],entry.tau[2],
-                entry.tau[3],entry.tau[4],entry.tau[5],
-                entry.tcp_x,entry.tcp_y,entry.tcp_z,
-                (int)entry.ctrl_mode);
-        }
-        fflush(fp);  //fp에 써둔 내용들 바로 파일에 반영
+    DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");                           
+    while (pRobot->m_logBuffer.pop(entry)) {}
+    DBG_LOG_INFO("(proc_logger) Collecting 10 seconds of data...");
+    //(1kHz * 10s = 10,000 entries)
+    sleep(3);
+           
+    pRobot->m_bLogTrigger.store(false, std::memory_order_release);
+
+    // create csv file
+    FILE* fp = make_csv(pRobot);
+    if (!fp) return;
+                                                                         
+    fprintf(fp, "timestamp_ns,"
+                "q0,q1,q2,q3,q4,q5,"                                                              
+                "q_ref0,q_ref1,q_ref2,q_ref3,q_ref4,q_ref5,"                                      
+                "qd0,qd1,qd2,qd3,qd4,qd5,"                                                      
+                "tau0,tau1,tau2,tau3,tau4,tau5,"                                                  
+                "tcp_x,tcp_y,tcp_z,ctrl_mode\n");                                               
+                
+    while (pRobot->m_logBuffer.pop(entry))
+    {
+        fprintf(fp,
+            "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%d\n",
+            (unsigned long long)entry.timestamp_ns,
+            entry.q[0],entry.q[1],entry.q[2],
+            entry.q[3],entry.q[4],entry.q[5],
+            entry.q_ref[0], entry.q_ref[1], entry.q_ref[2],
+            entry.q_ref[3], entry.q_ref[4], entry.q_ref[5],   
+            entry.qd[0],entry.qd[1],entry.qd[2],
+            entry.qd[3],entry.qd[4],entry.qd[5],
+            entry.tau[0],entry.tau[1],entry.tau[2],
+            entry.tau[3],entry.tau[4],entry.tau[5],
+            entry.tcp_x,entry.tcp_y,entry.tcp_z,
+            (int)entry.ctrl_mode);
+            nCount++;
     }
-    fclose(fp);
+    //fflush(fp);                                                                                         
+    fclose(fp);                                                                                   
+    DBG_LOG_INFO("(proc_logger) %d entries saved", nCount);
+
+
+}
+
+
+FILE*
+make_csv(CRobotIndy7* pRobot)
+{                                                               
+    char szFilename[256];
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    snprintf(szFilename, sizeof(szFilename),
+            "/home/raimlab/RAON-RT/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
+            //"./../rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,                                        
+            t->tm_hour, t->tm_min, t->tm_sec);                                                 
+                                                                                                
+    FILE* fp = fopen(szFilename, "w");
+    if (!fp)
+    {
+        DBG_LOG_ERROR("proc_logger: Cannot open %s", szFilename);                               
+        return nullptr;        
+    }
+    return fp;
+
 
 }
 

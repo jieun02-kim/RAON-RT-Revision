@@ -124,6 +124,9 @@ CControllerFullDynamicsRT::Init()
     DBG_LOG_INFO("(%s) Controller initialized successfully with %u DOF", 
                  "CControllerFullDynamicsRT", m_uDOF);
     
+    // jieun
+    m_body_id = m_rbdlModel.GetBodyId("tcp");             
+    
     return TRUE;
 }
 
@@ -219,9 +222,11 @@ CControllerFullDynamicsRT::ComputeFullDynamics(std::vector<double>& avOutputTorq
     // Full dynamics control: τ = M(q)q̈_ref + h(q,q̇) + K_feedback
 
     // Inertia Matrix M(q)
+    // return m_M
     RigidBodyDynamics::CompositeRigidBodyAlgorithm(m_rbdlModel, m_Q, m_M);
     
     // Nonlinear Effects h(q,qd) = C(q,qd)*qd + g(q)
+    // m_h == tau
     RigidBodyDynamics::NonlinearEffects(m_rbdlModel, m_Q, m_Qd, m_h);
     
     // Gravity Vector g(q) 
@@ -285,7 +290,6 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
 BOOL 
 CControllerFullDynamicsRT::ComputeTcpFK()
 {
-    m_body_id = m_rbdlModel.GetBodyId("tcp");
     RigidBodyDynamics::Math::Vector3d p_tcp;
     RigidBodyDynamics::Math::Matrix3d R_base_to_body, R_body_to_base;
 
@@ -295,7 +299,6 @@ CControllerFullDynamicsRT::ComputeTcpFK()
     // tcp orientation - (R_base_to_body : base -> body) 
     R_base_to_body = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, m_Q, m_body_id);
     R_body_to_base = R_base_to_body.transpose();
-    
     
     // base coordinates
     tcpPose.m_position = p_tcp;
@@ -308,98 +311,62 @@ CControllerFullDynamicsRT::ComputeTcpFK()
 BOOL 
 CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutputTorque)
 {
-    if(!ComputeTcpFK()){return FALSE;}
-
-    // // init goal_tcpPose : mode is t 
-    // goal_tcpPose.m_position[0] = 0.173256;
-    // goal_tcpPose.m_position[1] = -0.143725;
-    // goal_tcpPose.m_position[2] = 1.389501;
-
-    // goal_tcpPose.m_rotation <<
-    //     0.806490, -0.585035,  0.085484,
-    //     0.585444,  0.810391,  0.022838,
-    //     -0.082636,  0.031628,  0.996078;
-
-    
 
     if (m_bIkTrigger) {
         m_tcpStartPose = tcpPose;
+        //goal_tcpPose = tcpPose;
+        
+                
+        // init goal_tcpPose : mode is t 
+        // goal_tcpPose.m_position[0] = 0.042177;
+        // goal_tcpPose.m_position[1] = -0.145970;
+        // goal_tcpPose.m_position[2] = 1.331485;
 
-        goal_tcpPose = tcpPose;
+        // goal_tcpPose.m_rotation <<
+        //     0.806490, -0.585035,  0.085484,
+        //     0.585444,  0.810391,  0.022838,
+        //     -0.082636,  0.031628,  0.996078;
+ 
+
         goal_tcpPose.m_position[0] += 0.05;
         m_goalTcpPoseForCheck = goal_tcpPose;
+        
 
         m_bVerifyInit = TRUE;
         m_bVerifyDone = FALSE;
         m_nStableCount = 0;
+        //DBG_LOG_INFO("IK Target Reset: Current X + 5cm");  
+        
+        std::vector<unsigned int> body_ids;
+        std::vector<RigidBodyDynamics::Math::Vector3d> body_points;
+        std::vector<RigidBodyDynamics::Math::Vector3d> target_positions;
 
+        body_ids.push_back(m_body_id);
+        body_points.push_back(tcp_local_point);
+        target_positions.push_back(goal_tcpPose.m_position);
+
+        BOOL is_ok = RigidBodyDynamics::InverseKinematics(
+            m_rbdlModel, 
+            m_Q, 
+            body_ids, 
+            body_points, 
+            target_positions, 
+            m_Q_ref
+        );
+
+         if(!ComputeTcpFK()){return FALSE;}
+        if (!ComputeComputedTorque(avOutputTorque)) return FALSE;
+
+
+        if(!is_ok)
+        {
+            return FALSE;
+        }
+        m_Qd_ref = m_zero_vector;
+        m_Qdd_ref = m_zero_vector;
         m_bIkTrigger = FALSE;   // for once execution
 
-        DBG_LOG_INFO("IK Target Reset: Current X + 5cm");
     }
-
-    
-
-    std::vector<unsigned int> body_ids;
-    std::vector<RigidBodyDynamics::Math::Vector3d> body_points;
-    std::vector<RigidBodyDynamics::Math::Vector3d> target_positions;
-
-    body_ids.push_back(m_body_id);
-    body_points.push_back(tcp_local_point);
-    target_positions.push_back(goal_tcpPose.m_position);
-
-    BOOL is_ok = RigidBodyDynamics::InverseKinematics(
-        m_rbdlModel, 
-        m_Q, 
-        body_ids, 
-        body_points, 
-        target_positions, 
-        m_Q_ref
-    );
-
-    if(!is_ok)
-    {
-        return FALSE;
-    }
-
-    // // Gravity compensation: τ = g(q)
-    // RigidBodyDynamics::InverseDynamics(m_rbdlModel, m_Q, m_zero_vector, m_zero_vector, m_g);
-    
-    // for (unsigned int i = 0; i < m_uDOF; ++i) {
-    //     avOutputTorque[i] = m_g[i];
-    // }
-    
-
-
-    // // m_rotation format is.... unknown... lol..
-    // RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-
-    // // position constraint 1개 추가
-    // CS.constraint_type.push_back(
-    //     RigidBodyDynamics::InverseKinematicsConstraintSet::ConstraintTypeFull
-    // );
-    // CS.body_ids.push_back(m_body_id);
-    // CS.body_points.push_back(tcp_local_point);
-    // CS.target_positions.push_back(goal_tcpPose.m_position);
-    // CS.target_orientations.push_back(goal_tcpPose.m_rotation);
-    // CS.constraint_weight.push_back(1.0f);
-
-    // BOOL is_ok = RigidBodyDynamics::InverseKinematics(
-    //     m_rbdlModel,
-    //     m_Q,      // Qinit
-    //     CS,
-    //     m_Q_ref   // Qres
-    // );
-
-    // if (!is_ok)
-    //     return FALSE;
-    
-
-    m_Qd_ref = m_zero_vector;
-    m_Qdd_ref = m_zero_vector;
-
-    if (!ComputeComputedTorque(avOutputTorque)) return FALSE;
-    
 
     // ---------- Convengence Check & Data Logging ----------
     if (m_bVerifyInit && !m_bVerifyDone) {
@@ -415,6 +382,7 @@ CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutpu
                 m_tcpFinalPose = tcpPose;
                 PrintTcpVerificationResult();
                 m_bVerifyDone = TRUE;
+                
             }
         }
     }
@@ -435,8 +403,6 @@ BOOL CControllerFullDynamicsRT::IsJointSettled(double vel_threshold)
 
 void CControllerFullDynamicsRT::PrintTcpVerificationResult()
 {
-    
-    
     double dx = m_tcpFinalPose.m_position[0] - m_tcpStartPose.m_position[0];
     double dy = m_tcpFinalPose.m_position[1] - m_tcpStartPose.m_position[1];
     double dz = m_tcpFinalPose.m_position[2] - m_tcpStartPose.m_position[2];

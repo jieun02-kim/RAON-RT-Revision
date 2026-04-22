@@ -109,7 +109,8 @@ public:
     RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.0};
     BOOL ComputeTcpFK();
     Pose tcpPose;
-    BOOL m_bIkTrigger;
+    const Pose& GetTcpPose() const { return tcpPose; }
+    
     
     // for goal pose
     Pose goal_tcpPose;
@@ -126,6 +127,13 @@ public:
 
     
     unsigned int m_body_id;
+
+    const RigidBodyDynamics::Math::VectorNd& GetQRef() const { return     m_Q_ref; }    
+
+    // logging
+    std::atomic<bool> 		 m_bIkTrigger{false};
+
+
 
     //====================================================================
     //====================================================================

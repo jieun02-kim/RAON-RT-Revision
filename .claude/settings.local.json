@@ -4,7 +4,18 @@
       "Skill(update-config)",
       "Bash(claude config:*)",
       "WebFetch(domain:docs.neuromeka.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(sudo cat:*)",
+      "Bash(sudo head:*)",
+      "Bash(cat /home/raimlab/RAON-RT/scripts/*.sh)",
+      "Bash(sudo grep:*)",
+      "Bash(ls /home/raimlab/RAON-RT/App/Indy7/*.cfg)",
+      "Bash(sudo git:*)",
+      "Bash(dpkg -l)",
+      "Bash(find:*)",
+      "Bash(pkg-config --cflags rtposix)",
+      "Bash(ldconfig -p)",
+      "Bash(git -C /home/raimlab/RAON-RT show :App/Indy7/DataRecorder.h)"
     ]
   }
 }

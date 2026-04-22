@@ -87,7 +87,8 @@ int main(int argc, char **argv)
         usleep(1000);
     }
 
-    // g_cRobot->WriteDataLog();
+    // jieun : for test open
+    //g_cRobot->WriteDataLog();
 
     DBG_LOG_INFO("=======================ROBOT APPLICATION ENDED!=======================");
     return RET_SUCC;

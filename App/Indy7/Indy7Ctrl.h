@@ -10,6 +10,8 @@
 
 #include <list>
 #include <queue>
+#include <atomic>
+#include <ctime>
 
 #include "Robot.h"
 #include "AxisNRMKCore.h"
@@ -17,6 +19,7 @@
 #include "FullDynControllerRT.h"
 //jieun
 #include "DataRecorder.h"
+
 
 typedef std::vector<double> VECDOUBLE;
 typedef std::list<UINT64>   LISTULONG;
@@ -98,8 +101,19 @@ private:
     std::vector<double> m_vCurrentTor;
     std::vector<double> m_vOutputTorque;
 
-	//jiuen
-    LogRingBuffer m_logBuffer;
+	//=====================================================
+	//jieun
+	LogRingBuffer            m_logBuffer;
+	std::atomic<bool>        m_bLogTrigger{false};
+	
+
+
+public:
+    friend FILE* make_csv(CRobotIndy7*); 
+	
+	//=====================================================
+	
+
 
 }; 
 #endif //__ROBOT_EXAMPLE_APP__

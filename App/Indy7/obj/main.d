@@ -251,7 +251,9 @@ obj/main.o: main.cpp /usr/include/stdc-predef.h \
  /usr/include/c++/13/bits/list.tcc /usr/include/c++/13/queue \
  /usr/include/c++/13/deque /usr/include/c++/13/bits/stl_deque.h \
  /usr/include/c++/13/bits/deque.tcc /usr/include/c++/13/bits/stl_queue.h \
- ../../CRobot/Robot.h ../../CRobot/Axis.h ../../CRobot/ConfigRobot.h \
+ /usr/include/c++/13/atomic /usr/include/c++/13/bits/atomic_base.h \
+ /usr/include/c++/13/bits/atomic_lockfree_defines.h ../../CRobot/Robot.h \
+ ../../CRobot/Axis.h ../../CRobot/ConfigRobot.h \
  /opt/rt_posix/include/posix_rt.h /opt/rt_posix/include/commons.h \
  /usr/include/malloc.h /usr/lib/gcc/x86_64-linux-gnu/13/include/limits.h \
  /usr/lib/gcc/x86_64-linux-gnu/13/include/syslimits.h \
@@ -319,8 +321,6 @@ obj/main.o: main.cpp /usr/include/stdc-predef.h \
  /usr/include/c++/13/bits/shared_ptr_base.h \
  /usr/include/c++/13/ext/concurrence.h \
  /usr/include/c++/13/bits/shared_ptr_atomic.h \
- /usr/include/c++/13/bits/atomic_base.h \
- /usr/include/c++/13/bits/atomic_lockfree_defines.h \
  /usr/include/c++/13/backward/auto_ptr.h \
  /usr/include/c++/13/pstl/glue_memory_defs.h \
  /usr/include/c++/13/pstl/execution_defs.h ../../CRobot/ExtInterface.h \
@@ -457,7 +457,6 @@ obj/main.o: main.cpp /usr/include/stdc-predef.h \
  /usr/include/eigen3/Eigen/src/Core/SelfAdjointView.h \
  /usr/include/eigen3/Eigen/src/Core/products/GeneralBlockPanelKernel.h \
  /usr/include/eigen3/Eigen/src/Core/products/Parallelizer.h \
- /usr/include/c++/13/atomic \
  /usr/include/eigen3/Eigen/src/Core/ProductEvaluators.h \
  /usr/include/eigen3/Eigen/src/Core/products/GeneralMatrixVector.h \
  /usr/include/eigen3/Eigen/src/Core/products/GeneralMatrixMatrix.h \
