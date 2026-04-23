@@ -121,9 +121,12 @@ public:
     Pose m_tcpFinalPose;
     Pose m_goalTcpPoseForCheck;
 
-    BOOL m_bVerifyInit;
+    BOOL m_bIkReady;          // IK 해가 설정됐는지
     BOOL m_bVerifyDone;
+    BOOL m_bIkMotionStarted;  // IK 시작 후 실제로 움직임이 감지됐는지
     int  m_nStableCount;
+
+    void CheckIKConvergence();
 
     
     unsigned int m_body_id;
@@ -133,7 +136,17 @@ public:
     // logging
     std::atomic<bool> 		 m_bIkTrigger{false};
 
+    // Full IK (Jacobian-based)
+    RigidBodyDynamics::Math::MatrixNd m_J;       // 6 x DOF Jacobian
+    RigidBodyDynamics::Math::MatrixNd m_JJt;     // 6 x 6
+    RigidBodyDynamics::Math::MatrixNd m_J_pinv;  // DOF x 6
+    RigidBodyDynamics::Math::VectorNd m_e_task;  // 6D Cartesian error [angular; linear]
+    double m_Kp_task_pos = 1.0;                  // task-space position gain
+    double m_Kp_task_rot = 1.0;                  // task-space orientation gain
+    static constexpr double m_dt = 0.001;        // 1kHz → 1ms
+    static constexpr double m_lambda = 0.01;     // DLS damping factor
 
+    BOOL ComputeJacobianBasedInverseKinematics(std::vector<double>& avOutputTorque);
 
     //====================================================================
     //====================================================================

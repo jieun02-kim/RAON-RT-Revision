@@ -1,0 +1,4 @@
+App/Indy7/raim_csv/*.csv
+App/Indy7/raim_csv/*.swp
+App/Indy7/obj/*.o
+App/Indy7/raim_csv/

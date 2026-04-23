@@ -77,6 +77,19 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     tcpPose.m_position.setZero();
     tcpPose.m_rotation.setZero();
     m_bIkTrigger = FALSE;
+    m_bIkReady   = FALSE;
+    m_bVerifyDone  = FALSE;
+    m_nStableCount = 0;
+
+    // Full IK
+    m_J.resize(6, auDOF);
+    m_J.setZero();
+    m_JJt.resize(6, 6);
+    m_JJt.setZero();
+    m_J_pinv.resize(auDOF, 6);
+    m_J_pinv.setZero();
+    m_e_task.resize(6);
+    m_e_task.setZero();
 
     DBG_LOG_INFO("(%s) Constructor completed for %u DOF", "CControllerFullDynamicsRT", auDOF);
 }
@@ -172,7 +185,8 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
             result = ComputeComputedTorque(avOutputTorque);
             break;
         case eInverseKinematics:
-            result = ComputeInverseKinematics(avOutputTorque);
+            //result = ComputeInverseKinematics(avOutputTorque);
+            result = ComputeJacobianBasedInverseKinematics(avOutputTorque);
             break;
 
         default:
@@ -308,86 +322,180 @@ CControllerFullDynamicsRT::ComputeTcpFK()
 
 }
 
-BOOL 
+BOOL
 CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutputTorque)
 {
-
     if (m_bIkTrigger) {
-        m_tcpStartPose = tcpPose;
-        //goal_tcpPose = tcpPose;
-        
-                
-        // init goal_tcpPose : mode is t 
-        // goal_tcpPose.m_position[0] = 0.042177;
-        // goal_tcpPose.m_position[1] = -0.145970;
-        // goal_tcpPose.m_position[2] = 1.331485;
+        m_Q_ref    = m_Q;
+        m_Qd_ref   = m_zero_vector;
+        m_Qdd_ref  = m_zero_vector;
 
-        // goal_tcpPose.m_rotation <<
-        //     0.806490, -0.585035,  0.085484,
-        //     0.585444,  0.810391,  0.022838,
-        //     -0.082636,  0.031628,  0.996078;
- 
-
+        m_tcpStartPose     = tcpPose;
+        goal_tcpPose       = tcpPose;
         goal_tcpPose.m_position[0] += 0.05;
         m_goalTcpPoseForCheck = goal_tcpPose;
-        
 
-        m_bVerifyInit = TRUE;
-        m_bVerifyDone = FALSE;
+        m_bVerifyDone  = FALSE;
         m_nStableCount = 0;
-        //DBG_LOG_INFO("IK Target Reset: Current X + 5cm");  
-        
-        std::vector<unsigned int> body_ids;
+        m_bIkTrigger   = FALSE;
+
+        std::vector<unsigned int>                      body_ids;
         std::vector<RigidBodyDynamics::Math::Vector3d> body_points;
         std::vector<RigidBodyDynamics::Math::Vector3d> target_positions;
-
         body_ids.push_back(m_body_id);
         body_points.push_back(tcp_local_point);
         target_positions.push_back(goal_tcpPose.m_position);
 
         BOOL is_ok = RigidBodyDynamics::InverseKinematics(
-            m_rbdlModel, 
-            m_Q, 
-            body_ids, 
-            body_points, 
-            target_positions, 
-            m_Q_ref
-        );
+            m_rbdlModel, m_Q, body_ids, body_points, target_positions, m_Q_ref);
 
-         if(!ComputeTcpFK()){return FALSE;}
-        if (!ComputeComputedTorque(avOutputTorque)) return FALSE;
-
-
-        if(!is_ok)
-        {
-            return FALSE;
+        if (!is_ok) {
+            DBG_LOG_WARN("(ComputeInverseKinematics) IK failed - falling back to gravity compensation");
+            m_bIkReady = FALSE;
+            return ComputeGravityCompensation(avOutputTorque);
         }
-        m_Qd_ref = m_zero_vector;
-        m_Qdd_ref = m_zero_vector;
-        m_bIkTrigger = FALSE;   // for once execution
-
+        m_bIkReady = TRUE;
     }
 
-    // ---------- Convengence Check & Data Logging ----------
-    if (m_bVerifyInit && !m_bVerifyDone) {
-        if (IsJointSettled(0.01)) {
-            m_nStableCount++;
-        } else {
-            m_nStableCount = 0;
-        }
+    if (!m_bIkReady)
+        return ComputeGravityCompensation(avOutputTorque);
 
-        // Considered converged if sufficiently slow for 100 consecutive cycles.
-        if (m_nStableCount > 100) {
-            if (ComputeTcpFK()) {
-                m_tcpFinalPose = tcpPose;
-                PrintTcpVerificationResult();
-                m_bVerifyDone = TRUE;
-                
-            }
-        }
-    }
+    ComputeTcpFK();
+    ComputeComputedTorque(avOutputTorque);
+    CheckIKConvergence();
     return TRUE;
+}
 
+void
+CControllerFullDynamicsRT::CheckIKConvergence()
+{
+    if (m_bVerifyDone) return;
+
+    // 한 번이라도 움직임 감지 (관절 속도 > 0.02 rad/s)
+    if (!m_bIkMotionStarted && !IsJointSettled(0.02))
+        m_bIkMotionStarted = TRUE;
+
+    // 움직임 감지 후 완전히 멈추면 수렴 판정
+    if (m_bIkMotionStarted && IsJointSettled(0.01)) {
+        ComputeTcpFK();
+        m_tcpFinalPose = tcpPose;
+        PrintTcpVerificationResult();
+        m_bVerifyDone = TRUE;
+    }
+}
+
+
+BOOL
+CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<double>& avOutputTorque)
+{
+    // 1. FK로 현재 TCP pose 업데이트
+    ComputeTcpFK();
+
+    if (m_bIkTrigger) {
+        m_Q_ref        = m_Q;
+        m_Qd_ref       = m_zero_vector;
+        m_Qdd_ref      = m_zero_vector;
+        m_bVerifyDone       = FALSE;
+        m_bIkMotionStarted  = FALSE;
+        m_nStableCount      = 0;
+        m_bIkReady          = TRUE;
+
+        m_tcpStartPose = tcpPose;
+
+        // [ORIGINAL] 현재 위치에서 X +5cm
+        // goal_tcpPose          = tcpPose;
+        // goal_tcpPose.m_position[0] += 0.05;
+
+        // TODO: 목표 TCP 위치 (절대 좌표, 단위: m)
+        goal_tcpPose.m_position[0] = 0.5;   // X
+        goal_tcpPose.m_position[1] = 0.0;   // Y
+        goal_tcpPose.m_position[2] = 0.8;   // Z
+
+        m_goalTcpPoseForCheck = goal_tcpPose;
+
+        m_bIkTrigger = FALSE;
+
+        DBG_LOG_INFO("========== IK Command ==========");
+        DBG_LOG_INFO("Start : X=%.4f Y=%.4f Z=%.4f",
+            m_tcpStartPose.m_position[0],
+            m_tcpStartPose.m_position[1],
+            m_tcpStartPose.m_position[2]);
+        DBG_LOG_INFO("Goal  : X=%.4f Y=%.4f Z=%.4f",
+            goal_tcpPose.m_position[0],
+            goal_tcpPose.m_position[1],
+            goal_tcpPose.m_position[2]);
+    }
+
+    if (!m_bIkReady)
+        return ComputeGravityCompensation(avOutputTorque);
+
+
+    // 2. 6D Jacobian 계산 [angular(0-2); linear(3-5)] × DOF
+    m_J.setZero();
+    RigidBodyDynamics::CalcPointJacobian6D(m_rbdlModel, m_Q, m_body_id, tcp_local_point, m_J);
+
+    // 3. Cartesian 오차 계산 (RBDL Jacobian 순서에 맞춰 [angular; linear])
+    // 위치 오차
+    m_e_task[3] = goal_tcpPose.m_position[0] - tcpPose.m_position[0];
+    m_e_task[4] = goal_tcpPose.m_position[1] - tcpPose.m_position[1];
+    m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
+
+    // 자세 오차 (rotation matrix → axis-angle 근사)
+    // TODO: 자세 제어 활성화 시 위치 드리프트 발생 확인 필요 → 현재 비활성화
+    // RigidBodyDynamics::Math::Matrix3d R_err = goal_tcpPose.m_rotation * tcpPose.m_rotation.transpose();
+    // m_e_task[0] = m_Kp_task_rot * 0.5 * (R_err(2,1) - R_err(1,2));
+    // m_e_task[1] = m_Kp_task_rot * 0.5 * (R_err(0,2) - R_err(2,0));
+    // m_e_task[2] = m_Kp_task_rot * 0.5 * (R_err(1,0) - R_err(0,1));
+    m_e_task[0] = 0.0;
+    m_e_task[1] = 0.0;
+    m_e_task[2] = 0.0;
+
+    m_e_task[3] *= m_Kp_task_pos;
+    m_e_task[4] *= m_Kp_task_pos;
+    m_e_task[5] *= m_Kp_task_pos;
+
+    // 4. DLS pseudo-inverse: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
+    // 특이점 근처에서도 안정적으로 동작 (Damped Least Squares)
+    m_JJt.noalias() = m_J * m_J.transpose();
+    m_JJt.diagonal().array() += m_lambda * m_lambda;
+    m_J_pinv.noalias() = m_J.transpose() * m_JJt.inverse();
+
+    // 5. 관절 속도 레퍼런스: q̇_ref = J⁺ * e_task
+    m_Qd_ref.noalias() = m_J_pinv * m_e_task;
+
+    // 안전을 위한 관절 속도 클램핑
+    const double MAX_JOINT_VEL = 0.2;  // rad/s
+    for (unsigned int i = 0; i < m_uDOF; ++i)
+        m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
+
+    // 6. q_ref 적분: 오차가 2mm 이상일 때만 적분 (windup 방지)
+    double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
+                              m_e_task[4]*m_e_task[4] +
+                              m_e_task[5]*m_e_task[5]);
+    if (pos_err_now > 0.002)
+        m_Q_ref += m_Qd_ref * m_dt;
+
+    // m_Q_ref가 실제 m_Q보다 MAX_REF_LEAD 이상 앞서지 못하도록 제한 (오버슈트 방지)
+    const double MAX_REF_LEAD = 0.15;  // rad
+    for (unsigned int i = 0; i < m_uDOF; ++i)
+    {
+        double lead = m_Q_ref[i] - m_Q[i];
+        if (fabs(lead) > MAX_REF_LEAD)
+            m_Q_ref[i] = m_Q[i] + (lead > 0 ? MAX_REF_LEAD : -MAX_REF_LEAD);
+    }
+
+    // 7. 참조 가속도 0
+    m_Qdd_ref = m_zero_vector;
+
+    // 8. CTC로 토크 계산
+    ComputeComputedTorque(avOutputTorque);
+    CheckIKConvergence();
+
+
+    CheckIKConvergence();
+
+
+    return TRUE;
 }
 
 

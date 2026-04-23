@@ -834,26 +834,26 @@ proc_terminal_output(void* apRobot)
 
                 //==================================================================================
         // jieun
-        pRTController->ComputeTcpFK();
-        printf("X: %f, Y: %f, Z: %f\n", 
-        pRTController->tcpPose.m_position[0], 
-        pRTController->tcpPose.m_position[1], 
-        pRTController->tcpPose.m_position[2]);
-        printf("0: %f, 1: %f, 2: %f\n", 
-        pRTController->tcpPose.m_rotation(0,0), 
-        pRTController->tcpPose.m_rotation(0,1), 
-        pRTController->tcpPose.m_rotation(0,2));
-        printf("0: %f, 1: %f, 2: %f\n",
-        pRTController->tcpPose.m_rotation(1,0), 
-        pRTController->tcpPose.m_rotation(1,1), 
-        pRTController->tcpPose.m_rotation(1,2));
-        printf("0: %f, 1: %f, 2: %f\n",
-        pRTController->tcpPose.m_rotation(2,0), 
-        pRTController->tcpPose.m_rotation(2,1), 
-        pRTController->tcpPose.m_rotation(2,2));
+        // pRTController->ComputeTcpFK();
+        // printf("X: %f, Y: %f, Z: %f\n",
+        // pRTController->tcpPose.m_position[0],
+        // pRTController->tcpPose.m_position[1],
+        // pRTController->tcpPose.m_position[2]);
+        // printf("0: %f, 1: %f, 2: %f\n",
+        // pRTController->tcpPose.m_rotation(0,0),
+        // pRTController->tcpPose.m_rotation(0,1),
+        // pRTController->tcpPose.m_rotation(0,2));
+        // printf("0: %f, 1: %f, 2: %f\n",
+        // pRTController->tcpPose.m_rotation(1,0),
+        // pRTController->tcpPose.m_rotation(1,1),
+        // pRTController->tcpPose.m_rotation(1,2));
+        // printf("0: %f, 1: %f, 2: %f\n",
+        // pRTController->tcpPose.m_rotation(2,0),
+        // pRTController->tcpPose.m_rotation(2,1),
+        // pRTController->tcpPose.m_rotation(2,2));
         //==================================================================================          
 
-        DBG_LOG_NOTHING("\n");
+        // DBG_LOG_NOTHING("\n");
     }
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_terminal_output");
 }
