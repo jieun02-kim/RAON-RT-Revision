@@ -378,12 +378,19 @@ CControllerFullDynamicsRT::CheckIKConvergence()
     if (!m_bIkMotionStarted && !IsJointSettled(0.02))
         m_bIkMotionStarted = TRUE;
 
-    // 움직임 감지 후 완전히 멈추면 수렴 판정
-    if (m_bIkMotionStarted && IsJointSettled(0.01)) {
-        ComputeTcpFK();
-        m_tcpFinalPose = tcpPose;
-        PrintTcpVerificationResult();
-        m_bVerifyDone = TRUE;
+    // 움직임 감지 후 속도 조건을 50사이클(50ms) 연속 유지해야 정지 판정
+    if (m_bIkMotionStarted) {
+        if (IsJointSettled(0.01))
+            m_nStableCount++;
+        else
+            m_nStableCount = 0;
+
+        if (m_nStableCount >= 50) {
+            ComputeTcpFK();
+            m_tcpFinalPose = tcpPose;
+            PrintTcpVerificationResult();
+            m_bVerifyDone = TRUE;
+        }
     }
 }
 
