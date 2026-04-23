@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <cmath>
 #include <errno.h>
+#include <fstream>
+#include <ctime>
+#include <sys/stat.h>
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 
@@ -541,6 +544,32 @@ void CControllerFullDynamicsRT::PrintTcpVerificationResult()
     DBG_LOG_INFO("Error     : eX=%.6f eY=%.6f eZ=%.6f", ex, ey, ez);
     DBG_LOG_INFO("Norm Error: %.6f m", err_norm);
     DBG_LOG_INFO("======================================");
+
+    // CSV에 오차 기록 (rt_ik_error_log/ 폴더에 누적 append)
+    const char* log_dir  = "rt_ik_error_log";
+    const char* csv_path = "rt_ik_error_log/ik_accuracy_log.csv";
+    mkdir(log_dir, 0755);  // 폴더 없으면 생성
+
+    bool write_header = false;
+    {
+        std::ifstream check(csv_path);
+        write_header = !check.good();
+    }
+    std::ofstream csv(csv_path, std::ios::app);
+    if (csv.is_open())
+    {
+        if (write_header)
+            csv << "goal_x,goal_y,goal_z,"
+                << "final_x,final_y,final_z,"
+                << "err_x,err_y,err_z,norm_err\n";
+        csv << m_goalTcpPoseForCheck.m_position[0] << ","
+            << m_goalTcpPoseForCheck.m_position[1] << ","
+            << m_goalTcpPoseForCheck.m_position[2] << ","
+            << m_tcpFinalPose.m_position[0] << ","
+            << m_tcpFinalPose.m_position[1] << ","
+            << m_tcpFinalPose.m_position[2] << ","
+            << ex << "," << ey << "," << ez << "," << err_norm << "\n";
+    }
 }
 
 //===================================================================
