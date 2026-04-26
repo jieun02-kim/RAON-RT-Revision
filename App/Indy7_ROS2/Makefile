@@ -29,7 +29,7 @@ EIGEN3_INCLUDE=/usr/include/eigen3
 
 
 # ROS2 INDY IFACE
-ROS_DIR=/opt/ros/humble
+ROS_DIR=/opt/ros/jazzy
 ROS_INCLUDE=$(ROS_DIR)/include
 ROS_LIB=$(ROS_DIR)/lib
 
@@ -39,22 +39,7 @@ INDY_IFACE_LIB=$(INDY_IFACE_DIR)/lib
 
 # CFLAGS_ROS= -I$(INDY_IFACE_INCLUDE)/indy_iface -I$(ROS_INCLUDE) -I$(ROS_INCLUDE)/rclcpp -I$(ROS_INCLUDE)/std_msgs -I$(ROS_INCLUDE)/rcl -I$(ROS_INCLUDE)/rcutils -I$(ROS_INCLUDE)/rmw -I$(ROS_INCLUDE)/rcl_yaml_param_parser -I$(ROS_INCLUDE)/rosidl_runtime_c -I$(ROS_INCLUDE)/rosidl_typesupport_interface -I$(ROS_INCLUDE)/rcpputils -I$(ROS_INCLUDE)/builtin_interfaces -I$(ROS_INCLUDE)/rosidl_runtime_cpp -I$(ROS_INCLUDE)/tracetools -I$(ROS_INCLUDE)/rcl_interfaces -I$(ROS_INCLUDE)/libstatistics_collector -I$(ROS_INCLUDE)/statistics_msgs -I$(ROS_LIB)
 CFLAGS_ROS = -I$(INDY_IFACE_INCLUDE)/indy_iface \
-             -I$(ROS_INCLUDE) \
-             -I$(ROS_INCLUDE)/rclcpp \
-             -I$(ROS_INCLUDE)/std_msgs \
-             -I$(ROS_INCLUDE)/rcl \
-             -I$(ROS_INCLUDE)/rcutils \
-             -I$(ROS_INCLUDE)/rmw \
-             -I$(ROS_INCLUDE)/rcl_yaml_param_parser \
-             -I$(ROS_INCLUDE)/rosidl_runtime_c \
-             -I$(ROS_INCLUDE)/rosidl_typesupport_interface \
-             -I$(ROS_INCLUDE)/rcpputils \
-             -I$(ROS_INCLUDE)/builtin_interfaces \
-             -I$(ROS_INCLUDE)/rosidl_runtime_cpp \
-             -I$(ROS_INCLUDE)/tracetools \
-             -I$(ROS_INCLUDE)/rcl_interfaces \
-             -I$(ROS_INCLUDE)/libstatistics_collector \
-             -I$(ROS_INCLUDE)/statistics_msgs
+             $(shell find $(ROS_INCLUDE) -maxdepth 1 -type d | sed 's/^/-I/')
 
 # LDFLAGS_ROS= -L$(INDY_IFACE_LIB) -lindy_iface__rosidl_generator_c -lindy_iface__rosidl_typesupport_fastrtps_cpp -lindy_iface__rosidl_generator_py -lindy_iface__rosidl_typesupport_fastrtps_c -lindy_iface__rosidl_typesupport_cpp -lindy_iface__rosidl_typesupport_introspection_cpp -lindy_iface__rosidl_typesupport_c -lindy_iface__rosidl_typesupport_introspection_c  -L$(ROS_LIB) -lstatistics_msgs__rosidl_typesupport_cpp -llibstatistics_collector -lrmw -lrclcpp -lrcutils -lrcl -ltracetools -lstd_msgs__rosidl_typesupport_cpp 
 LDFLAGS_ROS = -L$(INDY_IFACE_LIB) \

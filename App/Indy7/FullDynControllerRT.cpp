@@ -16,6 +16,27 @@
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 
+// RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
+static RigidBodyDynamics::Math::Matrix3d RPYToRot(double roll, double pitch, double yaw)
+{
+    double cr = cos(roll),  sr = sin(roll);
+    double cp = cos(pitch), sp = sin(pitch);
+    double cy = cos(yaw),   sy = sin(yaw);
+    RigidBodyDynamics::Math::Matrix3d R;
+    R << cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr,
+         sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr,
+        -sp,     cp*sr,             cp*cr;
+    return R;
+}
+
+// 회전행렬 → RPY (ZYX convention)
+static void RotToRPY(const RigidBodyDynamics::Math::Matrix3d& R,
+                     double& roll, double& pitch, double& yaw)
+{
+    pitch = atan2(-R(2,0), sqrt(R(2,1)*R(2,1) + R(2,2)*R(2,2)));
+    roll  = atan2(R(2,1), R(2,2));
+    yaw   = atan2(R(1,0), R(0,0));
+}
 
 
 CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath, unsigned int auDOF)
@@ -421,6 +442,14 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
         goal_tcpPose.m_position[1] = 0.0;   // Y
         goal_tcpPose.m_position[2] = 0.8;   // Z
 
+        // 현재 자세 유지 (orientation 제어 비활성화)
+        goal_tcpPose.m_rotation = tcpPose.m_rotation;
+        // TODO: 목표 TCP 자세 (RPY, 단위: rad) - 로그의 Final RPY 참고해서 설정
+        // double goal_roll  = -0.6045;
+        // double goal_pitch = -0.6636;
+        // double goal_yaw   = -1.2223;
+        // goal_tcpPose.m_rotation = RPYToRot(goal_roll, goal_pitch, goal_yaw);
+
         m_goalTcpPoseForCheck = goal_tcpPose;
 
         m_bIkTrigger = FALSE;
@@ -450,8 +479,7 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     m_e_task[4] = goal_tcpPose.m_position[1] - tcpPose.m_position[1];
     m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
 
-    // 자세 오차 (rotation matrix → axis-angle 근사)
-    // TODO: 자세 제어 활성화 시 위치 드리프트 발생 확인 필요 → 현재 비활성화
+    // 자세 오차 비활성화 (XYZ만 제어)
     // RigidBodyDynamics::Math::Matrix3d R_err = goal_tcpPose.m_rotation * tcpPose.m_rotation.transpose();
     // m_e_task[0] = m_Kp_task_rot * 0.5 * (R_err(2,1) - R_err(1,2));
     // m_e_task[1] = m_Kp_task_rot * 0.5 * (R_err(0,2) - R_err(2,0));
@@ -486,7 +514,7 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
         m_Q_ref += m_Qd_ref * m_dt;
 
     // m_Q_ref가 실제 m_Q보다 MAX_REF_LEAD 이상 앞서지 못하도록 제한 (오버슈트 방지)
-    const double MAX_REF_LEAD = 0.15;  // rad
+    const double MAX_REF_LEAD = 0.20;  // rad
     for (unsigned int i = 0; i < m_uDOF; ++i)
     {
         double lead = m_Q_ref[i] - m_Q[i];
@@ -519,6 +547,8 @@ BOOL CControllerFullDynamicsRT::IsJointSettled(double vel_threshold)
     return TRUE;
 }
 
+// RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
+
 void CControllerFullDynamicsRT::PrintTcpVerificationResult()
 {
     double dx = m_tcpFinalPose.m_position[0] - m_tcpStartPose.m_position[0];
@@ -531,22 +561,23 @@ void CControllerFullDynamicsRT::PrintTcpVerificationResult()
 
     double err_norm = sqrt(ex*ex + ey*ey + ez*ez);
 
+    double r_start, p_start, y_start;
+    double r_goal,  p_goal,  y_goal;
+    double r_final, p_final, y_final;
+    RotToRPY(m_tcpStartPose.m_rotation,        r_start, p_start, y_start);
+    RotToRPY(m_goalTcpPoseForCheck.m_rotation,  r_goal,  p_goal,  y_goal);
+    RotToRPY(m_tcpFinalPose.m_rotation,         r_final, p_final, y_final);
+
     DBG_LOG_INFO("========== TCP Verification ==========");
-    DBG_LOG_INFO("TCP Start : X=%.6f Y=%.6f Z=%.6f",
-        m_tcpStartPose.m_position[0],
-        m_tcpStartPose.m_position[1],
-        m_tcpStartPose.m_position[2]);
-
-    DBG_LOG_INFO("TCP Goal  : X=%.6f Y=%.6f Z=%.6f",
-        m_goalTcpPoseForCheck.m_position[0],
-        m_goalTcpPoseForCheck.m_position[1],
-        m_goalTcpPoseForCheck.m_position[2]);
-
-    DBG_LOG_INFO("TCP Final : X=%.6f Y=%.6f Z=%.6f",
-        m_tcpFinalPose.m_position[0],
-        m_tcpFinalPose.m_position[1],
-        m_tcpFinalPose.m_position[2]);
-
+    DBG_LOG_INFO("TCP Start : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_tcpStartPose.m_position[0], m_tcpStartPose.m_position[1], m_tcpStartPose.m_position[2],
+        r_start, p_start, y_start);
+    DBG_LOG_INFO("TCP Goal  : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_goalTcpPoseForCheck.m_position[0], m_goalTcpPoseForCheck.m_position[1], m_goalTcpPoseForCheck.m_position[2],
+        r_goal, p_goal, y_goal);
+    DBG_LOG_INFO("TCP Final : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_tcpFinalPose.m_position[0], m_tcpFinalPose.m_position[1], m_tcpFinalPose.m_position[2],
+        r_final, p_final, y_final);
     DBG_LOG_INFO("Delta     : dX=%.6f dY=%.6f dZ=%.6f", dx, dy, dz);
     DBG_LOG_INFO("Error     : eX=%.6f eY=%.6f eZ=%.6f", ex, ey, ez);
     DBG_LOG_INFO("Norm Error: %.6f m", err_norm);

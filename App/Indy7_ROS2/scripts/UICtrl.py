@@ -334,7 +334,7 @@ class JointControl(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    qdarktheme.setup_theme("light")
+    app.setStyleSheet(qdarktheme.load_stylesheet("light"))
 
     window = JointControl()
     window.show()

@@ -15,7 +15,8 @@
       "Bash(find:*)",
       "Bash(pkg-config --cflags rtposix)",
       "Bash(ldconfig -p)",
-      "Bash(git -C /home/raimlab/RAON-RT show :App/Indy7/DataRecorder.h)"
+      "Bash(git -C /home/raimlab/RAON-RT show :App/Indy7/DataRecorder.h)",
+      "Bash(sudo ls:*)"
     ]
   }
 }
