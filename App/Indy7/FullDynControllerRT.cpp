@@ -350,6 +350,7 @@ BOOL
 CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutputTorque)
 {
     if (m_bIkTrigger) {
+        ComputeTcpFK();
         m_Q_ref    = m_Q;
         m_Qd_ref   = m_zero_vector;
         m_Qdd_ref  = m_zero_vector;
@@ -359,26 +360,28 @@ CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutpu
         goal_tcpPose.m_position[0] += 0.05;
         m_goalTcpPoseForCheck = goal_tcpPose;
 
-        m_bVerifyDone  = FALSE;
-        m_nStableCount = 0;
-        m_bIkTrigger   = FALSE;
+        m_bVerifyDone      = FALSE;
+        m_nStableCount     = 0;
+        m_bIkMotionStarted = FALSE;
+        m_bIkTrigger       = FALSE;
 
-        std::vector<unsigned int>                      body_ids;
-        std::vector<RigidBodyDynamics::Math::Vector3d> body_points;
-        std::vector<RigidBodyDynamics::Math::Vector3d> target_positions;
-        body_ids.push_back(m_body_id);
-        body_points.push_back(tcp_local_point);
-        target_positions.push_back(goal_tcpPose.m_position);
 
-        BOOL is_ok = RigidBodyDynamics::InverseKinematics(
-            m_rbdlModel, m_Q, body_ids, body_points, target_positions, m_Q_ref);
+
+
+        BOOL is_ok = RigidBodyDynamics::InverseKinematics(                                       
+            m_rbdlModel, m_Q,                                                                    
+            {m_body_id},                                                                         
+            {tcp_local_point},                                                                   
+            {goal_tcpPose.m_position},                                                           
+            m_Q_ref);   
 
         if (!is_ok) {
             DBG_LOG_WARN("(ComputeInverseKinematics) IK failed - falling back to gravity compensation");
             m_bIkReady = FALSE;
-            return ComputeGravityCompensation(avOutputTorque);
         }
-        m_bIkReady = TRUE;
+        else {
+            m_bIkReady = TRUE;
+        }
     }
 
     if (!m_bIkReady)
@@ -396,23 +399,38 @@ CControllerFullDynamicsRT::CheckIKConvergence()
     if (m_bVerifyDone) return;
 
     // 한 번이라도 움직임 감지 (관절 속도 > 0.02 rad/s)
-    if (!m_bIkMotionStarted && !IsJointSettled(0.02))
+    if (!m_bIkMotionStarted && !IsJointSettled(0.05))
         m_bIkMotionStarted = TRUE;
 
-    // 움직임 감지 후 속도 조건을 50사이클(50ms) 연속 유지해야 정지 판정
+    //움직임 감지 후 속도 조건을 50사이클(50ms) 연속 유지해야 정지 판정
     if (m_bIkMotionStarted) {
         if (IsJointSettled(0.01))
             m_nStableCount++;
         else
             m_nStableCount = 0;
 
-        if (m_nStableCount >= 50) {
+        if (m_nStableCount >= 500) {
             ComputeTcpFK();
             m_tcpFinalPose = tcpPose;
             PrintTcpVerificationResult();
             m_bVerifyDone = TRUE;
         }
     }
+
+
+    // if(m_bIkMotionStarted){
+    //     if(IsJointStopped())
+    //        m_nStableCount++;
+    //     else
+    //         m_nStableCount = 0;
+    //     if (m_nStableCount >= 2000) {
+    //         ComputeTcpFK();
+    //         m_tcpFinalPose = tcpPose;
+    //         PrintTcpVerificationResult();
+    //         m_bVerifyDone = TRUE;
+    //     }
+
+    //     }
 }
 
 
@@ -426,6 +444,7 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
         m_Q_ref        = m_Q;
         m_Qd_ref       = m_zero_vector;
         m_Qdd_ref      = m_zero_vector;
+
         m_bVerifyDone       = FALSE;
         m_bIkMotionStarted  = FALSE;
         m_nStableCount      = 0;
@@ -480,13 +499,13 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
 
     // 자세 오차 비활성화 (XYZ만 제어)
-    // RigidBodyDynamics::Math::Matrix3d R_err = goal_tcpPose.m_rotation * tcpPose.m_rotation.transpose();
-    // m_e_task[0] = m_Kp_task_rot * 0.5 * (R_err(2,1) - R_err(1,2));
-    // m_e_task[1] = m_Kp_task_rot * 0.5 * (R_err(0,2) - R_err(2,0));
-    // m_e_task[2] = m_Kp_task_rot * 0.5 * (R_err(1,0) - R_err(0,1));
-    m_e_task[0] = 0.0;
-    m_e_task[1] = 0.0;
-    m_e_task[2] = 0.0;
+    RigidBodyDynamics::Math::Matrix3d R_err = goal_tcpPose.m_rotation * tcpPose.m_rotation.transpose();
+    m_e_task[0] = m_Kp_task_rot * 0.5 * (R_err(2,1) - R_err(1,2));
+    m_e_task[1] = m_Kp_task_rot * 0.5 * (R_err(0,2) - R_err(2,0));
+    m_e_task[2] = m_Kp_task_rot * 0.5 * (R_err(1,0) - R_err(0,1));
+    // m_e_task[0] = 0.0;
+    // m_e_task[1] = 0.0;
+    // m_e_task[2] = 0.0;
 
     m_e_task[3] *= m_Kp_task_pos;
     m_e_task[4] *= m_Kp_task_pos;
@@ -502,7 +521,7 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     m_Qd_ref.noalias() = m_J_pinv * m_e_task;
 
     // 안전을 위한 관절 속도 클램핑
-    const double MAX_JOINT_VEL = 0.2;  // rad/s
+    const double MAX_JOINT_VEL = 0.3;  // rad/s
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
 
@@ -530,7 +549,6 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     CheckIKConvergence();
 
 
-    CheckIKConvergence();
 
 
     return TRUE;
@@ -541,6 +559,16 @@ BOOL CControllerFullDynamicsRT::IsJointSettled(double vel_threshold)
 {
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (fabs(m_Qd[i]) > vel_threshold) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL CControllerFullDynamicsRT::IsJointStopped(void)
+{
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        if (fabs(m_Qd[i]) > 0.04) {
             return FALSE;
         }
     }

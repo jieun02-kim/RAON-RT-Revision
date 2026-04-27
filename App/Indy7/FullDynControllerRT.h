@@ -104,9 +104,9 @@ public:
         }
     };
 
-    //RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.07};
+    RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.07};
     
-    RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.0};
+    // RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.0};
     BOOL ComputeTcpFK();
     Pose tcpPose;
     const Pose& GetTcpPose() const { return tcpPose; }
@@ -144,7 +144,8 @@ public:
     double m_Kp_task_pos = 1.0;                  // task-space position gain
     double m_Kp_task_rot = 1.0;                  // task-space orientation gain
     static constexpr double m_dt = 0.001;        // 1kHz → 1ms
-    static constexpr double m_lambda = 0.01;     // DLS damping factor
+    static constexpr double m_lambda = 0.005;     // DLS damping factor
+    // static constexpr double m_lambda = 0.01;     // DLS damping factor
 
     BOOL ComputeJacobianBasedInverseKinematics(std::vector<double>& avOutputTorque);
 
@@ -208,6 +209,7 @@ private:
     BOOL ComputeInverseKinematics(std::vector<double>& avOutputTorque);
     
     BOOL IsJointSettled(double vel_threshold);
+    BOOL IsJointStopped(void);
     void PrintTcpVerificationResult();
     
 };
