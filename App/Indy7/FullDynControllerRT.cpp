@@ -195,7 +195,9 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
         m_Q[i] = avCurrentPos[i];
         m_Qd[i] = avCurrentVel[i];
     }
-    
+
+    SetTcpReferencePose();
+
     // Compute control based on selected mode
     BOOL result = FALSE;
     switch (m_eControlMode) {
@@ -325,73 +327,102 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
 
 //===================================================================
 // jieun
-BOOL 
-CControllerFullDynamicsRT::ComputeTcpFK()
+
+
+BOOL CControllerFullDynamicsRT::IsJointSettled(double vel_threshold)
 {
-    RigidBodyDynamics::Math::Vector3d p_tcp;
-    RigidBodyDynamics::Math::Matrix3d R_base_to_body, R_body_to_base;
-
-    // tcp position 
-    p_tcp = RigidBodyDynamics::CalcBodyToBaseCoordinates(m_rbdlModel, m_Q, m_body_id, tcp_local_point);
-    
-    // tcp orientation - (R_base_to_body : base -> body) 
-    R_base_to_body = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, m_Q, m_body_id);
-    R_body_to_base = R_base_to_body.transpose();
-    
-    // base coordinates
-    tcpPose.m_position = p_tcp;
-    tcpPose.m_rotation = R_body_to_base;
-   
-    return TRUE;
-
-}
-
-BOOL
-CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutputTorque)
-{
-    if (m_bIkTrigger) {
-        ComputeTcpFK();
-        m_Q_ref    = m_Q;
-        m_Qd_ref   = m_zero_vector;
-        m_Qdd_ref  = m_zero_vector;
-
-        m_tcpStartPose     = tcpPose;
-        goal_tcpPose       = tcpPose;
-        goal_tcpPose.m_position[0] += 0.05;
-        m_goalTcpPoseForCheck = goal_tcpPose;
-
-        m_bVerifyDone      = FALSE;
-        m_nStableCount     = 0;
-        m_bIkMotionStarted = FALSE;
-        m_bIkTrigger       = FALSE;
-
-
-
-
-        BOOL is_ok = RigidBodyDynamics::InverseKinematics(                                       
-            m_rbdlModel, m_Q,                                                                    
-            {m_body_id},                                                                         
-            {tcp_local_point},                                                                   
-            {goal_tcpPose.m_position},                                                           
-            m_Q_ref);   
-
-        if (!is_ok) {
-            DBG_LOG_WARN("(ComputeInverseKinematics) IK failed - falling back to gravity compensation");
-            m_bIkReady = FALSE;
-        }
-        else {
-            m_bIkReady = TRUE;
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        if (fabs(m_Qd[i]) > vel_threshold) {
+            return FALSE;
         }
     }
-
-    if (!m_bIkReady)
-        return ComputeGravityCompensation(avOutputTorque);
-
-    ComputeTcpFK();
-    ComputeComputedTorque(avOutputTorque);
-    CheckIKConvergence();
     return TRUE;
 }
+
+BOOL CControllerFullDynamicsRT::IsJointStopped(void)
+{
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        if (fabs(m_Qd[i]) > 0.04) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+// RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
+
+void CControllerFullDynamicsRT::PrintTcpVerificationResult()
+{
+    double dx = m_tcpFinalPose.m_position[0] - m_tcpStartPose.m_position[0];
+    double dy = m_tcpFinalPose.m_position[1] - m_tcpStartPose.m_position[1];
+    double dz = m_tcpFinalPose.m_position[2] - m_tcpStartPose.m_position[2];
+
+    double ex = m_goalTcpPoseForCheck.m_position[0] - m_tcpFinalPose.m_position[0];
+    double ey = m_goalTcpPoseForCheck.m_position[1] - m_tcpFinalPose.m_position[1];
+    double ez = m_goalTcpPoseForCheck.m_position[2] - m_tcpFinalPose.m_position[2];
+
+    double err_norm = sqrt(ex*ex + ey*ey + ez*ez);
+
+    double r_start, p_start, y_start;
+    double r_goal,  p_goal,  y_goal;
+    double r_final, p_final, y_final;
+    RotToRPY(m_tcpStartPose.m_rotation,        r_start, p_start, y_start);
+    RotToRPY(m_goalTcpPoseForCheck.m_rotation,  r_goal,  p_goal,  y_goal);
+    RotToRPY(m_tcpFinalPose.m_rotation,         r_final, p_final, y_final);
+
+    DBG_LOG_INFO("========== TCP Verification ==========");
+    DBG_LOG_INFO("TCP Start : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_tcpStartPose.m_position[0], m_tcpStartPose.m_position[1], m_tcpStartPose.m_position[2],
+        r_start, p_start, y_start);
+    DBG_LOG_INFO("TCP Goal  : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_goalTcpPoseForCheck.m_position[0], m_goalTcpPoseForCheck.m_position[1], m_goalTcpPoseForCheck.m_position[2],
+        r_goal, p_goal, y_goal);
+    DBG_LOG_INFO("TCP Final : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        m_tcpFinalPose.m_position[0], m_tcpFinalPose.m_position[1], m_tcpFinalPose.m_position[2],
+        r_final, p_final, y_final);
+    double er = r_goal - r_final;
+    double ep = p_goal - p_final;
+    double ey_rot = y_goal - y_final;
+
+    DBG_LOG_INFO("Delta     : dX=%.6f dY=%.6f dZ=%.6f", dx, dy, dz);
+    DBG_LOG_INFO("Error     : eX=%.6f eY=%.6f eZ=%.6f", ex, ey, ez);
+    DBG_LOG_INFO("Norm Error: %.6f m", err_norm);
+    DBG_LOG_INFO("Rot Error : eR=%.6f eP=%.6f eY=%.6f (rad)", er, ep, ey_rot);
+    DBG_LOG_INFO("======================================");
+
+    // CSV에 오차 기록 (rt_ik_error_log/ 폴더에 누적 append)
+    const char* log_dir  = "rt_ik_error_log";
+    const char* csv_path = "rt_ik_error_log/ik_accuracy_log.csv";
+    mkdir(log_dir, 0755);  // 폴더 없으면 생성
+
+    bool write_header = false;
+    {
+        std::ifstream check(csv_path);
+        write_header = !check.good();
+    }
+    std::ofstream csv(csv_path, std::ios::app);
+    if (csv.is_open())
+    {
+        if (write_header)
+            csv << "goal_x,goal_y,goal_z,"
+                << "final_x,final_y,final_z,"
+                << "err_x,err_y,err_z,norm_err,"
+                << "goal_r,goal_p,goal_y,"
+                << "final_r,final_p,final_y,"
+                << "err_r,err_p,err_y\n";
+        csv << m_goalTcpPoseForCheck.m_position[0] << ","
+            << m_goalTcpPoseForCheck.m_position[1] << ","
+            << m_goalTcpPoseForCheck.m_position[2] << ","
+            << m_tcpFinalPose.m_position[0] << ","
+            << m_tcpFinalPose.m_position[1] << ","
+            << m_tcpFinalPose.m_position[2] << ","
+            << ex << "," << ey << "," << ez << "," << err_norm << ","
+            << r_goal << "," << p_goal << "," << y_goal << ","
+            << r_final << "," << p_final << "," << y_final << ","
+            << er << "," << ep << "," << ey_rot << "\n";
+    }
+}
+
 
 void
 CControllerFullDynamicsRT::CheckIKConvergence()
@@ -434,6 +465,100 @@ CControllerFullDynamicsRT::CheckIKConvergence()
 }
 
 
+BOOL 
+CControllerFullDynamicsRT::SetTcpReferencePose()
+{
+    if(m_bSetRefPoseTrigger==TRUE)
+    {
+        ComputeTcpFK();
+        double r_set, p_set, y_set;
+        RotToRPY(tcpPose.m_rotation, r_set, p_set, y_set);
+
+        DBG_LOG_INFO("========== Current TCP ==========");
+        DBG_LOG_INFO("TCP Setting : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
+        tcpPose.m_position[0], tcpPose.m_position[1], tcpPose.m_position[2],
+        r_set, r_set, r_set);
+        
+        goal_tcpPose = tcpPose;
+
+        DBG_LOG_INFO("========== Setting TCP  ==========");
+        m_bSetRefPoseTrigger = FALSE;
+
+    }
+    return TRUE;
+}
+
+
+
+BOOL 
+CControllerFullDynamicsRT::ComputeTcpFK()
+{
+    RigidBodyDynamics::Math::Vector3d p_tcp;
+    RigidBodyDynamics::Math::Matrix3d R_base_to_body, R_body_to_base;
+
+    // tcp position 
+    p_tcp = RigidBodyDynamics::CalcBodyToBaseCoordinates(m_rbdlModel, m_Q, m_body_id, tcp_local_point);
+    
+    // tcp orientation - (R_base_to_body : base -> body) 
+    R_base_to_body = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, m_Q, m_body_id);
+    R_body_to_base = R_base_to_body.transpose();
+    
+    // base coordinates
+    tcpPose.m_position = p_tcp;
+    tcpPose.m_rotation = R_body_to_base;
+   
+    return TRUE;
+
+}
+
+BOOL
+CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutputTorque)
+{
+    if (m_bIkTrigger) {
+        ComputeTcpFK();
+        m_Q_ref    = m_Q;
+        m_Qd_ref   = m_zero_vector;
+        m_Qdd_ref  = m_zero_vector;
+
+        m_tcpStartPose     = tcpPose;
+        // goal_tcpPose       = tcpPose;
+        // goal_tcpPose.m_position[0] += 0.05;
+        m_goalTcpPoseForCheck = goal_tcpPose;
+
+        m_bVerifyDone      = FALSE;
+        m_nStableCount     = 0;
+        m_bIkMotionStarted = FALSE;
+        m_bIkTrigger       = FALSE;
+
+
+
+
+        BOOL is_ok = RigidBodyDynamics::InverseKinematics(                                       
+            m_rbdlModel, m_Q,                                                                    
+            {m_body_id},                                                                         
+            {tcp_local_point},                                                                   
+            {goal_tcpPose.m_position},                                                           
+            m_Q_ref);   
+
+        if (!is_ok) {
+            DBG_LOG_WARN("(ComputeInverseKinematics) IK failed - falling back to gravity compensation");
+            m_bIkReady = FALSE;
+        }
+        else {
+            m_bIkReady = TRUE;
+        }
+    }
+
+    if (!m_bIkReady)
+        return ComputeGravityCompensation(avOutputTorque);
+
+    ComputeTcpFK();
+    ComputeComputedTorque(avOutputTorque);
+    CheckIKConvergence();
+    return TRUE;
+}
+
+
 BOOL
 CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<double>& avOutputTorque)
 {
@@ -456,13 +581,14 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
         // goal_tcpPose          = tcpPose;
         // goal_tcpPose.m_position[0] += 0.05;
 
-        // TODO: 목표 TCP 위치 (절대 좌표, 단위: m)
-        goal_tcpPose.m_position[0] = 0.5;   // X
-        goal_tcpPose.m_position[1] = 0.0;   // Y
-        goal_tcpPose.m_position[2] = 0.8;   // Z
+        // // TODO: 목표 TCP 위치 (절대 좌표, 단위: m)
+        // goal_tcpPose.m_position[0] = 0.5;   // X
+        // goal_tcpPose.m_position[1] = 0.0;   // Y
+        // goal_tcpPose.m_position[2] = 0.8;   // Z
 
-        // 현재 자세 유지 (orientation 제어 비활성화)
-        goal_tcpPose.m_rotation = tcpPose.m_rotation;
+        // // 현재 자세 유지 (orientation 제어 비활성화)
+        // goal_tcpPose.m_rotation = tcpPose.m_rotation;
+
         // TODO: 목표 TCP 자세 (RPY, 단위: rad) - 로그의 Final RPY 참고해서 설정
         // double goal_roll  = -0.6045;
         // double goal_pitch = -0.6636;
@@ -520,16 +646,16 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     // 5. 관절 속도 레퍼런스: q̇_ref = J⁺ * e_task
     m_Qd_ref.noalias() = m_J_pinv * m_e_task;
 
-    // 안전을 위한 관절 속도 클램핑
+    // velocity clamping
     const double MAX_JOINT_VEL = 0.3;  // rad/s
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
 
-    // 6. q_ref 적분: 오차가 2mm 이상일 때만 적분 (windup 방지)
+    // 6. q_ref 적분: 오차가 1mm 이상일 때만 적분 (windup 방지)
     double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
                               m_e_task[4]*m_e_task[4] +
                               m_e_task[5]*m_e_task[5]);
-    if (pos_err_now > 0.002)
+    if (pos_err_now > 0.001)
         m_Q_ref += m_Qd_ref * m_dt;
 
     // m_Q_ref가 실제 m_Q보다 MAX_REF_LEAD 이상 앞서지 못하도록 제한 (오버슈트 방지)
@@ -555,88 +681,6 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
 }
 
 
-BOOL CControllerFullDynamicsRT::IsJointSettled(double vel_threshold)
-{
-    for (unsigned int i = 0; i < m_uDOF; ++i) {
-        if (fabs(m_Qd[i]) > vel_threshold) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-BOOL CControllerFullDynamicsRT::IsJointStopped(void)
-{
-    for (unsigned int i = 0; i < m_uDOF; ++i) {
-        if (fabs(m_Qd[i]) > 0.04) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-// RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
-
-void CControllerFullDynamicsRT::PrintTcpVerificationResult()
-{
-    double dx = m_tcpFinalPose.m_position[0] - m_tcpStartPose.m_position[0];
-    double dy = m_tcpFinalPose.m_position[1] - m_tcpStartPose.m_position[1];
-    double dz = m_tcpFinalPose.m_position[2] - m_tcpStartPose.m_position[2];
-
-    double ex = m_goalTcpPoseForCheck.m_position[0] - m_tcpFinalPose.m_position[0];
-    double ey = m_goalTcpPoseForCheck.m_position[1] - m_tcpFinalPose.m_position[1];
-    double ez = m_goalTcpPoseForCheck.m_position[2] - m_tcpFinalPose.m_position[2];
-
-    double err_norm = sqrt(ex*ex + ey*ey + ez*ez);
-
-    double r_start, p_start, y_start;
-    double r_goal,  p_goal,  y_goal;
-    double r_final, p_final, y_final;
-    RotToRPY(m_tcpStartPose.m_rotation,        r_start, p_start, y_start);
-    RotToRPY(m_goalTcpPoseForCheck.m_rotation,  r_goal,  p_goal,  y_goal);
-    RotToRPY(m_tcpFinalPose.m_rotation,         r_final, p_final, y_final);
-
-    DBG_LOG_INFO("========== TCP Verification ==========");
-    DBG_LOG_INFO("TCP Start : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
-        m_tcpStartPose.m_position[0], m_tcpStartPose.m_position[1], m_tcpStartPose.m_position[2],
-        r_start, p_start, y_start);
-    DBG_LOG_INFO("TCP Goal  : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
-        m_goalTcpPoseForCheck.m_position[0], m_goalTcpPoseForCheck.m_position[1], m_goalTcpPoseForCheck.m_position[2],
-        r_goal, p_goal, y_goal);
-    DBG_LOG_INFO("TCP Final : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
-        m_tcpFinalPose.m_position[0], m_tcpFinalPose.m_position[1], m_tcpFinalPose.m_position[2],
-        r_final, p_final, y_final);
-    DBG_LOG_INFO("Delta     : dX=%.6f dY=%.6f dZ=%.6f", dx, dy, dz);
-    DBG_LOG_INFO("Error     : eX=%.6f eY=%.6f eZ=%.6f", ex, ey, ez);
-    DBG_LOG_INFO("Norm Error: %.6f m", err_norm);
-    DBG_LOG_INFO("======================================");
-
-    // CSV에 오차 기록 (rt_ik_error_log/ 폴더에 누적 append)
-    const char* log_dir  = "rt_ik_error_log";
-    const char* csv_path = "rt_ik_error_log/ik_accuracy_log.csv";
-    mkdir(log_dir, 0755);  // 폴더 없으면 생성
-
-    bool write_header = false;
-    {
-        std::ifstream check(csv_path);
-        write_header = !check.good();
-    }
-    std::ofstream csv(csv_path, std::ios::app);
-    if (csv.is_open())
-    {
-        if (write_header)
-            csv << "goal_x,goal_y,goal_z,"
-                << "final_x,final_y,final_z,"
-                << "err_x,err_y,err_z,norm_err\n";
-        csv << m_goalTcpPoseForCheck.m_position[0] << ","
-            << m_goalTcpPoseForCheck.m_position[1] << ","
-            << m_goalTcpPoseForCheck.m_position[2] << ","
-            << m_tcpFinalPose.m_position[0] << ","
-            << m_tcpFinalPose.m_position[1] << ","
-            << m_tcpFinalPose.m_position[2] << ","
-            << ex << "," << ey << "," << ez << "," << err_norm << "\n";
-    }
-}
 
 //===================================================================
 

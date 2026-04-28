@@ -502,6 +502,12 @@ CRobotIndy7::DoInput()
             DBG_LOG_INFO(">>> RT Controller: Logging");
             m_bLogTrigger = TRUE;
             break;
+        case 's':
+        case 'S':
+            DBG_LOG_INFO(">>> RT Controller: what is current pose?");
+            m_pController->m_bSetRefPoseTrigger = TRUE;
+            
+            break;
 
         default:
             break;

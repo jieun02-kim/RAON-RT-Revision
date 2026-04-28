@@ -105,8 +105,8 @@ private:
 	//jieun
 	LogRingBuffer            m_logBuffer;
 	std::atomic<bool>        m_bLogTrigger{false};
+	std::atomic<bool>        m_bSetRefPoseTrigger{false};
 	
-
 
 public:
     friend FILE* make_csv(CRobotIndy7*); 
