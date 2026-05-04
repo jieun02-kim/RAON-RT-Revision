@@ -58,7 +58,8 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qd_ref.resize(auDOF);
     m_Qdd_ref.resize(auDOF);
     m_zero_vector.resize(auDOF);
-    
+    m_Q_ik_target.resize(auDOF);
+
     m_M.resize(auDOF, auDOF);
     m_h.resize(auDOF);
     m_g.resize(auDOF);
@@ -79,7 +80,8 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qd_ref.setZero();
     m_Qdd_ref.setZero();
     m_zero_vector.setZero();
-    
+    m_Q_ik_target.setZero();
+
     m_M.setZero();
     m_h.setZero();
     m_g.setZero();
@@ -211,8 +213,13 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
             result = ComputeComputedTorque(avOutputTorque);
             break;
         case eInverseKinematics:
-            //result = ComputeInverseKinematics(avOutputTorque);
             result = ComputeJacobianBasedInverseKinematics(avOutputTorque);
+            break;
+        case eInverseKinematics_Pos:
+            result = ComputeInverseKinematics(avOutputTorque);
+            break;
+        case eInverseKinematics_6dof:
+            result = ComputeInverseKinematics_6dof(avOutputTorque);
             break;
 
         default:
@@ -380,14 +387,18 @@ void CControllerFullDynamicsRT::PrintTcpVerificationResult()
     DBG_LOG_INFO("TCP Final : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
         m_tcpFinalPose.m_position[0], m_tcpFinalPose.m_position[1], m_tcpFinalPose.m_position[2],
         r_final, p_final, y_final);
-    double er = r_goal - r_final;
-    double ep = p_goal - p_final;
-    double ey_rot = y_goal - y_final;
+    // 회전 오차: R_err = R_goal * R_final^T → axis-angle (vee map)
+    RigidBodyDynamics::Math::Matrix3d R_err =
+        m_goalTcpPoseForCheck.m_rotation * m_tcpFinalPose.m_rotation.transpose();
+    double er     = 0.5 * (R_err(2,1) - R_err(1,2));
+    double ep     = 0.5 * (R_err(0,2) - R_err(2,0));
+    double ey_rot = 0.5 * (R_err(1,0) - R_err(0,1));
+    double rot_err_norm = sqrt(er*er + ep*ep + ey_rot*ey_rot);
 
     DBG_LOG_INFO("Delta     : dX=%.6f dY=%.6f dZ=%.6f", dx, dy, dz);
     DBG_LOG_INFO("Error     : eX=%.6f eY=%.6f eZ=%.6f", ex, ey, ez);
     DBG_LOG_INFO("Norm Error: %.6f m", err_norm);
-    DBG_LOG_INFO("Rot Error : eR=%.6f eP=%.6f eY=%.6f (rad)", er, ep, ey_rot);
+    DBG_LOG_INFO("Rot Error : eR=%.6f eP=%.6f eY=%.6f (rad) | Norm=%.6f", er, ep, ey_rot, rot_err_norm);
     DBG_LOG_INFO("======================================");
 
     // CSV에 오차 기록 (rt_ik_error_log/ 폴더에 누적 append)
@@ -409,7 +420,7 @@ void CControllerFullDynamicsRT::PrintTcpVerificationResult()
                 << "err_x,err_y,err_z,norm_err,"
                 << "goal_r,goal_p,goal_y,"
                 << "final_r,final_p,final_y,"
-                << "err_r,err_p,err_y\n";
+                << "err_r,err_p,err_y,rot_norm_err\n";
         csv << m_goalTcpPoseForCheck.m_position[0] << ","
             << m_goalTcpPoseForCheck.m_position[1] << ","
             << m_goalTcpPoseForCheck.m_position[2] << ","
@@ -419,7 +430,7 @@ void CControllerFullDynamicsRT::PrintTcpVerificationResult()
             << ex << "," << ey << "," << ez << "," << err_norm << ","
             << r_goal << "," << p_goal << "," << y_goal << ","
             << r_final << "," << p_final << "," << y_final << ","
-            << er << "," << ep << "," << ey_rot << "\n";
+            << er << "," << ep << "," << ey_rot << "," << rot_err_norm << "\n";
     }
 }
 
@@ -430,17 +441,17 @@ CControllerFullDynamicsRT::CheckIKConvergence()
     if (m_bVerifyDone) return;
 
     // 한 번이라도 움직임 감지 (관절 속도 > 0.02 rad/s)
-    if (!m_bIkMotionStarted && !IsJointSettled(0.05))
+    if (!m_bIkMotionStarted && !IsJointSettled(0.02))
         m_bIkMotionStarted = TRUE;
 
-    //움직임 감지 후 속도 조건을 50사이클(50ms) 연속 유지해야 정지 판정
+    //움직임 감지 후 속도 조건을 5ms 연속 유지해야 정지 판정
     if (m_bIkMotionStarted) {
         if (IsJointSettled(0.01))
             m_nStableCount++;
         else
             m_nStableCount = 0;
 
-        if (m_nStableCount >= 500) {
+        if (m_nStableCount >= 5000) {
             ComputeTcpFK();
             m_tcpFinalPose = tcpPose;
             PrintTcpVerificationResult();
@@ -477,7 +488,7 @@ CControllerFullDynamicsRT::SetTcpReferencePose()
         DBG_LOG_INFO("========== Current TCP ==========");
         DBG_LOG_INFO("TCP Setting : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f (rad)",
         tcpPose.m_position[0], tcpPose.m_position[1], tcpPose.m_position[2],
-        r_set, r_set, r_set);
+        r_set, p_set, y_set);
         
         goal_tcpPose = tcpPose;
 
@@ -516,13 +527,12 @@ CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutpu
 {
     if (m_bIkTrigger) {
         ComputeTcpFK();
-        m_Q_ref    = m_Q;
-        m_Qd_ref   = m_zero_vector;
-        m_Qdd_ref  = m_zero_vector;
+        m_Q_ref       = m_Q;
+        m_Q_ik_target = m_Q;
+        m_Qd_ref      = m_zero_vector;
+        m_Qdd_ref     = m_zero_vector;
 
-        m_tcpStartPose     = tcpPose;
-        // goal_tcpPose       = tcpPose;
-        // goal_tcpPose.m_position[0] += 0.05;
+        m_tcpStartPose        = tcpPose;
         m_goalTcpPoseForCheck = goal_tcpPose;
 
         m_bVerifyDone      = FALSE;
@@ -530,15 +540,13 @@ CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutpu
         m_bIkMotionStarted = FALSE;
         m_bIkTrigger       = FALSE;
 
-
-
-
-        BOOL is_ok = RigidBodyDynamics::InverseKinematics(                                       
-            m_rbdlModel, m_Q,                                                                    
-            {m_body_id},                                                                         
-            {tcp_local_point},                                                                   
-            {goal_tcpPose.m_position},                                                           
-            m_Q_ref);   
+        // IK 해를 m_Q_ik_target에 저장 (m_Q_ref에 직접 쓰지 않음)
+        BOOL is_ok = RigidBodyDynamics::InverseKinematics(
+            m_rbdlModel, m_Q,
+            {m_body_id},
+            {tcp_local_point},
+            {goal_tcpPose.m_position},
+            m_Q_ik_target);
 
         if (!is_ok) {
             DBG_LOG_WARN("(ComputeInverseKinematics) IK failed - falling back to gravity compensation");
@@ -551,6 +559,101 @@ CControllerFullDynamicsRT::ComputeInverseKinematics(std::vector<double>& avOutpu
 
     if (!m_bIkReady)
         return ComputeGravityCompensation(avOutputTorque);
+
+    // 점진적 추종: m_Q_ref → m_Q_ik_target (속도 제한)
+    const double MAX_JOINT_VEL = 0.3;   // rad/s
+    const double MAX_REF_LEAD  = 0.10;  // rad
+    const double max_step      = MAX_JOINT_VEL * m_dt;
+
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        double step = m_Q_ik_target[i] - m_Q_ref[i];
+        step = std::max(-max_step, std::min(max_step, step));
+        m_Q_ref[i] += step;
+
+        // 실제 관절과 ref가 너무 앞서지 않도록 제한
+        double lead = m_Q_ref[i] - m_Q[i];
+        if (fabs(lead) > MAX_REF_LEAD)
+            m_Q_ref[i] = m_Q[i] + (lead > 0 ? MAX_REF_LEAD : -MAX_REF_LEAD);
+    }
+
+    m_Qdd_ref = m_zero_vector;
+
+    ComputeTcpFK();
+    ComputeComputedTorque(avOutputTorque);
+    CheckIKConvergence();
+    return TRUE;
+}
+
+
+BOOL
+CControllerFullDynamicsRT::ComputeInverseKinematics_6dof(std::vector<double>& avOutputTorque)
+{
+    if (m_bIkTrigger) {
+        ComputeTcpFK();
+        m_Q_ref       = m_Q;
+        m_Q_ik_target = m_Q;
+        m_Qd_ref      = m_zero_vector;
+        m_Qdd_ref     = m_zero_vector;
+
+        m_tcpStartPose = tcpPose;
+
+        // 'p' 키 누른 시점의 orientation을 목표로 설정 (position은 's' 키 저장값 유지)
+        goal_tcpPose.m_rotation = tcpPose.m_rotation;
+
+        m_goalTcpPoseForCheck = goal_tcpPose;
+
+        m_bVerifyDone      = FALSE;
+        m_nStableCount     = 0;
+        m_bIkMotionStarted = FALSE;
+        m_bIkTrigger       = FALSE;
+
+        double r_goal, p_goal, y_goal;
+        RotToRPY(goal_tcpPose.m_rotation, r_goal, p_goal, y_goal);
+        DBG_LOG_INFO("========== 6DOF IK Command ==========");
+        DBG_LOG_INFO("Start : X=%.4f Y=%.4f Z=%.4f", m_tcpStartPose.m_position[0], m_tcpStartPose.m_position[1], m_tcpStartPose.m_position[2]);
+        DBG_LOG_INFO("Goal  : X=%.4f Y=%.4f Z=%.4f | R=%.4f P=%.4f Y=%.4f",
+            goal_tcpPose.m_position[0], goal_tcpPose.m_position[1], goal_tcpPose.m_position[2],
+            r_goal, p_goal, y_goal);
+
+        // 6DOF IK: position + orientation 동시 제약 → m_Q_ik_target에 저장
+        RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+        CS.num_steps      = 1000;   // default 100 → 수렴 기회 늘리기
+        CS.step_tol       = 1.0e-10;
+        CS.constraint_tol = 1.0e-8;
+        CS.AddPointConstraint(m_body_id, tcp_local_point, goal_tcpPose.m_position);
+        CS.AddOrientationConstraint(m_body_id, goal_tcpPose.m_rotation.transpose()); // RBDL expects R_base_to_body
+
+        BOOL is_ok = RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, m_Q_ik_target);
+
+        if (!is_ok) {
+            DBG_LOG_WARN("(ComputeInverseKinematics_6dof) IK failed - goal pos=(%.4f, %.4f, %.4f)",
+                goal_tcpPose.m_position[0], goal_tcpPose.m_position[1], goal_tcpPose.m_position[2]);
+            m_bIkReady = FALSE;
+        }
+        else {
+            m_bIkReady = TRUE;
+        }
+    }
+
+    if (!m_bIkReady)
+        return ComputeGravityCompensation(avOutputTorque);
+
+    // 점진적 추종: m_Q_ref → m_Q_ik_target (속도 제한)
+    const double MAX_JOINT_VEL = 0.3;   // rad/s
+    const double MAX_REF_LEAD  = 0.10;  // rad
+    const double max_step      = MAX_JOINT_VEL * m_dt;
+
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        double step = m_Q_ik_target[i] - m_Q_ref[i];
+        step = std::max(-max_step, std::min(max_step, step));
+        m_Q_ref[i] += step;
+
+        double lead = m_Q_ref[i] - m_Q[i];
+        if (fabs(lead) > MAX_REF_LEAD)
+            m_Q_ref[i] = m_Q[i] + (lead > 0 ? MAX_REF_LEAD : -MAX_REF_LEAD);
+    }
+
+    m_Qdd_ref = m_zero_vector;
 
     ComputeTcpFK();
     ComputeComputedTorque(avOutputTorque);
@@ -586,8 +689,8 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
         // goal_tcpPose.m_position[1] = 0.0;   // Y
         // goal_tcpPose.m_position[2] = 0.8;   // Z
 
-        // // 현재 자세 유지 (orientation 제어 비활성화)
-        // goal_tcpPose.m_rotation = tcpPose.m_rotation;
+        // 현재 자세 유지: 'i' 키 누른 시점의 orientation을 목표로 설정
+        goal_tcpPose.m_rotation = tcpPose.m_rotation;
 
         // TODO: 목표 TCP 자세 (RPY, 단위: rad) - 로그의 Final RPY 참고해서 설정
         // double goal_roll  = -0.6045;
@@ -637,10 +740,19 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     m_e_task[4] *= m_Kp_task_pos;
     m_e_task[5] *= m_Kp_task_pos;
 
+
+    
+
+    // 6. q_ref 적분용 위치 오차 계산 (gain 적용 전 raw 오차)
+    double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
+                              m_e_task[4]*m_e_task[4] +
+                              m_e_task[5]*m_e_task[5]) / m_Kp_task_pos;
+
     // 4. DLS pseudo-inverse: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
-    // 특이점 근처에서도 안정적으로 동작 (Damped Least Squares)
+    // 목표 근접 시 λ를 줄여 수렴 정확도 향상 (adaptive damping)
+    double lambda = (pos_err_now < 0.01) ? 0.0005 : m_lambda;
     m_JJt.noalias() = m_J * m_J.transpose();
-    m_JJt.diagonal().array() += m_lambda * m_lambda;
+    m_JJt.diagonal().array() += lambda * lambda;
     m_J_pinv.noalias() = m_J.transpose() * m_JJt.inverse();
 
     // 5. 관절 속도 레퍼런스: q̇_ref = J⁺ * e_task
@@ -651,15 +763,12 @@ CControllerFullDynamicsRT::ComputeJacobianBasedInverseKinematics(std::vector<dou
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
 
-    // 6. q_ref 적분: 오차가 1mm 이상일 때만 적분 (windup 방지)
-    double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
-                              m_e_task[4]*m_e_task[4] +
-                              m_e_task[5]*m_e_task[5]);
+    // q_ref 적분: 오차가 1mm 이상일 때만 적분 (windup 방지)
     if (pos_err_now > 0.001)
         m_Q_ref += m_Qd_ref * m_dt;
 
     // m_Q_ref가 실제 m_Q보다 MAX_REF_LEAD 이상 앞서지 못하도록 제한 (오버슈트 방지)
-    const double MAX_REF_LEAD = 0.20;  // rad
+    const double MAX_REF_LEAD = 0.10;  // rad
     for (unsigned int i = 0; i < m_uDOF; ++i)
     {
         double lead = m_Q_ref[i] - m_Q[i];

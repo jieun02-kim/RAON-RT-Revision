@@ -59,7 +59,9 @@ public:
         eFullDynamics,
         eComputedTorque,
         eAdaptiveControl,
-        eInverseKinematics
+        eInverseKinematics,       // 'i' : Jacobian-based IK
+        eInverseKinematics_Pos,   // 'o' : RBDL IK (position only)
+        eInverseKinematics_6dof   // 'p' : RBDL IK (position + orientation)
     };
     
     void SetControlMode(eControlMode aeMode) { m_eControlMode = aeMode; }
@@ -150,7 +152,8 @@ public:
     double m_Kp_task_pos = 1.0;                  // task-space position gain
     double m_Kp_task_rot = 1.0;                  // task-space orientation gain
     static constexpr double m_dt = 0.001;        // 1kHz → 1ms
-    static constexpr double m_lambda = 0.003;     // DLS damping factor
+    static constexpr double m_lambda = 0.01;     // DLS damping factor
+    
     // static constexpr double m_lambda = 0.01;     // DLS damping factor
 
     
@@ -173,6 +176,7 @@ private:
     RigidBodyDynamics::Math::VectorNd m_Qd_ref;         // Reference velocity
     RigidBodyDynamics::Math::VectorNd m_Qdd_ref;        // Reference acceleration
     RigidBodyDynamics::Math::VectorNd m_zero_vector;    // Zero vector
+    RigidBodyDynamics::Math::VectorNd m_Q_ik_target;    // RBDL IK solution (final target)
     
     // Dynamics components
     RigidBodyDynamics::Math::MatrixNd m_M;              // Inertia matrix M(q)
@@ -213,7 +217,8 @@ private:
     //BOOL ComputeTcpFK(std::vector<double>& avOutputTorque);
     //Pose tcpPose;
     BOOL ComputeInverseKinematics(std::vector<double>& avOutputTorque);
-    
+    BOOL ComputeInverseKinematics_6dof(std::vector<double>& avOutputTorque);
+
     BOOL IsJointSettled(double vel_threshold);
     BOOL IsJointStopped(void);
     void PrintTcpVerificationResult();

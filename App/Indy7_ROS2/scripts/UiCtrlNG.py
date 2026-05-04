@@ -96,9 +96,12 @@ class ROS2Worker(QThread):
         future = self.get_gains_client.call_async(req)
 
         def handle_response():
+            import time
             try:
-                # Wait for the response with timeout
-                rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+                timeout = 5.0
+                start = time.time()
+                while not future.done() and (time.time() - start) < timeout:
+                    time.sleep(0.05)
                 if future.done():
                     response = future.result()
                     if response.success:
@@ -138,9 +141,12 @@ class ROS2Worker(QThread):
         future = self.get_control_mode_client.call_async(req)
 
         def handle_response():
+            import time
             try:
-                # Wait for result with timeout
-                rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+                timeout = 5.0
+                start = time.time()
+                while not future.done() and (time.time() - start) < timeout:
+                    time.sleep(0.05)
                 if future.done():
                     response = future.result()
                     if hasattr(response, "control_mode"):

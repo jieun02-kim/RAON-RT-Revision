@@ -493,8 +493,22 @@ CRobotIndy7::DoInput()
         case 'i':
         case 'I':
             m_pEcatSensor[0]->LED_RED(TRUE);
-            DBG_LOG_INFO(">>> RT Controller: Computed Inverse Kinematics Mode");
+            DBG_LOG_INFO(">>> RT Controller: Jacobian IK Mode");
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+            m_pController->m_bIkTrigger = TRUE;
+            break;
+        case 'n':
+        case 'N':
+            m_pEcatSensor[0]->LED_RED(TRUE);
+            DBG_LOG_INFO(">>> RT Controller: RBDL IK (Position only) Mode");
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_Pos);
+            m_pController->m_bIkTrigger = TRUE;
+            break;
+        case 'm':
+        case 'M':
+            m_pEcatSensor[0]->LED_RED(TRUE);
+            DBG_LOG_INFO(">>> RT Controller: RBDL IK (6DOF) Mode");
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
             m_pController->m_bIkTrigger = TRUE;
             break;
         case 'l':
@@ -823,19 +837,18 @@ proc_terminal_output(void* apRobot)
     {
         wait_next_period(NULL);
 
-    //     // /* TODO: Last slave is Sensor, we must do this only for Axis */
-    //     for (int nMotCnt = 0; nMotCnt < pRobot->GetTotalAxis(); nMotCnt++)
-    //     {
-        //  DBG_LOG_TRACE("[SLAVE %d]", nMotCnt);
+        // /* TODO: Last slave is Sensor, we must do this only for Axis */
+        // for (int nMotCnt = 0; nMotCnt < pRobot->GetTotalAxis(); nMotCnt++)
+        // {
+        //     DBG_LOG_TRACE("[SLAVE %d]", nMotCnt);
         //     DBG_LOG_TRACE("TargetPos: %d, RawPos:%d", pRobot->m_pEcatAxis[nMotCnt]->GetTargetRawPos(), pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawPos());
         //     DBG_LOG_TRACE("RawVel:%d RawTor: %d",pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawVel(), pRobot->m_pEcatAxis[nMotCnt]->GetCurrentRawTor());
-                                
-        //      DBG_LOG_TRACE("ControlWord %04x, StatusWord %04x", pRobot->m_pEcatAxis[nMotCnt]->GetControlWord(), pRobot->m_pEcatAxis[nMotCnt]->GetStatusWord());
+        //     DBG_LOG_TRACE("ControlWord %04x, StatusWord %04x", pRobot->m_pEcatAxis[nMotCnt]->GetControlWord(), pRobot->m_pEcatAxis[nMotCnt]->GetStatusWord());
         //     DBG_LOG_TRACE("CurrentPos: %lf", pRobot->m_pEcatAxis[nMotCnt]->GetCurrentPosD());
         //     DBG_LOG_TRACE("HomePosition: %d StartPos:%d", pRobot->m_pEcatAxis[nMotCnt]->GetHomePosition(), pRobot->m_pEcatAxis[nMotCnt]->GetStartRawPos());
-        //      DBG_LOG_TRACE("IsServoOn: %d\n", pRobot->m_pEcatAxis[nMotCnt]->IsServoOn());
-        //      DBG_LOG_TRACE("DriveMode: %s\n", GetCIA402DriveMode(pRobot->m_pEcatAxis[nMotCnt]->GetDriveMode()).c_str());
-    //     }
+        //     DBG_LOG_TRACE("IsServoOn: %d\n", pRobot->m_pEcatAxis[nMotCnt]->IsServoOn());
+        //     DBG_LOG_TRACE("DriveMode: %s\n", GetCIA402DriveMode(pRobot->m_pEcatAxis[nMotCnt]->GetDriveMode()).c_str());
+        // }
 
 
                 //==================================================================================

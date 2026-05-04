@@ -40,7 +40,13 @@ CROS2Executor::CROS2Executor(int domain_id)
 
 CROS2Executor::~CROS2Executor()
 {
-	rclcpp::shutdown();
+    if (m_pExecutor) {
+        delete m_pExecutor;
+        m_pExecutor = nullptr;
+    }
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
 }
 
 BOOL
@@ -354,7 +360,8 @@ CROS2Executor::CreateSpinThread(CROS2Node* apNode, BOOL abMulti)
 			case eSET_ALL_POS_CLI:
 					pCliSetAllPos = (CROS2SetAllPosCli*)apNode;
 					executor.remove_node(pCliSetAllPos->GetSharedPtr());
-					case eSET_CONTROL_MODE_SRV:
+					break;
+			case eSET_CONTROL_MODE_SRV:
 					pSrvSetControlMode = (CROS2SetControlModeSrv*)apNode;
 					executor.remove_node(pSrvSetControlMode->GetSharedPtr());
 					break;
@@ -401,6 +408,8 @@ CROS2Executor::DeInit()
 	}
 	m_vecSpinThread.clear();
 	
-	rclcpp::shutdown();
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
 	return TRUE;
 }
