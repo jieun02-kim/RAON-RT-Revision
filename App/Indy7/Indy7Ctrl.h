@@ -17,8 +17,6 @@
 #include "AxisNRMKCore.h"
 #include "SensorNRMKEndTool.h"
 #include "FullDynControllerRT.h"
-//jieun
-#include "DataRecorder.h"
 
 
 typedef std::vector<double> VECDOUBLE;
@@ -53,6 +51,8 @@ public:
 	virtual BOOL	Init					(BOOL abSim);
 	virtual BOOL	DeInit					(	);
 	void	WriteDataLog					(	);
+
+	enum eISOHWState { eISO_HW_IDLE=0, eISO_HW_TO_TARGET, eISO_HW_TO_CLEARANCE, eISO_HW_DONE };
 	
 	/* Controller */
 	CControllerFullDynamicsRT* GetController() { return m_pController; }
@@ -83,8 +83,8 @@ protected:
 	friend void	proc_main_control(void*);
 	friend void proc_ethercat_control(void*);
 	friend void	proc_keyboard_control(void*);
-	friend void	proc_logger(void*); 
 	friend void proc_terminal_output(void*);
+	friend void proc_logger(void*);
 
 private:
 	BOOL m_bEcatOP;
@@ -103,14 +103,23 @@ private:
 
 	//=====================================================
 	//jieun
-	LogRingBuffer            m_logBuffer;
-	std::atomic<bool>        m_bLogTrigger{false};
-	
-	
+
+	// ISO Hardware Test
+	std::atomic<bool>               m_bIsoHWTrigger{false};
+	eISOHWState                     m_eISOHWState{eISO_HW_IDLE};
+	int                             m_nISOPointIdx{0};
+	int                             m_nISOCycle{0};
+	bool                            m_bISOCmdSent{false};
+	double                          m_isoHWRecords[5][10][3];
+	CControllerFullDynamicsRT::Pose m_isoTargets[5];
+	CControllerFullDynamicsRT::Pose m_isoClearance;
+
+	CControllerFullDynamicsRT::Pose	m_Pose;
+	void SaveISOHWResults();
+
+	//=====================================================
 
 public:
-    friend FILE* make_csv(CRobotIndy7*); 
-	
 	//=====================================================
 	
 

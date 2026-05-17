@@ -83,10 +83,15 @@ CRobot::DeInit()
 		m_pcEcatMaster->DeInit();
 	}
 
-	// for (INT nCnt = 0; nCnt < GetTotalAxis(); nCnt++)
-	// {
-	// 	m_pcConfigRobot->WriteLastPosition(nCnt, m_vAxis[nCnt]->GetCurrentRawPos());
-	// }
+
+	for (INT nCnt = 0; nCnt < GetTotalAxis(); nCnt++)
+	{
+		INT32 nRawPos = m_vAxis[nCnt]->GetCurrentRawPos();
+		DBG_LOG_INFO("(DeInit) AXIS[%d] CurrentRawPos: %d, HomePosition: %d, Diff: %d",
+			nCnt, nRawPos, m_vAxis[nCnt]->GetHomePosition(), nRawPos - m_vAxis[nCnt]->GetHomePosition());
+		m_pcConfigRobot->WriteLastPosition(nCnt, nRawPos);
+		DBG_LOG_INFO("(DeInit) AXIS[%d] POS_BEFORE_EXIT saved: %d", nCnt, nRawPos);
+	}
 
 	if (NULL != m_pcConfigRobot)
 	{

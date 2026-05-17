@@ -51,6 +51,9 @@ public:
     BOOL SetControlGain(UINT auAxis, double adKp, double adKd);
     BOOL GetControlGain(UINT auAxis, double* adKp, double* adKd);
     UINT GetDOF() const { return m_uDOF; }
+
+    void SetTrajectoryDuration(double adT_sec) { m_traj_duration = adT_sec; }
+    bool IsTrajectoryDone() const { return !m_traj.active; }
   
 
     // Controller modes
@@ -60,8 +63,7 @@ public:
         eComputedTorque,
         eAdaptiveControl,
         eInverseKinematics,       // 'i' : Jacobian-based IK
-        eInverseKinematics_Pos,   // 'o' : RBDL IK (position only)
-        eInverseKinematics_6dof   // 'p' : RBDL IK (position + orientation)
+        eInverseKinematics_6dof   // 'm' : RBDL IK (position + orientation) + CTC
     };
     
     void SetControlMode(eControlMode aeMode) { m_eControlMode = aeMode; }
@@ -97,12 +99,15 @@ public:
     //====================================================================
     struct Pose
     {
-        RigidBodyDynamics::Math::Vector3d m_position;
+        RigidBodyDynamics::Math::Vector3d m_position, m_rotation_rpy;
         RigidBodyDynamics::Math::Matrix3d m_rotation;
+
         Pose()
         {
             m_position.setZero();
             m_rotation.setIdentity();
+            m_rotation_rpy.setZero();
+            
         }
     };
 
@@ -113,8 +118,7 @@ public:
     BOOL ComputeTcpFK();
     BOOL SetTcpReferencePose();
     BOOL ComputeJacobianBasedInverseKinematics(std::vector<double>& avOutputTorque);
-
-
+    BOOL RunISOCubeIKValidation();
 
     Pose tcpPose;
     const Pose& GetTcpPose() const { return tcpPose; }
@@ -133,11 +137,9 @@ public:
     BOOL m_bVerifyDone;
     BOOL m_bIkMotionStarted;    // IK 시작 후 실제로 움직임이 감지됐는지
     int  m_nStableCount;
-
-    
-    
     unsigned int m_body_id;
 
+    
     const RigidBodyDynamics::Math::VectorNd& GetQRef() const { return     m_Q_ref; }    
 
     // logging
@@ -149,14 +151,20 @@ public:
     RigidBodyDynamics::Math::MatrixNd m_JJt;     // 6 x 6
     RigidBodyDynamics::Math::MatrixNd m_J_pinv;  // DOF x 6
     RigidBodyDynamics::Math::VectorNd m_e_task;  // 6D Cartesian error [angular; linear]
-    double m_Kp_task_pos = 1.0;                  // task-space position gain
+    double m_Kp_task_pos = 3.0;                  // task-space position gain
     double m_Kp_task_rot = 1.0;                  // task-space orientation gain
     static constexpr double m_dt = 0.001;        // 1kHz → 1ms
     static constexpr double m_lambda = 0.01;     // DLS damping factor
     
     // static constexpr double m_lambda = 0.01;     // DLS damping factor
 
-    
+    BOOL GetCurrentPose(Pose& astCurrPose);
+    BOOL SetTargetPose(Pose astTargetPose);
+    BOOL SetTargetPose_Jacobian();           // visual servoing용 (매 사이클 목표 추종)
+    BOOL LogDistanceError(Pose astTargetPose);
+
+    static RigidBodyDynamics::Math::Matrix3d RPYToRot(double roll, double pitch, double yaw);
+
 
     //====================================================================
     //====================================================================
@@ -196,6 +204,18 @@ private:
     // Control gains
     std::vector<double> m_Kp;                           // Position gains
     std::vector<double> m_Kd;                           // Velocity gains
+
+    // 5th-order polynomial trajectory
+    struct TrajState {
+        RigidBodyDynamics::Math::VectorNd q_start;
+        RigidBodyDynamics::Math::VectorNd q_goal;
+        double T;
+        double t_elapsed;
+        bool   active;
+    };
+    TrajState m_traj;
+    double    m_traj_duration;
+    void      UpdateTrajectory();
     
     // RT performance monitoring
     RTPerformance m_rt_perf;
@@ -216,7 +236,6 @@ private:
     // jieun
     //BOOL ComputeTcpFK(std::vector<double>& avOutputTorque);
     //Pose tcpPose;
-    BOOL ComputeInverseKinematics(std::vector<double>& avOutputTorque);
     BOOL ComputeInverseKinematics_6dof(std::vector<double>& avOutputTorque);
 
     BOOL IsJointSettled(double vel_threshold);

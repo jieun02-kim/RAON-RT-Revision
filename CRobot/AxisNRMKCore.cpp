@@ -71,8 +71,8 @@ CAxisNRMKCore::OnSlaveStatusChanged(PVOID apSlave, PVOID apStatus, PVOID apReser
 			INT32 nStartPos = cEcatSlave.GetActualPos();
 			if (eAxisHomeStartPos == GetHomingMethod())
 			{
-				SetHomePosition(nStartPos);
-				// SetHomePosition(nStartPos - GetPositionBeforeExit());
+				// SetHomePosition(nStartPos);
+				SetHomePosition(nStartPos - GetPositionBeforeExit());
 			}
 			UpdateCurrentParams(nStartPos, cEcatSlave.GetStartVel(), cEcatSlave.GetStartTor());
 			/* todo: do we need this? */

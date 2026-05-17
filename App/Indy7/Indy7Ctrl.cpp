@@ -7,7 +7,8 @@
 *****************************************************************************/
 #include "Indy7Ctrl.h"
 #include <unistd.h>
-#include <cmath>    
+#include <cmath>
+#include <sys/stat.h>
 
 #define CTRL_MODE_GRAV_COMP     0
 #define CTRL_MODE_FULL_DYN      1
@@ -19,7 +20,6 @@ void proc_ethercat_control(void* apRobot);
 void proc_keyboard_control(void* apRobot);
 void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
-FILE* make_csv(CRobotIndy7* pRobot);   
 
 
 /****************************************************************************/
@@ -497,31 +497,72 @@ CRobotIndy7::DoInput()
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
             m_pController->m_bIkTrigger = TRUE;
             break;
-        case 'n':
-        case 'N':
-            m_pEcatSensor[0]->LED_RED(TRUE);
-            DBG_LOG_INFO(">>> RT Controller: RBDL IK (Position only) Mode");
-            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_Pos);
-            m_pController->m_bIkTrigger = TRUE;
-            break;
         case 'm':
         case 'M':
             m_pEcatSensor[0]->LED_RED(TRUE);
             DBG_LOG_INFO(">>> RT Controller: RBDL IK (6DOF) Mode");
+            m_pController->SetTargetPose(m_Pose);
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-            m_pController->m_bIkTrigger = TRUE;
+            
             break;
-        case 'l':
-        case 'L':
-            DBG_LOG_INFO(">>> RT Controller: Logging");
-            m_bLogTrigger = TRUE;
+        case 'q':
+        case 'Q':
+        {
+            DBG_LOG_INFO(">>> ISO Cube Hardware Test Start");
+            const CControllerFullDynamicsRT::Pose& cur = m_pController->GetTcpPose();
+            const double cx = cur.m_position[0] + 0.02;
+            const double cy = cur.m_position[1];
+            const double cz = cur.m_position[2];
+            const double a = 0.100;  // ISO 9283: 0.8*(L/2), L=0.25m
+            const double offsets[5][3] = {{0,0,0},{a,a,-a},{-a,a,-a},{-a,-a,a},{a,-a,a}};
+            for (int i = 0; i < 5; ++i) {
+                m_isoTargets[i].m_position[0] = cx + offsets[i][0];
+                m_isoTargets[i].m_position[1] = cy + offsets[i][1];
+                m_isoTargets[i].m_position[2] = cz + offsets[i][2];
+                m_isoTargets[i].m_rotation    = cur.m_rotation;
+            }
+            m_isoClearance.m_position[0] = cx;
+            m_isoClearance.m_position[1] = cy;
+            m_isoClearance.m_position[2] = cz + 0.08;
+            m_isoClearance.m_rotation    = cur.m_rotation;
+            DBG_LOG_INFO("[ISO-HW] Center: X=%.4f Y=%.4f Z=%.4f", cx, cy, cz);
+
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+            m_nISOPointIdx  = 0;
+            m_nISOCycle     = 0;
+            m_bISOCmdSent   = false;
+            m_eISOHWState   = eISO_HW_TO_TARGET;
+            m_bIsoHWTrigger = true;
+            break;
+        }
+        case 'd':
+        case 'D':
+            DBG_LOG_INFO(">>> Log Distance Error");
+            m_pController->LogDistanceError(m_Pose);
             break;
         case 's':
         case 'S':
-            DBG_LOG_INFO(">>> RT Controller: what is current pose?");
-            m_pController->m_bSetRefPoseTrigger = TRUE;
-            
+            DBG_LOG_INFO(">>> RT Controller: what is current pose?");             
+            m_pController->GetCurrentPose(m_Pose);
+
             break;
+        case 'a':
+        case 'A':
+        {
+            DBG_LOG_INFO(">>> RT Controller: what is current pose?");
+            CControllerFullDynamicsRT::Pose ref_pose;
+            ref_pose.m_position[0] = -0.1806;
+            ref_pose.m_position[1] = -0.1808;
+            ref_pose.m_position[2] = 0.9307;
+            ref_pose.m_rotation_rpy[0] = 0.0872;
+            ref_pose.m_rotation_rpy[1] = -0.0860;
+            ref_pose.m_rotation_rpy[2] = 1.5670;
+            ref_pose.m_rotation = CControllerFullDynamicsRT::RPYToRot(ref_pose.m_rotation_rpy[0], ref_pose.m_rotation_rpy[1], ref_pose.m_rotation_rpy[2]);
+
+            m_pController->GetCurrentPose(ref_pose);
+
+            break;
+        }
 
         default:
             break;
@@ -652,32 +693,64 @@ void proc_main_control(void* apRobot)
         else
         {
             // Fallback: Apply zero torque if no controller available
-            for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
+            for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
             {
                 pRobot->m_pEcatAxis[nCnt]->MoveTorque(0.0);
             }
         }
 
+        //======================================================================
+        // ISO Hardware Test state machine
+        if (pRobot->m_bIsoHWTrigger.load()) {
+            switch (pRobot->m_eISOHWState) {
+                case CRobotIndy7::eISO_HW_TO_TARGET:
+                    if (!pRobot->m_bISOCmdSent) {
+                        pRTController->goal_tcpPose = pRobot->m_isoTargets[pRobot->m_nISOPointIdx];
+                        pRTController->m_bIkTrigger = true;
+                        pRobot->m_bISOCmdSent = true;
+                        DBG_LOG_INFO("[ISO-HW] Cycle %d/10  P%d  moving...",
+                            pRobot->m_nISOCycle+1, pRobot->m_nISOPointIdx+1);
+                    } else if (pRTController->m_bVerifyDone) {
+                        const auto& tcp = pRTController->GetTcpPose();
+                        pRobot->m_isoHWRecords[pRobot->m_nISOPointIdx][pRobot->m_nISOCycle][0] = tcp.m_position[0];
+                        pRobot->m_isoHWRecords[pRobot->m_nISOPointIdx][pRobot->m_nISOCycle][1] = tcp.m_position[1];
+                        pRobot->m_isoHWRecords[pRobot->m_nISOPointIdx][pRobot->m_nISOCycle][2] = tcp.m_position[2];
+                        pRobot->m_bISOCmdSent = false;
+                        pRobot->m_eISOHWState = CRobotIndy7::eISO_HW_TO_CLEARANCE;
+                    }
+                    break;
 
-        //======================================================================                
-        ST_LOG_ENTRY entry{};
-        
-        entry.timestamp_ns = read_timer();
-        for (int i = 0; i < udof; ++i) {
-            entry.q[i]     = pRobot->m_vCurrentPos[i];
-            entry.q_ref[i] = pRTController->GetQRef()[i];
-            entry.qd[i]    = pRobot->m_vCurrentVel[i];
-            entry.tau[i]   = pRobot->m_vOutputTorque[i];
-            
+                case CRobotIndy7::eISO_HW_TO_CLEARANCE:
+                    if (!pRobot->m_bISOCmdSent) {
+                        pRTController->goal_tcpPose = pRobot->m_isoClearance;
+                        pRTController->m_bIkTrigger = true;
+                        pRobot->m_bISOCmdSent = true;
+                    } else if (pRTController->m_bVerifyDone) {
+                        pRobot->m_bISOCmdSent = false;
+                        pRobot->m_nISOPointIdx++;
+                        if (pRobot->m_nISOPointIdx >= 5) {
+                            pRobot->m_nISOPointIdx = 0;
+                            pRobot->m_nISOCycle++;
+                            if (pRobot->m_nISOCycle >= 10)
+                                pRobot->m_eISOHWState = CRobotIndy7::eISO_HW_DONE;
+                            else
+                                pRobot->m_eISOHWState = CRobotIndy7::eISO_HW_TO_TARGET;
+                        } else {
+                            pRobot->m_eISOHWState = CRobotIndy7::eISO_HW_TO_TARGET;
+                        }
+                    }
+                    break;
+
+                case CRobotIndy7::eISO_HW_DONE:
+                    pRobot->m_bIsoHWTrigger = false;
+                    pRobot->SaveISOHWResults();
+                    pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                    pRobot->m_eISOHWState = CRobotIndy7::eISO_HW_IDLE;
+                    break;
+
+                default: break;
+            }
         }
-
-        const CControllerFullDynamicsRT::Pose& tcp = pRTController->GetTcpPose();         
-        entry.tcp_x    = tcp.m_position[0];
-        entry.tcp_y    = tcp.m_position[1];                                   
-        entry.tcp_z    = tcp.m_position[2];
-        entry.ctrl_mode = (uint8_t)pRTController->GetControlMode();
-
-        pRobot->m_logBuffer.push(entry);  // atomic push, 블로킹 없음
         //======================================================================
 
         /* Turn On LED depending on control mode */
@@ -805,13 +878,22 @@ proc_keyboard_control(void* apRobot)
     while (TRUE)
     {
         cKeyPress = (char)getche();
-        pRobot->m_cKeyPress = cKeyPress;
 
         if ('q' == cKeyPress)
         {
             pRobot->StopTasks();
             break;
         }
+
+        if ((cKeyPress == 'z' || cKeyPress == 'Z') && pRTController != NULL)
+        {
+            DBG_LOG_INFO(">>> ISO Cube IK Validation (software only)");
+            if (!pRTController->RunISOCubeIKValidation())
+                DBG_LOG_ERROR(">>> ISO Cube IK Validation failed");
+            continue;
+        }
+
+        pRobot->m_cKeyPress = cKeyPress;
 
         // if ((cKeyPress == 'i' || cKeyPress == 'I')&& pRTController != NULL)
         // {
@@ -877,93 +959,81 @@ proc_terminal_output(void* apRobot)
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_terminal_output");
 }
 
-
-
 void
 proc_logger(void* apRobot)
 {
     CRobotIndy7* pRobot = (CRobotIndy7*)apRobot;
-    ST_LOG_ENTRY entry;                                                                         
-    int nCount = 0;
 
+    DBG_LOG_INFO("(proc_logger) Task Started!");
 
-    while (!pRobot->CheckStopTask())
-    {       
-        if(pRobot->m_bLogTrigger.load(std::memory_order_acquire)) 
-        break;    
-        usleep(10000);  // drain per 10ms
+    while (!pRobot->CheckStopTask()) {
+        usleep(100000);
     }
-    if (pRobot->CheckStopTask()) return;
 
-    DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");                           
-    while (pRobot->m_logBuffer.pop(entry)) {}
-    DBG_LOG_INFO("(proc_logger) Collecting 10 seconds of data...");
-    //(1kHz * 10s = 10,000 entries)
-    sleep(3);
-           
-    pRobot->m_bLogTrigger.store(false, std::memory_order_release);
-
-    // create csv file
-    FILE* fp = make_csv(pRobot);
-    if (!fp) return;
-                                                                         
-    fprintf(fp, "timestamp_ns,"
-                "q0,q1,q2,q3,q4,q5,"                                                              
-                "q_ref0,q_ref1,q_ref2,q_ref3,q_ref4,q_ref5,"                                      
-                "qd0,qd1,qd2,qd3,qd4,qd5,"                                                      
-                "tau0,tau1,tau2,tau3,tau4,tau5,"                                                  
-                "tcp_x,tcp_y,tcp_z,ctrl_mode\n");                                               
-                
-    while (pRobot->m_logBuffer.pop(entry))
-    {
-        fprintf(fp,
-            "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%d\n",
-            (unsigned long long)entry.timestamp_ns,
-            entry.q[0],entry.q[1],entry.q[2],
-            entry.q[3],entry.q[4],entry.q[5],
-            entry.q_ref[0], entry.q_ref[1], entry.q_ref[2],
-            entry.q_ref[3], entry.q_ref[4], entry.q_ref[5],   
-            entry.qd[0],entry.qd[1],entry.qd[2],
-            entry.qd[3],entry.qd[4],entry.qd[5],
-            entry.tau[0],entry.tau[1],entry.tau[2],
-            entry.tau[3],entry.tau[4],entry.tau[5],
-            entry.tcp_x,entry.tcp_y,entry.tcp_z,
-            (int)entry.ctrl_mode);
-            nCount++;
-    }
-    //fflush(fp);                                                                                         
-    fclose(fp);                                                                                   
-    DBG_LOG_INFO("(proc_logger) %d entries saved", nCount);
-
-
+    DBG_LOG_WARN("[proc_logger] TASK ENDED!");
 }
 
 
-FILE*
-make_csv(CRobotIndy7* pRobot)
-{                                                               
+
+void
+CRobotIndy7::SaveISOHWResults()
+{
+    mkdir("/home/raimlab/RAON-RT/App/Indy7/iso_csv", 0777);
+    mkdir("/home/raimlab/RAON-RT/App/Indy7/iso_csv/hardware", 0777);
+
     char szFilename[256];
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     snprintf(szFilename, sizeof(szFilename),
-            "/home/raimlab/RAON-RT/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
-            //"./../rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
-            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,                                        
-            t->tm_hour, t->tm_min, t->tm_sec);                                                 
-                                                                                                
+        "/home/raimlab/RAON-RT/App/Indy7/iso_csv/hardware/iso_hw_%04d%02d%02d_%02d%02d%02d.csv",
+        t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+
     FILE* fp = fopen(szFilename, "w");
-    if (!fp)
-    {
-        DBG_LOG_ERROR("proc_logger: Cannot open %s", szFilename);                               
-        return nullptr;        
+    if (!fp) { DBG_LOG_ERROR("SaveISOHWResults: Cannot open %s", szFilename); return; }
+
+    // Raw records
+    fprintf(fp, "point,cycle,x,y,z\n");
+    for (int pt = 0; pt < 5; ++pt)
+        for (int cy = 0; cy < 10; ++cy)
+            fprintf(fp, "%d,%d,%.6f,%.6f,%.6f\n", pt+1, cy+1,
+                m_isoHWRecords[pt][cy][0], m_isoHWRecords[pt][cy][1], m_isoHWRecords[pt][cy][2]);
+
+    // AP / RP
+    fprintf(fp, "\npoint,cmd_x,cmd_y,cmd_z,mean_x,mean_y,mean_z,AP_mm,RP_mm\n");
+    for (int pt = 0; pt < 5; ++pt) {
+        double mean[3] = {0,0,0};
+        for (int cy = 0; cy < 10; ++cy) {
+            mean[0] += m_isoHWRecords[pt][cy][0];
+            mean[1] += m_isoHWRecords[pt][cy][1];
+            mean[2] += m_isoHWRecords[pt][cy][2];
+        }
+        mean[0] /= 30.0; mean[1] /= 30.0; mean[2] /= 30.0;
+
+        double cx = m_isoTargets[pt].m_position[0];
+        double cy = m_isoTargets[pt].m_position[1];
+        double cz = m_isoTargets[pt].m_position[2];
+        double AP = sqrt((mean[0]-cx)*(mean[0]-cx) + (mean[1]-cy)*(mean[1]-cy) + (mean[2]-cz)*(mean[2]-cz)) * 1000.0;
+
+        double d_sum = 0, d_sq_sum = 0;
+        for (int cy = 0; cy < 10; ++cy) {
+            double dx = m_isoHWRecords[pt][cy][0] - mean[0];
+            double dy = m_isoHWRecords[pt][cy][1] - mean[1];
+            double dz = m_isoHWRecords[pt][cy][2] - mean[2];
+            double d  = sqrt(dx*dx + dy*dy + dz*dz);
+            d_sum    += d;
+            d_sq_sum += d*d;
+        }
+        double d_mean = d_sum / 10.0;
+        double d_std  = sqrt(d_sq_sum/30.0 - d_mean*d_mean);
+        double RP = (d_mean + 3.0*d_std) * 1000.0;
+
+        fprintf(fp, "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f\n",
+            pt+1, cx, cy, cz, mean[0], mean[1], mean[2], AP, RP);
+        DBG_LOG_INFO("[ISO-HW] P%d  AP=%.4f mm  RP=%.4f mm", pt+1, AP, RP);
     }
-    return fp;
-
-
+    fclose(fp);
+    DBG_LOG_INFO("[ISO-HW] Saved: %s", szFilename);
 }
+
 
 
