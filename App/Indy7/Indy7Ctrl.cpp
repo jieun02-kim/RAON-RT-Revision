@@ -549,7 +549,7 @@ CRobotIndy7::DoInput()
         case 'a':
         case 'A':
         {
-            DBG_LOG_INFO(">>> RT Controller: what is current pose?");
+            DBG_LOG_INFO(">>> RT Controller: SetTargetPose (A key)");
             CControllerFullDynamicsRT::Pose ref_pose;
             ref_pose.m_position[0] = -0.1806;
             ref_pose.m_position[1] = -0.1808;
@@ -557,9 +557,15 @@ CRobotIndy7::DoInput()
             ref_pose.m_rotation_rpy[0] = 0.0872;
             ref_pose.m_rotation_rpy[1] = -0.0860;
             ref_pose.m_rotation_rpy[2] = 1.5670;
-            ref_pose.m_rotation = CControllerFullDynamicsRT::RPYToRot(ref_pose.m_rotation_rpy[0], ref_pose.m_rotation_rpy[1], ref_pose.m_rotation_rpy[2]);
+            ref_pose.m_rotation = CControllerFullDynamicsRT::RPYToRot(
+                ref_pose.m_rotation_rpy[0],
+                ref_pose.m_rotation_rpy[1],
+                ref_pose.m_rotation_rpy[2]);
 
-            m_pController->GetCurrentPose(ref_pose);
+            if (m_pController->SetTargetPose(ref_pose))
+                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+            else
+                DBG_LOG_ERROR(">>> SetTargetPose FAILED — IK did not converge");
 
             break;
         }
