@@ -17,6 +17,7 @@
 #include "AxisNRMKCore.h"
 #include "SensorNRMKEndTool.h"
 #include "FullDynControllerRT.h"
+#include "DataRecorder.h"
 
 
 typedef std::vector<double> VECDOUBLE;
@@ -53,6 +54,7 @@ public:
 	void	WriteDataLog					(	);
 
 	enum eISOHWState { eISO_HW_IDLE=0, eISO_HW_TO_TARGET, eISO_HW_TO_CLEARANCE, eISO_HW_DONE };
+	enum eRectState  { eRECT_IDLE=0, eRECT_TO_CORNER };
 	
 	/* Controller */
 	CControllerFullDynamicsRT* GetController() { return m_pController; }
@@ -85,6 +87,7 @@ protected:
 	friend void	proc_keyboard_control(void*);
 	friend void proc_terminal_output(void*);
 	friend void proc_logger(void*);
+	friend FILE* make_csv(CRobotIndy7*);
 
 private:
 	BOOL m_bEcatOP;
@@ -104,6 +107,10 @@ private:
 	//=====================================================
 	//jieun
 
+	// TCP Trajectory Logging
+	LogRingBuffer            m_logBuffer;
+	std::atomic<bool>        m_bLogTrigger{false};
+
 	// ISO Hardware Test
 	std::atomic<bool>               m_bIsoHWTrigger{false};
 	eISOHWState                     m_eISOHWState{eISO_HW_IDLE};
@@ -113,6 +120,14 @@ private:
 	double                          m_isoHWRecords[5][10][3];
 	CControllerFullDynamicsRT::Pose m_isoTargets[5];
 	CControllerFullDynamicsRT::Pose m_isoClearance;
+
+	// Rectangle (Square) Motion — 'n' key
+	std::atomic<bool>               m_bRectTrigger{false};
+	eRectState                      m_eRectState{eRECT_IDLE};
+	int                             m_nRectCornerIdx{0};
+	int                             m_nRectWaitCount{0};
+	CControllerFullDynamicsRT::Pose m_rectCorners[4];
+	RigidBodyDynamics::Math::VectorNd m_rectJointTargets[4];
 
 	CControllerFullDynamicsRT::Pose	m_Pose;
 	void SaveISOHWResults();

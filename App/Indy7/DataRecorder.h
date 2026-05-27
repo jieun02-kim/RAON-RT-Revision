@@ -10,7 +10,10 @@ struct ST_LOG_ENTRY {
     double   q_ref[6];    // 목표 관절 위치
     double   qd[6];       // 실제 관절 속도
     double   tau[6];      // 출력 토크
-    double   tcp_x, tcp_y, tcp_z;  // TCP 포즈
+    double   tcp_x, tcp_y, tcp_z;             // TCP 포즈
+    double   tcp_roll, tcp_pitch, tcp_yaw;    // TCP orientation (ZYX RPY, rad)
+    double   goal_x, goal_y, goal_z;          // goal TCP position (m)
+    double   goal_roll, goal_pitch, goal_yaw; // goal TCP orientation (ZYX RPY, rad)
     uint8_t  ctrl_mode;
 };
 

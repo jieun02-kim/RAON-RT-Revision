@@ -490,6 +490,11 @@ CRobotIndy7::DoInput()
             DBG_LOG_INFO(">>> RT Controller: Computed Torque Mode");
             SetControllerMode(CControllerFullDynamicsRT::eComputedTorque);
             break;
+        case 'l':
+        case 'L':
+            DBG_LOG_INFO(">>> Logging triggered: collecting TCP trajectory");
+            m_bLogTrigger = TRUE;
+            break;
         case 'i':
         case 'I':
             m_pEcatSensor[0]->LED_RED(TRUE);
@@ -501,10 +506,64 @@ CRobotIndy7::DoInput()
         case 'M':
             m_pEcatSensor[0]->LED_RED(TRUE);
             DBG_LOG_INFO(">>> RT Controller: RBDL IK (6DOF) Mode");
-            m_pController->SetTargetPose(m_Pose);
-            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-            
+            if (m_pController->SetTargetPose(m_Pose))
+            {
+                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                m_bLogTrigger = TRUE;
+            }
+            else
+                DBG_LOG_ERROR(">>> SetTargetPose FAILED — press 's' first to set target pose");
             break;
+        case 'n':
+        case 'N':
+            if (m_bRectTrigger.load()) {
+                m_bRectTrigger = false;
+                m_eRectState   = eRECT_IDLE;
+                m_bLogTrigger  = FALSE;
+                SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                DBG_LOG_INFO(">>> Rectangle Mode STOP");
+            } else {
+                // gravity comp 먼저: RT 루프가 m_traj를 소비 중이면 중단
+                SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+
+                // n 시작 순간 현재 TCP 위치를 중심으로 사각형 계산
+                m_pController->GetCurrentPose(m_Pose);
+                const double d = 0.05;
+                const double offsets[4][2] = {{+d,+d},{-d,+d},{-d,-d},{+d,-d}};
+                for (int i = 0; i < 4; ++i) {
+                    m_rectCorners[i].m_position[0] = m_Pose.m_position[0];
+                    m_rectCorners[i].m_position[1] = m_Pose.m_position[1] + offsets[i][0];
+                    m_rectCorners[i].m_position[2] = m_Pose.m_position[2] + offsets[i][1];
+                    m_rectCorners[i].m_rotation    = m_Pose.m_rotation;
+                }
+
+                // 4개 꼭짓점 IK 미리 계산 (위치만, 키보드 스레드 non-RT에서 안전)
+                bool all_ok = true;
+                for (int i = 0; i < 4; ++i) {
+                    if (!m_pController->SetTargetPosePositionOnly(m_rectCorners[i])) {
+                        DBG_LOG_ERROR(">>> [RECT] IK failed for corner %d — abort", i+1);
+                        all_ok = false;
+                        break;
+                    }
+                    m_rectJointTargets[i] = m_pController->GetTrajGoal();
+                }
+                if (!all_ok) break;
+
+                // 첫 번째 꼭짓점으로 1.5s 궤적 시작
+                m_nRectCornerIdx = 0;
+                m_nRectWaitCount = 0;
+                m_eRectState     = eRECT_TO_CORNER;
+                m_pEcatSensor[0]->LED_RED(TRUE);
+                m_pController->StartJointTrajectory(m_rectJointTargets[0], 1.5);
+                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                m_bLogTrigger  = TRUE;
+                m_bRectTrigger = true;
+                DBG_LOG_INFO(">>> Rectangle Mode START: Center X=%.4f Y=%.4f Z=%.4f",
+                    m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
+            }
+            break;
+
+
         case 'q':
         case 'Q':
         {
@@ -563,7 +622,10 @@ CRobotIndy7::DoInput()
                 ref_pose.m_rotation_rpy[2]);
 
             if (m_pController->SetTargetPose(ref_pose))
+            {
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                m_bLogTrigger = TRUE;
+            }
             else
                 DBG_LOG_ERROR(">>> SetTargetPose FAILED — IK did not converge");
 
@@ -706,6 +768,38 @@ void proc_main_control(void* apRobot)
         }
 
         //======================================================================
+        // TCP Trajectory Logging
+        if (bUseRTController && pRobot->m_bLogTrigger.load(std::memory_order_acquire))
+        {
+            ST_LOG_ENTRY entry{};
+            entry.timestamp_ns = (uint64_t)read_timer();
+            pRTController->ComputeTcpFK();
+            const CControllerFullDynamicsRT::Pose& tcp = pRTController->GetTcpPose();
+            entry.tcp_x = tcp.m_position[0];
+            entry.tcp_y = tcp.m_position[1];
+            entry.tcp_z = tcp.m_position[2];
+            const auto& R    = tcp.m_rotation;
+            entry.tcp_roll   = atan2(R(2,1), R(2,2));
+            entry.tcp_pitch  = atan2(-R(2,0), sqrt(R(2,1)*R(2,1) + R(2,2)*R(2,2)));
+            entry.tcp_yaw    = atan2(R(1,0), R(0,0));
+            const auto& goal = pRTController->goal_tcpPose;
+            entry.goal_x     = goal.m_position[0];
+            entry.goal_y     = goal.m_position[1];
+            entry.goal_z     = goal.m_position[2];
+            const auto& Rg   = goal.m_rotation;
+            entry.goal_roll  = atan2(Rg(2,1), Rg(2,2));
+            entry.goal_pitch = atan2(-Rg(2,0), sqrt(Rg(2,1)*Rg(2,1) + Rg(2,2)*Rg(2,2)));
+            entry.goal_yaw   = atan2(Rg(1,0), Rg(0,0));
+            for (int i = 0; i < 6; ++i) {
+                entry.q[i]     = pRobot->m_vCurrentPos[i];
+                entry.qd[i]    = pRobot->m_vCurrentVel[i];
+                entry.tau[i]   = pRobot->m_vOutputTorque[i];
+                entry.q_ref[i] = pRTController->GetQRef()[i];
+            }
+            entry.ctrl_mode = (uint8_t)pRTController->GetControlMode();
+            pRobot->m_logBuffer.push(entry);
+        }
+        //======================================================================
         // ISO Hardware Test state machine
         if (pRobot->m_bIsoHWTrigger.load()) {
             switch (pRobot->m_eISOHWState) {
@@ -755,6 +849,22 @@ void proc_main_control(void* apRobot)
                     break;
 
                 default: break;
+            }
+        }
+        //======================================================================
+        // Rectangle Motion state machine — 'n' key (time-based, 1.5s per corner)
+        if (pRobot->m_bRectTrigger.load() &&
+            pRTController->GetControlMode() == CControllerFullDynamicsRT::eInverseKinematics_6dof) {
+            pRobot->m_nRectWaitCount++;
+            if (pRobot->m_nRectWaitCount >= 1500) {  // 1.5s at 1ms period
+                pRobot->m_nRectWaitCount = 0;
+                pRobot->m_nRectCornerIdx = (pRobot->m_nRectCornerIdx + 1) % 4;
+                pRTController->StartJointTrajectory(
+                    pRobot->m_rectJointTargets[pRobot->m_nRectCornerIdx], 1.5);
+                DBG_LOG_INFO("[RECT] → Corner %d  Y=%.4f Z=%.4f",
+                    pRobot->m_nRectCornerIdx + 1,
+                    pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[1],
+                    pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[2]);
             }
         }
         //======================================================================
@@ -965,18 +1075,97 @@ proc_terminal_output(void* apRobot)
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_terminal_output");
 }
 
+FILE* make_csv(CRobotIndy7* pRobot);
+
 void
 proc_logger(void* apRobot)
 {
     CRobotIndy7* pRobot = (CRobotIndy7*)apRobot;
+    ST_LOG_ENTRY entry;
+    int nCount = 0;
 
     DBG_LOG_INFO("(proc_logger) Task Started!");
 
-    while (!pRobot->CheckStopTask()) {
-        usleep(100000);
+    while (!pRobot->CheckStopTask())
+    {
+        // 트리거 대기
+        if (!pRobot->m_bLogTrigger.load(std::memory_order_acquire)) {
+            usleep(10000);
+            continue;
+        }
+
+        nCount = 0;
+
+        DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");
+        while (pRobot->m_logBuffer.pop(entry)) {}
+
+        DBG_LOG_INFO("(proc_logger) Collecting 12 seconds of data...");
+        sleep(12);
+
+        pRobot->m_bLogTrigger.store(false, std::memory_order_release);
+
+        FILE* fp = make_csv(pRobot);
+        if (!fp) continue;
+
+        fprintf(fp,
+            "timestamp_ns,"
+            "q0,q1,q2,q3,q4,q5,"
+            "q_ref0,q_ref1,q_ref2,q_ref3,q_ref4,q_ref5,"
+            "qd0,qd1,qd2,qd3,qd4,qd5,"
+            "tau0,tau1,tau2,tau3,tau4,tau5,"
+            "tcp_x,tcp_y,tcp_z,"
+            "tcp_roll,tcp_pitch,tcp_yaw,"
+            "goal_x,goal_y,goal_z,"
+            "goal_roll,goal_pitch,goal_yaw,"
+            "ctrl_mode\n");
+
+        while (pRobot->m_logBuffer.pop(entry)) {
+            fprintf(fp,
+                "%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,"
+                "%.6f,%.6f,%.6f,"
+                "%d\n",
+                (unsigned long long)entry.timestamp_ns,
+                entry.q[0],entry.q[1],entry.q[2],entry.q[3],entry.q[4],entry.q[5],
+                entry.q_ref[0],entry.q_ref[1],entry.q_ref[2],entry.q_ref[3],entry.q_ref[4],entry.q_ref[5],
+                entry.qd[0],entry.qd[1],entry.qd[2],entry.qd[3],entry.qd[4],entry.qd[5],
+                entry.tau[0],entry.tau[1],entry.tau[2],entry.tau[3],entry.tau[4],entry.tau[5],
+                entry.tcp_x, entry.tcp_y, entry.tcp_z,
+                entry.tcp_roll, entry.tcp_pitch, entry.tcp_yaw,
+                entry.goal_x, entry.goal_y, entry.goal_z,
+                entry.goal_roll, entry.goal_pitch, entry.goal_yaw,
+                (int)entry.ctrl_mode);
+            nCount++;
+        }
+        fclose(fp);
+        DBG_LOG_INFO("(proc_logger) %d entries saved", nCount);
     }
 
     DBG_LOG_WARN("[proc_logger] TASK ENDED!");
+}
+
+FILE*
+make_csv(CRobotIndy7* pRobot)
+{
+    mkdir("/home/raimlab/RAON-RT/App/Indy7/rt_log_results", 0777);
+    char szFilename[256];
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    snprintf(szFilename, sizeof(szFilename),
+        "/home/raimlab/RAON-RT/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
+        t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+        t->tm_hour, t->tm_min, t->tm_sec);
+    FILE* fp = fopen(szFilename, "w");
+    if (!fp)
+        DBG_LOG_ERROR("make_csv: Cannot open %s", szFilename);
+    else
+        DBG_LOG_INFO("(proc_logger) Saving to %s", szFilename);
+    return fp;
 }
 
 

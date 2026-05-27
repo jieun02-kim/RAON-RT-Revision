@@ -54,6 +54,8 @@ public:
 
     void SetTrajectoryDuration(double adT_sec) { m_traj_duration = adT_sec; }
     bool IsTrajectoryDone() const { return !m_traj.active; }
+    const RigidBodyDynamics::Math::VectorNd& GetTrajGoal() const { return m_traj.q_goal; }
+    BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
   
 
     // Controller modes
@@ -160,6 +162,7 @@ public:
 
     BOOL GetCurrentPose(Pose& astCurrPose);
     BOOL SetTargetPose(Pose astTargetPose);
+    BOOL SetTargetPosePositionOnly(Pose astTargetPose);
     BOOL SetTargetPose_Jacobian();           // visual servoing용 (매 사이클 목표 추종)
     BOOL LogDistanceError(Pose astTargetPose);
 

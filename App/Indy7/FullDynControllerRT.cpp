@@ -557,8 +557,49 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
     m_traj.T         = m_traj_duration;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
+    goal_tcpPose     = astTargetPose;
     DBG_LOG_INFO("(SetTargetPose) Trajectory start, T=%.2f s", m_traj.T);
 
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose)
+{
+    RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
+    RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+    CS.num_steps      = 1000;
+    CS.step_tol       = 1.0e-10;
+    CS.constraint_tol = 1.0e-8;
+    CS.AddPointConstraint(m_body_id, tcp_local_point, astTargetPose.m_position);
+    BOOL is_ok = RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
+    if (!is_ok)
+    {
+        DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed!");
+        return FALSE;
+    }
+
+    m_traj.q_start   = m_Q;
+    m_traj.q_goal    = vjointspace;
+    m_traj.T         = m_traj_duration;
+    m_traj.t_elapsed = 0.0;
+    m_traj.active    = true;
+    goal_tcpPose     = astTargetPose;
+    DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s", m_traj.T);
+
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::StartJointTrajectory(
+    const RigidBodyDynamics::Math::VectorNd& q_goal, double T)
+{
+    m_traj.q_start   = m_Q;
+    m_traj.q_goal    = q_goal;
+    m_traj.T         = T;
+    m_traj.t_elapsed = 0.0;
+    m_traj.active    = true;
+    DBG_LOG_INFO("(StartJointTrajectory) T=%.2f s", T);
     return TRUE;
 }
 
