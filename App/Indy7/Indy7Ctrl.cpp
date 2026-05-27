@@ -528,7 +528,7 @@ CRobotIndy7::DoInput()
 
                 // n 시작 순간 현재 TCP 위치를 중심으로 사각형 계산
                 m_pController->GetCurrentPose(m_Pose);
-                const double d = 0.05;
+                const double d = 0.25;
                 const double offsets[4][2] = {{+d,+d},{-d,+d},{-d,-d},{+d,-d}};
                 for (int i = 0; i < 4; ++i) {
                     m_rectCorners[i].m_position[0] = m_Pose.m_position[0];
@@ -554,9 +554,8 @@ CRobotIndy7::DoInput()
                 m_nRectWaitCount = 0;
                 m_eRectState     = eRECT_TO_CORNER;
                 m_pEcatSensor[0]->LED_RED(TRUE);
-                m_pController->StartJointTrajectory(m_rectJointTargets[0], 1.5);
+                m_pController->StartJointTrajectory(m_rectJointTargets[0], 2.0);
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-                m_bLogTrigger  = TRUE;
                 m_bRectTrigger = true;
                 DBG_LOG_INFO(">>> Rectangle Mode START: Center X=%.4f Y=%.4f Z=%.4f",
                     m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
@@ -852,15 +851,19 @@ void proc_main_control(void* apRobot)
             }
         }
         //======================================================================
-        // Rectangle Motion state machine — 'n' key (time-based, 1.5s per corner)
+        // Rectangle Motion state machine — 'n' key (time-based, 2.0s per corner)
         if (pRobot->m_bRectTrigger.load() &&
             pRTController->GetControlMode() == CControllerFullDynamicsRT::eInverseKinematics_6dof) {
             pRobot->m_nRectWaitCount++;
-            if (pRobot->m_nRectWaitCount >= 1500) {  // 1.5s at 1ms period
+            if (pRobot->m_nRectWaitCount == 1230) {  // 1.23s 시점에 로깅 시작
+                pRobot->m_bLogTrigger = TRUE;
+                DBG_LOG_INFO("[RECT] Logging triggered at count 1230");
+            }
+            if (pRobot->m_nRectWaitCount >= 2000) {  // 2.0s at 1ms period
                 pRobot->m_nRectWaitCount = 0;
                 pRobot->m_nRectCornerIdx = (pRobot->m_nRectCornerIdx + 1) % 4;
                 pRTController->StartJointTrajectory(
-                    pRobot->m_rectJointTargets[pRobot->m_nRectCornerIdx], 1.5);
+                    pRobot->m_rectJointTargets[pRobot->m_nRectCornerIdx], 2.0);
                 DBG_LOG_INFO("[RECT] → Corner %d  Y=%.4f Z=%.4f",
                     pRobot->m_nRectCornerIdx + 1,
                     pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[1],
@@ -1099,8 +1102,8 @@ proc_logger(void* apRobot)
         DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");
         while (pRobot->m_logBuffer.pop(entry)) {}
 
-        DBG_LOG_INFO("(proc_logger) Collecting 12 seconds of data...");
-        sleep(12);
+        DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
+        sleep(24);
 
         pRobot->m_bLogTrigger.store(false, std::memory_order_release);
 
