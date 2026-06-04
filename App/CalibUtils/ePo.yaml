@@ -1,0 +1,10 @@
+Robot end-effector to object frames transformation (eMo)
+rows: 6
+cols: 1
+data: 
+  - [-0.030688]
+  - [0.0463749]
+  - [-0.0533527]
+  - [2.21612]
+  - [-0.00103439]
+  - [2.17288]

@@ -18,6 +18,7 @@
 #include "SensorNRMKEndTool.h"
 #include "FullDynControllerRT.h"
 #include "DataRecorder.h"
+#include "CalibCapture.h"
 
 
 typedef std::vector<double> VECDOUBLE;
@@ -131,13 +132,22 @@ private:
 
 	CControllerFullDynamicsRT::Pose	m_Pose;
 	void SaveISOHWResults();
+	void SaveRobotPose();
+	int  m_nPoseCapture{0};
 
 	//=====================================================
 
 public:
 	//=====================================================
-	
 
 
-}; 
+
+};
+
+//=====================================================
+// jieun — ViSP / Calibration
+// Defined in Indy7Ctrl.cpp; visible to any TU that includes this header.
+extern CalibCapture s_calibCapture;
+//=====================================================
+
 #endif //__ROBOT_EXAMPLE_APP__

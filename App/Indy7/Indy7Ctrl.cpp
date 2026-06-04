@@ -6,9 +6,12 @@
 *	Copyright: ROBOGRAM LAB (2022)
 *****************************************************************************/
 #include "Indy7Ctrl.h"
+#include "CalibCapture.h"
 #include <unistd.h>
 #include <cmath>
 #include <sys/stat.h>
+
+CalibCapture s_calibCapture("/home/raimlab/RAON-RT/App/CalibUtils");
 
 #define CTRL_MODE_GRAV_COMP     0
 #define CTRL_MODE_FULL_DYN      1
@@ -600,9 +603,18 @@ CRobotIndy7::DoInput()
             break;
         case 's':
         case 'S':
-            DBG_LOG_INFO(">>> RT Controller: what is current pose?");             
             m_pController->GetCurrentPose(m_Pose);
-
+            SaveRobotPose();
+            s_calibCapture.Capture(m_Pose);
+            printf("[TCP Pose]\n");
+            printf("  t = [%.6f, %.6f, %.6f]\n",
+                   m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
+            printf("  R = [%.6f, %.6f, %.6f]\n"
+                   "      [%.6f, %.6f, %.6f]\n"
+                   "      [%.6f, %.6f, %.6f]\n",
+                   m_Pose.m_rotation(0,0), m_Pose.m_rotation(0,1), m_Pose.m_rotation(0,2),
+                   m_Pose.m_rotation(1,0), m_Pose.m_rotation(1,1), m_Pose.m_rotation(1,2),
+                   m_Pose.m_rotation(2,0), m_Pose.m_rotation(2,1), m_Pose.m_rotation(2,2));
             break;
         case 'a':
         case 'A':
@@ -1172,6 +1184,43 @@ make_csv(CRobotIndy7* pRobot)
 }
 
 
+
+void
+CRobotIndy7::SaveRobotPose()
+{
+    static const char* kDir  = "/home/raimlab/RAON-RT/App/Indy7/calib_data";
+    static const char* kPath = "/home/raimlab/RAON-RT/App/Indy7/calib_data/robot_poses.csv";
+
+    mkdir(kDir, 0777);
+    m_nPoseCapture++;
+
+    FILE* fp;
+    if (m_nPoseCapture == 1)
+    {
+        fp = fopen(kPath, "w");
+        if (!fp) { DBG_LOG_ERROR("SaveRobotPose: Cannot open %s", kPath); m_nPoseCapture--; return; }
+        fprintf(fp, "capture,tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22\n");
+    }
+    else
+    {
+        fp = fopen(kPath, "a");
+        if (!fp) { DBG_LOG_ERROR("SaveRobotPose: Cannot open %s", kPath); m_nPoseCapture--; return; }
+    }
+
+    const auto& p = m_Pose.m_position;
+    const auto& R = m_Pose.m_rotation;
+    fprintf(fp, "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+        m_nPoseCapture,
+        p[0], p[1], p[2],
+        R(0,0), R(0,1), R(0,2),
+        R(1,0), R(1,1), R(1,2),
+        R(2,0), R(2,1), R(2,2));
+    fclose(fp);
+
+    DBG_LOG_INFO("[SaveRobotPose] #%d saved: t=[%.4f, %.4f, %.4f]",
+                 m_nPoseCapture, p[0], p[1], p[2]);
+    printf("[robot_poses] #%d saved → %s\n", m_nPoseCapture, kPath);
+}
 
 void
 CRobotIndy7::SaveISOHWResults()

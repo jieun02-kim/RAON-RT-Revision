@@ -38,6 +38,12 @@ LDFLAGS = -lm -lrt -lpthread $(LDFLAG_ECAT) $(LDFLAG_RT_POSIX)
 # add RBDL and URDF Reader
 LDFLAGS += -lrbdl -lrbdl_urdfreader
 
+# ViSP (ROS Jazzy) — used for hand-eye calibration and visual servoing
+VISP_INCLUDE = /opt/ros/jazzy/include
+VISP_LIB     = /opt/ros/jazzy/lib/x86_64-linux-gnu
+CFLAGS  += -I$(VISP_INCLUDE)
+LDFLAGS += -L$(VISP_LIB) -lvisp_core -lvisp_io
+
 #SOURCES
 SOURCES	+= $(GLOBAL_DIR)/ConfigParser.cpp
 SOURCES	+= $(COMM_DIR)/CRC16.cpp
@@ -53,6 +59,7 @@ SOURCES	+= $(ROBOT_DIR)/ExtInterface.cpp
 SOURCES	+= $(ROBOT_DIR)/Robot.cpp
 SOURCES	+= $(CURR_DIR)/Controller.cpp
 SOURCES	+= $(CURR_DIR)/FullDynControllerRT.cpp
+SOURCES	+= $(CURR_DIR)/CalibCapture.cpp
 SOURCES	+= $(CURR_DIR)/Indy7Ctrl.cpp
 SOURCES	+= $(CURR_DIR)/main.cpp
 
