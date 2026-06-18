@@ -113,8 +113,8 @@ public:
         }
     };
 
-    RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.07};
-    // RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.0};
+    // RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.07};
+    RigidBodyDynamics::Math::Vector3d tcp_local_point{0.0, 0.0, 0.0};
     
     void CheckIKConvergence();
     BOOL ComputeTcpFK();
@@ -153,8 +153,8 @@ public:
     RigidBodyDynamics::Math::MatrixNd m_JJt;     // 6 x 6
     RigidBodyDynamics::Math::MatrixNd m_J_pinv;  // DOF x 6
     RigidBodyDynamics::Math::VectorNd m_e_task;  // 6D Cartesian error [angular; linear]
-    double m_Kp_task_pos = 3.0;                  // task-space position gain
-    double m_Kp_task_rot = 1.0;                  // task-space orientation gain
+    double m_Kp_task_pos = 1.0;                  // task-space position gain
+    double m_Kp_task_rot = 0.2;                  // task-space orientation gain (작게 → flip 방지)
     static constexpr double m_dt = 0.001;        // 1kHz → 1ms
     static constexpr double m_lambda = 0.01;     // DLS damping factor
     
@@ -185,6 +185,7 @@ private:
     RigidBodyDynamics::Math::VectorNd m_Qdd;            // Current acceleration
     RigidBodyDynamics::Math::VectorNd m_Q_ref;          // Reference position
     RigidBodyDynamics::Math::VectorNd m_Qd_ref;         // Reference velocity
+    RigidBodyDynamics::Math::VectorNd m_Qd_ref_prev;   // Previous cycle reference velocity (for acc limit)
     RigidBodyDynamics::Math::VectorNd m_Qdd_ref;        // Reference acceleration
     RigidBodyDynamics::Math::VectorNd m_zero_vector;    // Zero vector
     RigidBodyDynamics::Math::VectorNd m_Q_ik_target;    // RBDL IK solution (final target)

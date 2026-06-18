@@ -129,7 +129,7 @@ CRobot::InitRTTasks()
 	{
 		PTASK taskTemp;
 
-		create_rt_task(&taskTemp, (const PCHAR)vTaskConf[nCnt].strName.c_str(), 0, vTaskConf[nCnt].nPriority);
+		create_rt_task(&taskTemp, (const PCHAR)vTaskConf[nCnt].strName.c_str(), 2*1024*1024, vTaskConf[nCnt].nPriority);
 
 		if (0 != vTaskConf[nCnt].nPeriod)
 		{

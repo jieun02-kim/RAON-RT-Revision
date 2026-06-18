@@ -28,7 +28,7 @@ ECAT_LIB=/opt/emaster_app/lib
 EIGEN3_INCLUDE=/usr/include/eigen3
 
 # CFLAGS_OPTIONS = -Wall -O3 -Wextra -Wpedantic -std=gnu++17 -DNDEBUG -Dlinux -mtune=native -flto -std=c++17 -shared-libgcc -fexceptions
-CFLAGS_OPTIONS = -w -O3 -std=gnu++17 -DNDEBUG -Dlinux -mtune=native -flto -std=c++17 -shared-libgcc -fexceptions
+CFLAGS_OPTIONS = -w -O2 -std=gnu++17 -Dlinux -mtune=native -std=c++17 -shared-libgcc -fexceptions
 CFLAGS = $(CFLAGS_OPTIONS) -I$(GLOBAL_DIR) -I$(ROBOT_DIR) -I$(ECAT_INCLUDE) -I$(COMM_DIR) -I$(RT_POSIX_INCLUDE) -I$(IGH_INCLUDE) -I$(EIGEN3_INCLUDE) -I$(ECAT_DIR)/Device
 
 LDFLAG_ECAT = -L$(ECAT_LIB) -lEMasterApp
@@ -39,10 +39,18 @@ LDFLAGS = -lm -lrt -lpthread $(LDFLAG_ECAT) $(LDFLAG_RT_POSIX)
 LDFLAGS += -lrbdl -lrbdl_urdfreader
 
 # ViSP (ROS Jazzy) — used for hand-eye calibration and visual servoing
-VISP_INCLUDE = /opt/ros/jazzy/include
-VISP_LIB     = /opt/ros/jazzy/lib/x86_64-linux-gnu
-CFLAGS  += -I$(VISP_INCLUDE)
-LDFLAGS += -L$(VISP_LIB) -lvisp_core -lvisp_io
+VISP_INCLUDE = /home/raimlab/visp/build/include
+VISP_LIB     = /home/raimlab/visp/build/lib
+VISP_SRC = /home/raimlab/visp/modules
+CFLAGS  += -I$(VISP_INCLUDE) -I$(VISP_INCLUDE)/visp
+CFLAGS  += -I$(VISP_SRC)/detection/include
+CFLAGS  += -I$(VISP_SRC)/sensor/include
+CFLAGS  += -I$(VISP_SRC)/core/include
+CFLAGS  += -I$(VISP_SRC)/io/include
+CFLAGS  += -I/usr/include/opencv4
+CFLAGS  += -I/usr/include/pcl-1.14
+LDFLAGS += -L$(VISP_LIB) -lvisp_core -lvisp_io -lvisp_detection -lvisp_sensor
+LDFLAGS += -L/usr/local/lib/x86_64-linux-gnu -lrealsense2
 
 #SOURCES
 SOURCES	+= $(GLOBAL_DIR)/ConfigParser.cpp
@@ -60,6 +68,7 @@ SOURCES	+= $(ROBOT_DIR)/Robot.cpp
 SOURCES	+= $(CURR_DIR)/Controller.cpp
 SOURCES	+= $(CURR_DIR)/FullDynControllerRT.cpp
 SOURCES	+= $(CURR_DIR)/CalibCapture.cpp
+SOURCES	+= $(CURR_DIR)/VisualServo.cpp
 SOURCES	+= $(CURR_DIR)/Indy7Ctrl.cpp
 SOURCES	+= $(CURR_DIR)/main.cpp
 

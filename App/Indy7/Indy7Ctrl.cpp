@@ -23,6 +23,7 @@ void proc_ethercat_control(void* apRobot);
 void proc_keyboard_control(void* apRobot);
 void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
+void proc_visual_servo(void* apRobot);
 
 
 /****************************************************************************/
@@ -62,6 +63,7 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     AddTaskFunction(&proc_keyboard_control);
     AddTaskFunction(&proc_terminal_output);
     AddTaskFunction(&proc_logger);
+    AddTaskFunction(&proc_visual_servo);
 }
 
 CRobotIndy7::~CRobotIndy7()
@@ -89,27 +91,25 @@ CRobotIndy7::Init(BOOL abSim)
         return FALSE;
     }
 
-    if (!CRobot::Init(abSim))      
+    if (!m_visualServo.Init())
+        DBG_LOG_WARN("(%s) VisualServo Init failed — VS disabled", "CRobotIndy7");
+
+    if (!CRobot::Init(abSim))
         return FALSE;
 
     return TRUE;
 }
 
-BOOL 
+BOOL
 CRobotIndy7::DeInit()
 {
     if (TRUE == CRobot::DeInit())
     {
-        // if (NULL != m_pEcatAxis)
-        // {
-        //     delete m_pEcatAxis;
-        //     m_pEcatAxis = NULL;
-        // }
         delete[] m_pEcatAxis;
         m_pEcatAxis = nullptr;
 
         delete[] m_pEcatSensor;
-        m_pEcatSensor = nullptr;    
+        m_pEcatSensor = nullptr;
 
         return TRUE;
     }
@@ -616,6 +616,21 @@ CRobotIndy7::DoInput()
                    m_Pose.m_rotation(1,0), m_Pose.m_rotation(1,1), m_Pose.m_rotation(1,2),
                    m_Pose.m_rotation(2,0), m_Pose.m_rotation(2,1), m_Pose.m_rotation(2,2));
             break;
+        case 'v':
+        case 'V':
+            if (!m_bVSTrigger.load()) {
+                m_visualServo.Start();
+                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+                m_bVSTrigger = true;
+                printf("[VS] Visual Servoing ON\n");
+            } else {
+                m_visualServo.Stop();
+                m_bVSTrigger = false;
+                m_pController->SetControlMode(CControllerFullDynamicsRT::eGravityCompensation);
+                printf("[VS] Visual Servoing OFF — Gravity Compensation\n");
+            }
+            break;
+
         case 'a':
         case 'A':
         {
@@ -744,37 +759,64 @@ void proc_main_control(void* apRobot)
             }
         }
 
-        // Compute control torques
+        // Compute control torques (Update 먼저 → tcpPose 갱신)
         if (bUseRTController)
         {
             // Use RT Controller - it handles all RT optimizations internally
-            if (pRTController->Update(pRobot->m_vCurrentPos, pRobot->m_vCurrentVel, 
+            if (pRTController->Update(pRobot->m_vCurrentPos, pRobot->m_vCurrentVel,
                                      pRobot->m_vCurrentTor, pRobot->m_vOutputTorque))
             {
                 // Apply RT controller output
-                for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
+                for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
                 {
                     auto* ax = pRobot->m_pEcatAxis[nCnt];
                     ax->MoveTorque(pRobot->m_vOutputTorque[nCnt]);
                 }
-      
             }
             else
             {
                 // RT Controller failed, apply zero torque for safety
                 DBG_LOG_ERROR("(proc_main_control) RT Controller update failed - applying zero torque");
-                for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
+                for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
                 {
                     pRobot->m_pEcatAxis[nCnt]->MoveTorque(0.0);
                 }
             }
         }
-        else
+
+        // Visual Servoing: Update() 이후 호출
+        if (bUseRTController && pRobot->m_bVSTrigger.load())
         {
-            // Fallback: Apply zero torque if no controller available
-            for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
+            CControllerFullDynamicsRT::Pose vsGoal;
+            if (pRobot->m_visualServo.GetGoalPose(vsGoal))
             {
-                pRobot->m_pEcatAxis[nCnt]->MoveTorque(0.0);
+                // tcpPose를 현재 m_Q 기준으로 갱신 (eGravityComp 모드에서는 Update()에서 갱신 안 됨)
+                pRTController->ComputeTcpFK();
+                pRTController->goal_tcpPose = vsGoal;
+                pRTController->SetTargetPose_Jacobian();
+
+                // Q_ref가 계산됐으므로 CTC 모드로 전환 → 실제 관절 추종
+                pRTController->SetControlMode(
+                    CControllerFullDynamicsRT::eComputedTorque);
+
+                // 특이점 감지: 관절 속도가 임계값 초과 시
+                const double SINGULARITY_VEL_THRESHOLD = 0.45; // rad/s
+                for (int i = 0; i < (int)udof; ++i)
+                {
+                    if (std::fabs(pRobot->m_vCurrentVel[i]) > SINGULARITY_VEL_THRESHOLD)
+                    {
+                        pRobot->m_visualServo.NotifySingularity();
+                        pRTController->SetControlMode(
+                            CControllerFullDynamicsRT::eGravityCompensation);
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                // 목표 없음 또는 SINGULARITY 상태 → 중력보상 유지
+                pRTController->SetControlMode(
+                    CControllerFullDynamicsRT::eGravityCompensation);
             }
         }
 
@@ -1010,6 +1052,13 @@ proc_keyboard_control(void* apRobot)
     {
         cKeyPress = (char)getche();
 
+        // 화살표 키 등 이스케이프 시퀀스(\033[X) 무시
+        if (cKeyPress == '\033') {
+            getche(); // '['
+            getche(); // 방향 문자 (A/B/C/D)
+            continue;
+        }
+
         if ('q' == cKeyPress)
         {
             pRobot->StopTasks();
@@ -1220,6 +1269,29 @@ CRobotIndy7::SaveRobotPose()
     DBG_LOG_INFO("[SaveRobotPose] #%d saved: t=[%.4f, %.4f, %.4f]",
                  m_nPoseCapture, p[0], p[1], p[2]);
     printf("[robot_poses] #%d saved → %s\n", m_nPoseCapture, kPath);
+}
+
+void
+proc_visual_servo(void* apRobot)
+{
+    // Drop to non-RT: camera I/O (USB/RealSense) must not run at RT priority.
+    // pipe.start() and wait_for_frames() can block for tens of ms and would
+    // starve proc_ethercat_control, triggering Sync Manager watchdog on all slaves.
+    struct sched_param sp = {};
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+
+    CRobotIndy7* pRobot = static_cast<CRobotIndy7*>(apRobot);
+    DBG_LOG_INFO("(proc_visual_servo) Visual Servo Task Started (non-RT)!");
+
+    while (!pRobot->CheckStopTask())
+    {
+        if (!pRobot->m_bVSTrigger.load()) {
+            usleep(10000);
+            continue;
+        }
+        pRobot->m_visualServo.Loop();
+    }
+    DBG_LOG_WARN("[proc_visual_servo] TASK ENDED!");
 }
 
 void

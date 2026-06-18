@@ -58,6 +58,7 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qdd.resize(auDOF);
     m_Q_ref.resize(auDOF);
     m_Qd_ref.resize(auDOF);
+    m_Qd_ref_prev.resize(auDOF);
     m_Qdd_ref.resize(auDOF);
     m_zero_vector.resize(auDOF);
     m_Q_ik_target.resize(auDOF);
@@ -80,6 +81,7 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qdd.setZero();
     m_Q_ref.setZero();
     m_Qd_ref.setZero();
+    m_Qd_ref_prev.setZero();
     m_Qdd_ref.setZero();
     m_zero_vector.setZero();
     m_Q_ik_target.setZero();
@@ -176,8 +178,13 @@ CControllerFullDynamicsRT::Init()
                  "CControllerFullDynamicsRT", m_uDOF);
     
     // jieun
-    m_body_id = m_rbdlModel.GetBodyId("tcp");             
-    
+    m_body_id = m_rbdlModel.GetBodyId("tcp");
+
+    // 기본 목표 위치 — 실수로 다른 모드 진입 시 로봇이 안전한 위치로 이동
+    goal_tcpPose.m_position[0] = -0.011930;
+    goal_tcpPose.m_position[1] = -0.188431;
+    goal_tcpPose.m_position[2] =  1.326710;
+
     return TRUE;
 }
 
@@ -316,7 +323,7 @@ CControllerFullDynamicsRT::ComputeFullDynamics(std::vector<double>& avOutputTorq
 BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOutputTorque)
 {
     // Computed torque control: τ = M(q)[q̈_ref + Kp*e_pos + Kd*e_vel] + h(q,q̇)
-    
+
     // Compute dynamics
     RigidBodyDynamics::CompositeRigidBodyAlgorithm(m_rbdlModel, m_Q, m_M);
     RigidBodyDynamics::NonlinearEffects(m_rbdlModel, m_Q, m_Qd, m_h);
@@ -694,7 +701,7 @@ CControllerFullDynamicsRT::UpdateTrajectory()
 BOOL
 CControllerFullDynamicsRT::SetTargetPose_Jacobian()
 {
-        // 2. 6D Jacobian 계산 [angular(0-2); linear(3-5)] × DOF
+    // 2. 6D Jacobian 계산 [angular(0-2); linear(3-5)] × DOF
     m_J.setZero();
     RigidBodyDynamics::CalcPointJacobian6D(m_rbdlModel, m_Q, m_body_id, tcp_local_point, m_J);
 
@@ -704,19 +711,45 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_e_task[4] = goal_tcpPose.m_position[1] - tcpPose.m_position[1];
     m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
 
-    // 자세 오차 비활성화 (XYZ만 제어)
-    RigidBodyDynamics::Math::Matrix3d R_err = goal_tcpPose.m_rotation * tcpPose.m_rotation.transpose();
-    m_e_task[0] = m_Kp_task_rot * 0.5 * (R_err(2,1) - R_err(1,2));
-    m_e_task[1] = m_Kp_task_rot * 0.5 * (R_err(0,2) - R_err(2,0));
-    m_e_task[2] = m_Kp_task_rot * 0.5 * (R_err(1,0) - R_err(0,1));
-    // m_e_task[0] = 0.0;
-    // m_e_task[1] = 0.0;
-    // m_e_task[2] = 0.0;
+    // 자세 오차: TCP z축 방향 정렬만 수행 (roll 무시)
+    // e_rot = curZ × goalZ — z축을 goalZ로 회전시키는 각속도 방향, magnitude = sin(θ)
+    {
+        double pos_err_raw = sqrt(m_e_task[3]*m_e_task[3] +
+                                  m_e_task[4]*m_e_task[4] +
+                                  m_e_task[5]*m_e_task[5]);
+        if (pos_err_raw < 0.08) {
+            RigidBodyDynamics::Math::Vector3d curZ  = tcpPose.m_rotation.col(2);
+            RigidBodyDynamics::Math::Vector3d goalZ = goal_tcpPose.m_rotation.col(2);
+            RigidBodyDynamics::Math::Vector3d e_rot = curZ.cross(goalZ);
+            m_e_task[0] = m_Kp_task_rot * e_rot[0];
+            m_e_task[1] = m_Kp_task_rot * e_rot[1];
+            m_e_task[2] = m_Kp_task_rot * e_rot[2];
+        } else {
+            m_e_task[0] = 0.0;
+            m_e_task[1] = 0.0;
+            m_e_task[2] = 0.0;
+        }
+    }
 
     m_e_task[3] *= m_Kp_task_pos;
     m_e_task[4] *= m_Kp_task_pos;
     m_e_task[5] *= m_Kp_task_pos;
 
+    // 각속도 클램핑 (rad/s)
+    {
+        double rot_mag = sqrt(m_e_task[0]*m_e_task[0] +
+                              m_e_task[1]*m_e_task[1] +
+                              m_e_task[2]*m_e_task[2]);
+        const double MAX_ROT_VEL = 0.30; // rad/s
+        if (rot_mag > MAX_ROT_VEL) {
+            double s = MAX_ROT_VEL / rot_mag;
+            m_e_task[0] *= s;
+            m_e_task[1] *= s;
+            m_e_task[2] *= s;
+        }
+    }
+
+    // 선속도 클램핑 제거 — 관절 속도 한계(MAX_JOINT_VEL)로만 제한
 
     // 6. q_ref 적분용 위치 오차 계산 (gain 적용 전 raw 오차)
     double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
@@ -724,19 +757,52 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
                               m_e_task[5]*m_e_task[5]) / m_Kp_task_pos;
 
     // 4. DLS pseudo-inverse: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
-    // 목표 근접 시 λ를 줄여 수렴 정확도 향상 (adaptive damping)
-    double lambda = (pos_err_now < 0.01) ? 0.0005 : m_lambda;
+    // manipulability 기반 adaptive damping
     m_JJt.noalias() = m_J * m_J.transpose();
+    double w = std::sqrt(std::max(0.0, m_JJt.determinant()));
+    const double w_threshold   = 0.01;
+    const double lambda_high   = 0.05;
+    const double lambda_low    = 0.0005;
+    double lambda;
+    if      (w < w_threshold)    lambda = lambda_high;
+    else if (pos_err_now < 0.01) lambda = lambda_low;
+    else                         lambda = m_lambda;
     m_JJt.diagonal().array() += lambda * lambda;
     m_J_pinv.noalias() = m_J.transpose() * m_JJt.inverse();
 
     // 5. 관절 속도 레퍼런스: q̇_ref = J⁺ * e_task
     m_Qd_ref.noalias() = m_J_pinv * m_e_task;
 
-    // velocity clamping
-    const double MAX_JOINT_VEL = 0.5;  // rad/s
+    // 진단: 1000 사이클마다 위치/자세 오차와 예측 속도 출력
+    {
+        static int _dbg = 0;
+        if (++_dbg >= 1000) {
+            _dbg = 0;
+            RigidBodyDynamics::Math::VectorNd v6 = m_J * m_Qd_ref;
+            double e_pos = sqrt(m_e_task[3]*m_e_task[3]+m_e_task[4]*m_e_task[4]+m_e_task[5]*m_e_task[5]);
+            double e_rot = sqrt(m_e_task[0]*m_e_task[0]+m_e_task[1]*m_e_task[1]+m_e_task[2]*m_e_task[2]);
+            printf("[VS-DBG] e_x=%.4f pred_vx=%.4f tcp_x=%.4f | e_z=%.4f pred_vz=%.4f tcp_z=%.4f | e_rot=%.4f\n",
+                   m_e_task[3], v6[3], tcpPose.m_position[0],
+                   m_e_task[5], v6[5], tcpPose.m_position[2], e_rot);
+        }
+    }
+
+    // 가속도 제한 (속도 변화율 클램핑)
+    const double MAX_JOINT_ACC = 2.0;  // rad/s²
+    const double max_delta_vel = MAX_JOINT_ACC * m_dt;
+    for (unsigned int i = 0; i < m_uDOF; ++i)
+    {
+        double dv = m_Qd_ref[i] - m_Qd_ref_prev[i];
+        if (dv >  max_delta_vel) m_Qd_ref[i] = m_Qd_ref_prev[i] + max_delta_vel;
+        if (dv < -max_delta_vel) m_Qd_ref[i] = m_Qd_ref_prev[i] - max_delta_vel;
+    }
+
+    // 속도 상한 (절대 안전 한계)
+    const double MAX_JOINT_VEL = 0.6;  // rad/s
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
+
+    m_Qd_ref_prev = m_Qd_ref;
 
     // 적분 제거: 매 주기 m_Q 기준으로 Q_ref 재계산 (드리프트 없음)
     m_Q_ref = m_Q;
@@ -753,6 +819,8 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
 
     // 7. 참조 가속도 0
     m_Qdd_ref = m_zero_vector;
+
+    return TRUE;
 }
 
 
