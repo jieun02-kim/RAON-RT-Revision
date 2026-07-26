@@ -2,3 +2,17 @@ App/Indy7/raim_csv/*.csv
 App/Indy7/raim_csv/*.swp
 App/Indy7/obj/*.o
 App/Indy7/raim_csv/
+
+# --- kv260-merge branch: build artifacts & local junk ---
+obj/
+bin/
+build/
+install/
+log/
+*.o
+*.d
+*.out
+*.so
+.vscode/
+.claude/settings.local.json
+.omc/

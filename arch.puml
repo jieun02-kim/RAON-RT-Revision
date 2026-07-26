@@ -1,0 +1,259 @@
+@startuml Indy7_Architecture
+title Indy7 로봇팔 실시간 제어 소프트웨어 아키텍처 (make -> bin/Indy7Ctrl.out)
+
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam linetype ortho
+legend top left
+  --|>  상속(inheritance)
+  *--   조립(composition)
+  o--   집합(aggregation)
+  ..>   의존/호출(dependency)
+endlegend
+
+' ============================================================
+' 진입점
+' ============================================================
+package "진입점 (App/Indy7)" {
+  class main <<entry>> {
+    + main(argc, argv)
+    + signal_handler(nSignal)
+    --
+    설정 로드 -> CRobotIndy7 생성
+    -> Init() -> 대기 루프
+  }
+}
+
+' ============================================================
+' 애플리케이션 / 제어 계층 (App/Indy7)
+' ============================================================
+package "애플리케이션·제어 계층 (App/Indy7)" {
+
+  class CRobotIndy7 <<RT controller>> {
+    - m_pController : CControllerFullDynamicsRT*
+    - m_pEcatAxis[] : CAxisNRMKCore*
+    - m_pEcatSensor[] : CSensorNRMKEndTool*
+    - m_logBuffer : LogRingBuffer
+    - m_visualServo : VisualServo
+    --
+    + Init() / DeInit()
+    + InitEtherCAT() / InitController()
+    + EnableController() / SetControllerMode()
+    .. 6개 RT 태스크 ..
+    + proc_main_control()      <<1ms>>
+    + proc_ethercat_control()  <<1ms>>
+    + proc_keyboard_control()
+    + proc_terminal_output()   <<1s>>
+    + proc_logger()
+    + proc_visual_servo()      <<non-RT>>
+  }
+
+  abstract class CController {
+    # m_uDOF / m_vGains
+    + {abstract} Init()
+    + {abstract} Update(pos,vel,tor, out)
+    + {abstract} Reset() / SetGains()
+    + SaturateOutput() / ValidateInputs()
+  }
+
+  class CControllerFullDynamicsRT <<RBDL>> {
+    - m_rbdlModel : RBDL::Model
+    - m_M, m_h, m_g : 동역학 항
+    - m_Kp, m_Kd / m_J(자코비안)
+    --
+    + Update()  : 모드 분기
+    + ComputeGravityCompensation()  : τ=g(q)
+    + ComputeFullDynamics()         : τ=M·q̈_ref+h+PD
+    + ComputeComputedTorque()       : τ=M·(q̈_ref+PD)+h
+    + ComputeJacobianBasedIK()      : DLS 자코비안 IK
+    + ComputeTcpFK() / SetTargetPose()
+    + UpdateTrajectory()  : 5차 다항식
+    + RunISOCubeIKValidation()
+  }
+
+  class VisualServo <<ViSP/RealSense>> {
+    - PIMPL(camera, rMc)
+    + Init() / Start() / Stop()
+    + Loop()  : AprilTag 검출 -> goal pose
+    + GetGoalPose()
+  }
+
+  class CalibCapture {
+    + Capture(pose)  : pose_rPe_N.yaml
+  }
+
+  class LogRingBuffer <<lock-free>> {
+    + push(ST_LOG_ENTRY) / pop()
+    65536 entries, atomic head/tail
+  }
+}
+
+' ============================================================
+' 로봇 추상화 / 하드웨어 계층 (CRobot)
+' ============================================================
+package "로봇 추상화·하드웨어 계층 (CRobot)" {
+
+  abstract class CRobot {
+    # m_pcEcatMaster / m_pcConfigRobot
+    # m_pcExtInterface
+    # m_vAxis / m_vTask / m_vTaskFunctions
+    + Init(sim) / DeInit()
+    + InitRTTasks() / InitExtInterface()
+    + AddAxis() / AddTaskFunction()
+    + {abstract} InitEtherCAT()
+  }
+
+  abstract class CAxis {
+    # 기어비/엔코더/토크상수/리미트
+    + ServoOn/Off() / DoHoming()
+    + MoveTorque() / MoveAxis()
+    + GetCurrentPos/Vel/Tor()
+    + ConvertRadMM2Res() / ConvertTor2Res()
+    + IsAllowablePosition()...
+  }
+  class CAxisCIA402 {
+    # m_cEcSlave : CSlaveCIA402
+    + Init(EcatMaster, driveMode)
+    + ChangeDriveMode() (CSP/CSV/CST)
+    + GetStatusWord/ControlWord()
+  }
+  class CAxisNRMKCore {
+    + MoveTorque()  : τ->전류->카운트
+    + OnSlaveStatusChanged()  : 상태머신
+  }
+
+  abstract class CSensor {
+    + {abstract} Init/Start/Stop/Reset()
+    + CheckLimits() / CheckOverload()
+  }
+  class CSensorFT {
+    + ProcessRawData()  : raw->물리값
+    + ApplyCalibration() / ZeroBias()
+    + GetForce() / GetTorque()
+  }
+  class CSensorNRMKEndTool {
+    # m_cNrmkSlave : CSlaveNrmkEndtool
+    + ReadData()
+    + LED_RED/GREEN/BLUE/YELLOW/OFF()
+    + SetGripper() / GetGripper()
+  }
+
+  class CConfigRobot {
+    + ReadConfiguration(path)
+    + ReadSystemConfig/RTTaskConfig/EtherCATConfig()
+    + GetSystemConf/GetTaskList/GetEcatSlaveList()
+    + WriteLastPosition()
+  }
+
+  class CExtInterface <<TCP :7420>> {
+    - m_pSocket : CTcpServer*
+    - m_cCRC : CRC16_ARC
+    + Init(robot, port)
+    + ParseRecvPacket() / InterpretPacket()
+    + InterpretCmdRobot/Axis/EcatMaster()
+    + SendMetadata*() / SendAck/Nack()
+  }
+}
+
+' ============================================================
+' 공용 유틸 (Global)
+' ============================================================
+package "공용 유틸 (Global)" {
+  class ConfigParser <<free functions>> {
+    + GetPrivateProfileString/Int()
+    + WritePrivateProfileString()
+    + IsExistFile()
+  }
+  class CRC16 {
+    + calculate() / create_lookup_table()
+  }
+  class CRC16_ARC
+  class CSocket {
+    + InitSocket/BindAddress/Listen/Accept()
+  }
+  class CTcpServer {
+    + Start(port) / Stop()
+    + SendToClients()  (브로드캐스트)
+  }
+  class CTcpClient {
+    + Send()  (송신 큐, 비동기 스레드)
+  }
+  class Defines <<header>> {
+    DBG_LOG_*, BOOL/TSTRING/BYTE
+    ST_AXIS_CMD/STATE, 엔디언 변환
+    GetCurrTimeInNs(CLOCK_MONOTONIC)
+  }
+}
+
+' ============================================================
+' 외부 선설치 라이브러리 (저장소에 없음)
+' ============================================================
+package "외부 라이브러리 (precompiled)" <<cloud>> {
+  class "EMasterApp\n(CEcatMaster / CSlaveCIA402 /\nCSlaveNrmkEndtool)" as EMasterApp <<EtherCAT>>
+  class "RBDL + URDFReader" as RBDL <<dynamics>>
+  class "Eigen3" as Eigen <<linalg>>
+  class "ViSP + librealsense2" as ViSP <<vision>>
+  class "rtposix\n(create_rt_task / read_timer /\nwait_next_period)" as RTPOSIX <<RT>>
+}
+
+' ============================================================
+' 관계 (상속)
+' ============================================================
+CRobotIndy7 --|> CRobot
+CControllerFullDynamicsRT --|> CController
+CAxisCIA402 --|> CAxis
+CAxisNRMKCore --|> CAxisCIA402
+CSensorFT --|> CSensor
+CSensorNRMKEndTool --|> CSensorFT
+CRC16_ARC --|> CRC16
+
+' 관계 (생성/진입점)
+main ..> CRobotIndy7 : creates
+main ..> CConfigRobot : creates
+
+' 관계 (조립 - CRobotIndy7)
+CRobotIndy7 *-- CControllerFullDynamicsRT
+CRobotIndy7 o-- CAxisNRMKCore : "6 관절"
+CRobotIndy7 o-- CSensorNRMKEndTool : "엔드툴"
+CRobotIndy7 *-- VisualServo
+CRobotIndy7 *-- LogRingBuffer
+CRobotIndy7 ..> CalibCapture
+
+' 관계 (조립 - CRobot 베이스)
+CRobot o-- CAxis
+CRobot *-- CConfigRobot
+CRobot *-- CExtInterface
+CRobot ..> EMasterApp : CEcatMaster
+
+' 관계 (제어/비전 -> 외부 라이브러리)
+CControllerFullDynamicsRT ..> RBDL
+CControllerFullDynamicsRT ..> Eigen
+VisualServo ..> ViSP
+CRobot ..> RTPOSIX : RT 태스크
+CRobotIndy7 ..> RTPOSIX
+
+' 관계 (하드웨어 -> EtherCAT 슬레이브)
+CAxisCIA402 o-- EMasterApp : CSlaveCIA402
+CSensorNRMKEndTool o-- EMasterApp : CSlaveNrmkEndtool
+
+' 관계 (외부 통신)
+CExtInterface *-- CTcpServer
+CExtInterface o-- CRC16_ARC
+CExtInterface ..> CRobot : friend / 콜백
+CTcpServer *-- CSocket
+CTcpServer o-- CTcpClient
+CConfigRobot ..> ConfigParser
+
+' ============================================================
+' 데이터 흐름 노트
+' ============================================================
+note bottom of CRobotIndy7
+  **1ms 제어 루프 (proc_main_control)**
+  축에서 q, q̇ 읽기
+   -> Controller.Update()로 토크 τ 계산
+   -> 각 축 MoveTorque(τ) 전송
+  설정은 INDY7.cfg, 모델은 indy7.urdf
+end note
+
+@enduml

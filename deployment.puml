@@ -1,0 +1,96 @@
+@startuml Indy7_Deployment
+title Indy7 로봇팔 제어 시스템 배포(Deployment) 다이어그램
+
+skinparam shadowing false
+skinparam linetype ortho
+skinparam node {
+  BackgroundColor #FDFDFD
+  BorderColor #555555
+}
+
+' ============================================================
+' 제어 PC (실행 환경)
+' ============================================================
+node "제어 PC\n<<Linux + PREEMPT_RT / RT-POSIX>>" as PC {
+
+  artifact "bin/Indy7Ctrl.out\n<<executable>>" as APP {
+  }
+
+  component "RT 태스크 x6\n(main / ethercat /\nkeyboard / printer /\nlogger / visualservo)" as RTTASKS
+  component "FullDynamics 제어기\n(RBDL + Eigen)" as CTRL
+  component "VisualServo\n(ViSP + AprilTag)" as VS
+  component "External Interface\nTCP 서버" as EXT
+  component "EtherCAT Master\n(IgH EtherLab + EMasterApp)" as ECM
+
+  folder "설정·모델" as CFG {
+    artifact "INDY7.cfg"
+    artifact "indy7.urdf"
+  }
+
+  folder "/opt 공유 라이브러리" as LIBS {
+    artifact "libEMasterApp.so"
+    artifact "librtposix.so"
+    artifact "librbdl / librbdl_urdfreader"
+    artifact "libvisp_*.so"
+    artifact "librealsense2.so"
+  }
+
+  interface "EtherCAT NIC\n(전용 eth)" as NIC_ECAT
+  interface "USB 3.0" as USB
+  interface "TCP/IP :7420" as NIC_TCP
+}
+
+APP ..> RTTASKS
+APP ..> CTRL
+APP ..> VS
+APP ..> EXT
+APP ..> ECM
+APP ..> CFG : 로드
+APP ..> LIBS : 링크/로드
+
+RTTASKS --> ECM
+ECM --> NIC_ECAT
+VS --> USB
+EXT --> NIC_TCP
+
+' ============================================================
+' Indy7 로봇 (EtherCAT 슬레이브, 7개)
+' ============================================================
+node "Indy7 로봇\n<<EtherCAT 슬레이브 x7>>" as ROBOT {
+  node "Servo Drive #0..#5\n(CiA402, CST 토크모드)" as DRIVES {
+    component "모터 + 엔코더 x6"
+  }
+  node "EOAT / End Tool\n(NRMK, Slave #6)" as EOAT {
+    component "F/T 센서 (6축)"
+    component "그리퍼"
+    component "상태 LED"
+  }
+}
+
+' ============================================================
+' 주변 장치
+' ============================================================
+node "Intel RealSense\n뎁스/컬러 카메라" as CAM
+node "외부 클라이언트\n(GUI / Teach Pendant)" as CLIENT
+
+' ============================================================
+' 통신 경로
+' ============================================================
+NIC_ECAT == DRIVES : "EtherCAT (DC on, 1ms cycle)\n프레임 데이지체인"
+DRIVES -- EOAT : EtherCAT 인라인
+USB -- CAM : "USB3 (RGB-D 스트림)"
+NIC_TCP -- CLIENT : "TCP/IP :7420\nCRC16 바이너리 패킷"
+
+note bottom of ROBOT
+  매 1ms: Master가 7개 슬레이브를
+  ReadSlaves(q, q̇) -> 제어기 토크 계산
+  -> WriteSlaves(τ) 로 동기 교환
+end note
+
+note right of PC
+  실행: ./Indy7Ctrl.out -f INDY7.cfg
+  mlockall로 메모리 잠금(스왑 방지)
+  RT 태스크 우선순위 97/95 (1ms 주기)
+end note
+
+@enduml
