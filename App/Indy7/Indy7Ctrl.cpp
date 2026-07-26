@@ -682,6 +682,7 @@ CRobotIndy7::DoInput()
             {
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                 m_bLogTrigger = TRUE;
+                StartRefine(ref_pose.m_position);   // [kv260-merge] close the CTC droop
             }
             else
                 DBG_LOG_ERROR(">>> SetTargetPose FAILED — IK did not converge");
@@ -756,6 +757,18 @@ CRobotIndy7::WriteDataLog()
         }
         fclose(pfFileTiming);
     }
+}
+
+// [kv260-merge] arm the refinement SM (see header). Rotation is irrelevant:
+// refinement passes use position-only IK.
+void
+CRobotIndy7::StartRefine(const RigidBodyDynamics::Math::Vector3d& avDesired)
+{
+    m_vRefineDesired = avDesired;
+    m_stRefineCmd.m_position = avDesired;   // bias accumulates on top of this
+    m_nRefineIter = 0;
+    m_nRefineSettleCnt = 0;
+    m_bRefineActive = true;
 }
 
 BOOL
@@ -962,7 +975,8 @@ void proc_main_control(void* apRobot)
         {
             if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_MOVING)
             {
-                if (pRTController->IsTrajectoryDone())
+                // refinement runs between the first trajectory and "done"
+                if (pRTController->IsTrajectoryRefDone() && !pRobot->m_bRefineActive)
                 {
                     pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
                     const auto& tcp = pRTController->GetTcpPose();
@@ -989,6 +1003,7 @@ void proc_main_control(void* apRobot)
                                                             CRobotIndy7::APPROACH_DURATION_S);
                         pRobot->SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                         pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_MOVING;
+                        pRobot->StartRefine(stTarget.m_position);
                         DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  [std mm %.1f/%.1f/%.1f n=%d]",
                                      stGoal.szClass, stGoal.dX, stGoal.dY, stGoal.dZ,
                                      CRobotIndy7::APPROACH_DURATION_S,
@@ -999,6 +1014,72 @@ void proc_main_control(void* apRobot)
                     {
                         DBG_LOG_ERROR("[APPROACH] IK failed for (%.3f, %.3f, %.3f) — staying in grav-comp",
                                       stGoal.dX, stGoal.dY, stGoal.dZ);
+                    }
+                }
+            }
+        }
+        //======================================================================
+        // [kv260-merge] Position-refinement state machine (see Indy7Ctrl.h).
+        // Waits REFINE_SETTLE_CYC after each trajectory, measures the FK
+        // error vs the desired position, folds it into the commanded target
+        // as an accumulated bias and re-runs IK — until <REFINE_TOL_M or
+        // REFINE_MAX_ITER. A mode change ('g'/'j'/E-stop paths) aborts it.
+        if (pRobot->m_bRefineActive)
+        {
+            if (!bCtrlOn || pRTController->GetControlMode() !=
+                                CControllerFullDynamicsRT::eInverseKinematics_6dof)
+            {
+                pRobot->m_bRefineActive = false;
+                DBG_LOG_WARN("[REFINE] aborted (controller/mode change)");
+            }
+            else if (!pRTController->IsTrajectoryRefDone())
+            {
+                pRobot->m_nRefineSettleCnt = 0;
+            }
+            else if ([&]{   // measure only once the arm has actually stopped
+                double dVelSq = 0.0;
+                for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                    dVelSq += pRobot->m_vCurrentVel[nCnt] * pRobot->m_vCurrentVel[nCnt];
+                if (dVelSq > CRobotIndy7::REFINE_VEL_EPS * CRobotIndy7::REFINE_VEL_EPS)
+                {
+                    pRobot->m_nRefineSettleCnt = 0;
+                    return false;
+                }
+                return ++pRobot->m_nRefineSettleCnt >= CRobotIndy7::REFINE_SETTLE_CYC;
+            }())
+            {
+                pRobot->m_nRefineSettleCnt = 0;
+                pRTController->ComputeTcpFK();
+                const RigidBodyDynamics::Math::Vector3d vErr =
+                    pRobot->m_vRefineDesired - pRTController->GetTcpPose().m_position;
+                const double dErrMM = vErr.norm() * 1e3;
+
+                if (vErr.norm() <= CRobotIndy7::REFINE_TOL_M)
+                {
+                    pRobot->m_bRefineActive = false;
+                    DBG_LOG_INFO("[REFINE] done — err %.1f mm after %d pass(es)",
+                                 dErrMM, pRobot->m_nRefineIter);
+                }
+                else if (pRobot->m_nRefineIter >= CRobotIndy7::REFINE_MAX_ITER)
+                {
+                    pRobot->m_bRefineActive = false;
+                    DBG_LOG_WARN("[REFINE] stop at max iters — residual %.1f mm", dErrMM);
+                }
+                else
+                {
+                    pRobot->m_stRefineCmd.m_position += CRobotIndy7::REFINE_DAMPING * vErr;   // damped bias
+                    if (pRTController->SetTargetPosePositionOnly(pRobot->m_stRefineCmd))
+                    {
+                        pRTController->StartJointTrajectory(pRTController->GetTrajGoal(),
+                                                            CRobotIndy7::REFINE_TRAJ_T_S);
+                        pRobot->m_nRefineIter++;
+                        DBG_LOG_INFO("[REFINE] pass %d — err %.1f mm, re-targeting",
+                                     pRobot->m_nRefineIter, dErrMM);
+                    }
+                    else
+                    {
+                        pRobot->m_bRefineActive = false;
+                        DBG_LOG_ERROR("[REFINE] IK failed on bias target — stop");
                     }
                 }
             }

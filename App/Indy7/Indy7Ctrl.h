@@ -149,6 +149,29 @@ private:
 	eApproachState         m_eApproachState{eAPPROACH_IDLE};
 	static constexpr double APPROACH_DURATION_S = 3.0;
 
+	// [kv260-merge] Iterative position refinement — closes the CTC
+	// steady-state error (gate 2 measured ~16 cm: no integral action +
+	// harmonic-drive friction). After a trajectory settles, the FK error
+	// vs the desired position is ADDED as a bias to the commanded target
+	// and IK re-runs; the droop is locally near-constant so this converges
+	// in a few passes. Runs after 'a' and after every vision approach.
+	void StartRefine(const RigidBodyDynamics::Math::Vector3d& avDesired);
+	bool m_bRefineActive{false};
+	int  m_nRefineIter{0};
+	int  m_nRefineSettleCnt{0};
+	RigidBodyDynamics::Math::Vector3d m_vRefineDesired;
+	CControllerFullDynamicsRT::Pose   m_stRefineCmd;
+	// Tuning (2026-07-26 CSV analysis): the plant is stiction-dominated —
+	// the arm STOPS inside a friction dead-band whose offset varies per
+	// move, so full-gain bias oscillates around the target. Damped bias +
+	// velocity-gated measurement converges instead.
+	static constexpr double REFINE_TOL_M      = 0.012;  // stiction floor ~10-15 mm at stock gains
+	static constexpr int    REFINE_MAX_ITER   = 6;
+	static constexpr double REFINE_DAMPING    = 0.65;   // bias += a*err
+	static constexpr double REFINE_TRAJ_T_S   = 1.5;
+	static constexpr double REFINE_VEL_EPS    = 0.02;   // [rad/s] |qd| gate
+	static constexpr int    REFINE_SETTLE_CYC = 300;    // 0.3 s below eps
+
 	//=====================================================
 
 public:

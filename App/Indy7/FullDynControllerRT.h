@@ -54,6 +54,12 @@ public:
 
     void SetTrajectoryDuration(double adT_sec) { m_traj_duration = adT_sec; }
     bool IsTrajectoryDone() const { return !m_traj.active; }
+    // [kv260-merge] "reference generation finished" — unlike IsTrajectoryDone,
+    // does NOT require the settle criterion (every joint within 0.15 rad of
+    // q_goal). Under steady-state droop that criterion can never be met, so
+    // completion logic gated on IsTrajectoryDone would wait forever.
+    bool IsTrajectoryRefDone() const
+    { return !m_traj.active || m_traj.t_elapsed >= m_traj.T; }
     const RigidBodyDynamics::Math::VectorNd& GetTrajGoal() const { return m_traj.q_goal; }
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
   
