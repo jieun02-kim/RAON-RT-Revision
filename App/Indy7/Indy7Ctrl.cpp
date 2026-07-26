@@ -470,8 +470,29 @@ CRobotIndy7::DoInput()
         case 'o':
         case 'O':
             m_pEcatSensor[0]->LED_OFF();
+            break;   // [kv260-merge] was falling through into 'h'
+        // [kv260-merge] Phase 4 — operator-gated servo arm/disarm (there was
+        // NO keyboard servo-on path; the author ran AUTO_SERVO_ON=1 instead).
+        // Interlock: CST drives enable at zero torque, so the controller must
+        // already be enabled ('r') and in grav-comp before the brakes release.
         case 'h':
         case 'H':
+            if (!m_bRTControllerEnabled ||
+                m_pController->GetControlMode() !=
+                    CControllerFullDynamicsRT::eGravityCompensation)
+            {
+                printf("[ARM] refused — press 'r' (controller) then 'g' (grav-comp) first\n");
+                break;
+            }
+            DBG_LOG_WARN(">>> SERVO ON (all axes, CST) — brakes release, grav-comp holds");
+            for (int nCnt = 0; nCnt < (int)GetTotalAxis(); nCnt++)
+                m_pEcatAxis[nCnt]->ServoOn(CIA402_CYCLIC_TORQUE);
+            break;
+        case 'j':
+        case 'J':
+            DBG_LOG_WARN(">>> SERVO OFF (all axes) — brakes engage");
+            for (int nCnt = 0; nCnt < (int)GetTotalAxis(); nCnt++)
+                m_pEcatAxis[nCnt]->ServoOff();
             break;
         case 'e':
         case 'E':
@@ -763,11 +784,13 @@ void proc_main_control(void* apRobot)
 
      // Check if RT Controller is available
     CControllerFullDynamicsRT* pRTController = pRobot->GetController();
-    BOOL bUseRTController = (pRTController != NULL && pRTController->IsEnabled());
-    if (bUseRTController)
-        DBG_LOG_INFO("(proc_main_control) Using RT Controller");
-    else 
-        DBG_LOG_INFO("(proc_main_control) RT Controller not available - using fallback");
+    // [kv260-merge] availability only — the enable state is re-read EVERY
+    // cycle below. The upstream one-shot snapshot froze IsEnabled() at task
+    // start, which silently killed the runtime 'r' key whenever
+    // ENABLE_CONTROLLER_AT_STARTUP=0 (our safe bring-up cfg).
+    const BOOL bUseRTController = (pRTController != NULL);
+    DBG_LOG_INFO("(proc_main_control) RT Controller %s (enable at runtime: 'r')",
+                 bUseRTController ? "available" : "NOT available - fallback");
 
     RTTIME tPrev = read_timer();
     uint64_t max_calc_ns = 0, avg_calc_ns = 0, samp = 0;
@@ -781,12 +804,15 @@ void proc_main_control(void* apRobot)
         
         pRobot->DoInput();
 
+        // [kv260-merge] live enable state — makes 'r' actually work at runtime
+        const BOOL bCtrlOn = bUseRTController && pRTController->IsEnabled();
+
         // Read current joint states
-        for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
-        {   
+        for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
+        {
             auto ax = static_cast<CAxisNRMKCore*>(pRobot->m_pEcatAxis[nCnt]);
-            
-            if (bUseRTController) {
+
+            if (bCtrlOn) {
                 // Update RT controller vectors
                 pRobot->m_vCurrentPos[nCnt] = ax->GetCurrentPos();
                 pRobot->m_vCurrentVel[nCnt] = ax->GetCurrentVel();
@@ -795,7 +821,7 @@ void proc_main_control(void* apRobot)
         }
 
         // Compute control torques (Update 먼저 → tcpPose 갱신)
-        if (bUseRTController)
+        if (bCtrlOn)
         {
             // Use RT Controller - it handles all RT optimizations internally
             if (pRTController->Update(pRobot->m_vCurrentPos, pRobot->m_vCurrentVel,
@@ -825,7 +851,7 @@ void proc_main_control(void* apRobot)
 
         //======================================================================
         // TCP Trajectory Logging
-        if (bUseRTController && pRobot->m_bLogTrigger.load(std::memory_order_acquire))
+        if (bCtrlOn && pRobot->m_bLogTrigger.load(std::memory_order_acquire))
         {
             ST_LOG_ENTRY entry{};
             entry.timestamp_ns = (uint64_t)read_timer();
@@ -932,7 +958,7 @@ void proc_main_control(void* apRobot)
         // bridge ('p' → digit → 'v'). Bridge already ran the N-frame std gate
         // and the workspace-box check; here we mirror the proven 'n'-key
         // sequence: position-only IK → quintic joint trajectory → IK6dof+CTC.
-        if (pRobot->m_pPickBridge != nullptr && bUseRTController)
+        if (pRobot->m_pPickBridge != nullptr && bCtrlOn)
         {
             if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_MOVING)
             {
