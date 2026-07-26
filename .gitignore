@@ -20,3 +20,4 @@ log/
 tools/gate0_rtposix_test
 lib/
 *.a
+tools/phase3_logs/
