@@ -582,21 +582,72 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose)
     CS.num_steps      = 1000;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
+    // [kv260-merge] E13 (2026-07-27 table strike): a point-only constraint
+    // leaves a 3-dim nullspace, so RBDL was free to return a configuration
+    // far from m_Q (elbow flip / wrist unwind) and the joint-space quintic
+    // then swept an arbitrary Cartesian arc through the table. Position is
+    // hard; the caller's orientation (m_rotation is body->base, RBDL wants
+    // base->body) enters as a SOFT regularizer that keeps the solution on
+    // the current branch without making it hypersensitive to the start pose.
     CS.AddPointConstraint(m_body_id, tcp_local_point, astTargetPose.m_position);
-    BOOL is_ok = RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
-    if (!is_ok)
+    CS.AddOrientationConstraint(m_body_id, astTargetPose.m_rotation.transpose(),
+                                IK_ORI_WEIGHT);
+    (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
+    // Soft residual keeps RBDL's flag false — judge by the FK position error.
+    const RigidBodyDynamics::Math::Vector3d vPosSol =
+        RigidBodyDynamics::CalcBodyToBaseCoordinates(
+            m_rbdlModel, vjointspace, m_body_id, tcp_local_point);
+    const double dPosErr = (vPosSol - astTargetPose.m_position).norm();
+    if (dPosErr > IK_POS_TOL_M)
     {
-        DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed!");
+        DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed — residual "
+                     "%.1f mm > %.1f mm", dPosErr * 1e3, IK_POS_TOL_M * 1e3);
         return FALSE;
     }
 
+    double dDqMax = 0.0;
+    int    nDqAxis = -1;
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const double dDq = std::fabs(vjointspace[i] - m_Q[i]);
+        if (dDq > dDqMax) { dDqMax = dDq; nDqAxis = (int)i; }
+    }
+    if (dDqMax > IK_DQ_MAX_RAD)
+    {
+        DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: J%d jumps %.2f rad "
+                      "(> %.1f) — IK branch flip. Reposition the arm (grav-comp) "
+                      "closer to the target posture and retry.",
+                      nDqAxis, dDqMax, IK_DQ_MAX_RAD);
+        return FALSE;
+    }
+
+    double dT = m_traj_duration;
+    const double dT_need = 1.875 * dDqMax / IK_QD_PEAK_RADPS;  // quintic peak vel
+    if (dT_need > dT)
+    {
+        dT = (dT_need < IK_T_MAX_S) ? dT_need : IK_T_MAX_S;
+        DBG_LOG_INFO("(SetTargetPosePositionOnly) T stretched %.2f → %.2f s "
+                     "(dq_max %.2f rad)", m_traj_duration, dT, dDqMax);
+    }
+
+    // how far the soft constraint let the orientation drift (info only)
+    const RigidBodyDynamics::Math::Matrix3d E_sol =
+        RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, vjointspace,
+                                                    m_body_id);
+    const RigidBodyDynamics::Math::Matrix3d R_err = E_sol * astTargetPose.m_rotation;
+    double dCosA = (R_err.trace() - 1.0) / 2.0;
+    if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
+    const double dOriDevDeg = std::acos(dCosA) * 180.0 / M_PI;
+
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = vjointspace;
-    m_traj.T         = m_traj_duration;
+    m_traj.T         = dT;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
     goal_tcpPose     = astTargetPose;
-    DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s", m_traj.T);
+    DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s, "
+                 "dq_max %.2f rad (J%d), R held within %.1f deg",
+                 m_traj.T, dDqMax, nDqAxis, dOriDevDeg);
 
     return TRUE;
 }

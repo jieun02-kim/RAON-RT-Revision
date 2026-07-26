@@ -149,13 +149,22 @@ private:
 	eApproachState         m_eApproachState{eAPPROACH_IDLE};
 	static constexpr double APPROACH_DURATION_S = 3.0;
 
+	// [kv260-merge] HOME: the 'p'-menu entry snapshots the CURRENT JOINTS
+	// (no IK — returning to a recorded q has no branch-jump risk by
+	// construction); 'b' replays them with the E13 speed-scaled quintic.
+	RigidBodyDynamics::Math::VectorNd m_vHomeQ;
+	bool m_bHomeSet{false};
+
 	// [kv260-merge] Iterative position refinement — closes the CTC
 	// steady-state error (gate 2 measured ~16 cm: no integral action +
 	// harmonic-drive friction). After a trajectory settles, the FK error
 	// vs the desired position is ADDED as a bias to the commanded target
 	// and IK re-runs; the droop is locally near-constant so this converges
 	// in a few passes. Runs after 'a' and after every vision approach.
-	void StartRefine(const RigidBodyDynamics::Math::Vector3d& avDesired);
+	// Takes the full pose: with the E13 orientation-constrained IK the refine
+	// re-targets must carry the SAME rotation as the original command — the
+	// old Vector3d overload left m_stRefineCmd.m_rotation at identity.
+	void StartRefine(const CControllerFullDynamicsRT::Pose& astDesired);
 	bool m_bRefineActive{false};
 	int  m_nRefineIter{0};
 	int  m_nRefineSettleCnt{0};

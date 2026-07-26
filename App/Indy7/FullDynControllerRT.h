@@ -61,6 +61,23 @@ public:
     bool IsTrajectoryRefDone() const
     { return !m_traj.active || m_traj.t_elapsed >= m_traj.T; }
     const RigidBodyDynamics::Math::VectorNd& GetTrajGoal() const { return m_traj.q_goal; }
+    double GetTrajT() const { return m_traj.T; }
+
+    // [kv260-merge] IK sanity gates (2026-07-27 table strike, merge.md E13).
+    // A solution jumping a joint by more than IK_DQ_MAX_RAD from the current
+    // configuration is a branch flip / wrist unwind — refuse it instead of
+    // sweeping the arc. T is stretched so the quintic's PEAK joint speed
+    // (1.875*dq/T) never exceeds IK_QD_PEAK_RADPS.
+    static constexpr double IK_DQ_MAX_RAD    = 2.0;
+    static constexpr double IK_QD_PEAK_RADPS = 0.6;
+    static constexpr double IK_T_MAX_S       = 10.0;
+    // Orientation is a SOFT preference (hard keep-R made the solution — and
+    // the dq gate — hypersensitive to the hand-parked start pose): position
+    // must land within IK_POS_TOL_M, orientation bends only where the arm
+    // must. Acceptance is checked by FK, not by RBDL's convergence flag,
+    // because an unsatisfiable soft residual keeps that flag false.
+    static constexpr float  IK_ORI_WEIGHT    = 0.3f;
+    static constexpr double IK_POS_TOL_M     = 0.002;
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
   
 

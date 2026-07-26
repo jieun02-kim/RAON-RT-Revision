@@ -66,6 +66,8 @@ public:
     // TRUE once per gated approach; producer never rewrites while ready.
     BOOL PopGoal(Goal& astOut);
     BOOL HasLockedTarget() const { return m_bLocked.load(std::memory_order_acquire); }
+    // TRUE once after the menu's "record HOME" entry — RT snapshots joints.
+    BOOL PopHomeRecord() { return m_bHomeRecordReq.exchange(false, std::memory_order_acq_rel); }
 
     /* ---- non-RT configuration (call before OP; defaults below) ---- */
     void SetWorkspaceBox(double adXMin, double adXMax, double adYMin,
@@ -97,6 +99,7 @@ private:
     static constexpr double MENU_WINDOW_S   = 1.0; // aggregation window for 'p'
     static constexpr int    MENU_MIN_COUNT  = 3;   // frames to count as "visible"
     static constexpr double LOCK_MAX_AGE_S  = 1.0; // sample freshness for lock
+    static constexpr double LOCK_LOST_DEBOUNCE_S = 1.0; // silence detection flicker
 
     using SteadyTP = std::chrono::steady_clock::time_point;
     struct Sample
@@ -129,6 +132,13 @@ private:
     std::vector<std::string> m_vMenu;   // index → class ("" = auto entry)
     std::string m_strSelected;          // desired_class actually set ("" = auto)
     bool m_bLockedPrev{false};
+    // Lock chatter is SESSION-scoped (2026-07-27): announce only between a
+    // menu selection and GOAL READY. Without this the bridge narrated every
+    // pipeline flicker forever — even at boot, when a desired_class left in
+    // pick_logic (LIVE param survives app restarts) made stale targets lock.
+    bool     m_bAnnounceLock{false};    // worker-thread only
+    bool     m_bShownLocked{false};     // last ANNOUNCED state
+    SteadyTP m_tLostSince;              // falling-edge timestamp for debounce
 
     /* RT handshake (atomics + SPSC slot only) */
     std::atomic<bool> m_bMenuReq{false};
@@ -138,6 +148,7 @@ private:
     std::atomic<bool> m_bLocked{false};
     Goal              m_stGoal;
     std::atomic<bool> m_bGoalReady{false};
+    std::atomic<bool> m_bHomeRecordReq{false};  // menu → RT: snapshot joints
 
     /* gate configuration (written before OP only) */
     double m_dBox[6];

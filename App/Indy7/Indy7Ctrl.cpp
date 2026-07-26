@@ -682,7 +682,7 @@ CRobotIndy7::DoInput()
             {
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                 m_bLogTrigger = TRUE;
-                StartRefine(ref_pose.m_position);   // [kv260-merge] close the CTC droop
+                StartRefine(ref_pose);   // [kv260-merge] close the CTC droop
             }
             else
                 DBG_LOG_ERROR(">>> SetTargetPose FAILED — IK did not converge");
@@ -708,6 +708,43 @@ CRobotIndy7::DoInput()
             else
                 printf("[PickBridge] not available (init failed at startup)\n");
             break;
+        case 'b':
+        case 'B':
+        {
+            if (!m_bHomeSet)
+            {
+                DBG_LOG_WARN("[HOME] no home recorded — 'p' menu, last entry");
+                break;
+            }
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+            {
+                DBG_LOG_WARN("[HOME] controller not enabled ('r' first)");
+                break;
+            }
+            // pure joint-space return: no IK, so no branch risk — just cap
+            // the quintic's peak speed like E13 and go.
+            m_bRefineActive  = false;
+            m_eApproachState = eAPPROACH_IDLE;
+            double dDqMax = 0.0;
+            for (size_t i = 0; i < m_vCurrentPos.size(); i++)
+            {
+                const double dDq = std::fabs(m_vHomeQ[i] - m_vCurrentPos[i]);
+                if (dDq > dDqMax) dDqMax = dDq;
+            }
+            double dT = APPROACH_DURATION_S;
+            const double dT_need = 1.875 * dDqMax /
+                CControllerFullDynamicsRT::IK_QD_PEAK_RADPS;
+            if (dT_need > dT)
+                dT = (dT_need < CControllerFullDynamicsRT::IK_T_MAX_S)
+                     ? dT_need : CControllerFullDynamicsRT::IK_T_MAX_S;
+            SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+            m_pController->StartJointTrajectory(m_vHomeQ, dT);
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+            DBG_LOG_INFO("[HOME] returning, T=%.1f s (dq_max %.2f rad)",
+                         dT, dDqMax);
+            break;
+        }
         case '0': case '1': case '2': case '3': case '4':
         case '5': case '6': case '7': case '8': case '9':
             if (m_pPickBridge != nullptr)
@@ -762,10 +799,12 @@ CRobotIndy7::WriteDataLog()
 // [kv260-merge] arm the refinement SM (see header). Rotation is irrelevant:
 // refinement passes use position-only IK.
 void
-CRobotIndy7::StartRefine(const RigidBodyDynamics::Math::Vector3d& avDesired)
+CRobotIndy7::StartRefine(const CControllerFullDynamicsRT::Pose& astDesired)
 {
-    m_vRefineDesired = avDesired;
-    m_stRefineCmd.m_position = avDesired;   // bias accumulates on top of this
+    m_vRefineDesired = astDesired.m_position;
+    m_stRefineCmd    = astDesired;   // bias accumulates on top of m_position;
+                                     // m_rotation rides along for the IK
+                                     // orientation constraint (E13)
     m_nRefineIter = 0;
     m_nRefineSettleCnt = 0;
     m_bRefineActive = true;
@@ -967,6 +1006,23 @@ void proc_main_control(void* apRobot)
             }
         }
         //======================================================================
+        // [kv260-merge] HOME record — menu entry N+1 asked for a snapshot of
+        // the CURRENT joints (works in any mode; measured q is always live).
+        if (pRobot->m_pPickBridge != nullptr &&
+            pRobot->m_pPickBridge->PopHomeRecord())
+        {
+            const size_t uDof = pRobot->m_vCurrentPos.size();
+            pRobot->m_vHomeQ.resize(uDof);
+            for (size_t i = 0; i < uDof; i++)
+                pRobot->m_vHomeQ[i] = pRobot->m_vCurrentPos[i];
+            pRobot->m_bHomeSet = true;
+            DBG_LOG_INFO("[HOME] recorded q = [%.2f %.2f %.2f %.2f %.2f %.2f] rad"
+                         " — 'b' returns here",
+                         pRobot->m_vHomeQ[0], pRobot->m_vHomeQ[1],
+                         pRobot->m_vHomeQ[2], pRobot->m_vHomeQ[3],
+                         pRobot->m_vHomeQ[4], pRobot->m_vHomeQ[5]);
+        }
+        //======================================================================
         // [kv260-merge] Vision approach — consume a gated goal from the ROS2
         // bridge ('p' → digit → 'v'). Bridge already ran the N-frame std gate
         // and the workspace-box check; here we mirror the proven 'n'-key
@@ -997,16 +1053,18 @@ void proc_main_control(void* apRobot)
                     stTarget.m_position[0] = stGoal.dX;
                     stTarget.m_position[1] = stGoal.dY;
                     stTarget.m_position[2] = stGoal.dZ;
+                    // E13: SetTargetPosePositionOnly now starts the (possibly
+                    // T-stretched) trajectory itself — re-issuing
+                    // StartJointTrajectory here would clobber the scaled T.
+                    pRTController->SetTrajectoryDuration(CRobotIndy7::APPROACH_DURATION_S);
                     if (pRTController->SetTargetPosePositionOnly(stTarget))
                     {
-                        pRTController->StartJointTrajectory(pRTController->GetTrajGoal(),
-                                                            CRobotIndy7::APPROACH_DURATION_S);
                         pRobot->SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                         pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_MOVING;
-                        pRobot->StartRefine(stTarget.m_position);
+                        pRobot->StartRefine(stTarget);
                         DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  [std mm %.1f/%.1f/%.1f n=%d]",
                                      stGoal.szClass, stGoal.dX, stGoal.dY, stGoal.dZ,
-                                     CRobotIndy7::APPROACH_DURATION_S,
+                                     pRTController->GetTrajT(),
                                      stGoal.dStdMM[0], stGoal.dStdMM[1], stGoal.dStdMM[2],
                                      stGoal.nSamples);
                     }
@@ -1068,10 +1126,10 @@ void proc_main_control(void* apRobot)
                 else
                 {
                     pRobot->m_stRefineCmd.m_position += CRobotIndy7::REFINE_DAMPING * vErr;   // damped bias
+                    // E13: trajectory (incl. any T stretch) starts inside
+                    pRTController->SetTrajectoryDuration(CRobotIndy7::REFINE_TRAJ_T_S);
                     if (pRTController->SetTargetPosePositionOnly(pRobot->m_stRefineCmd))
                     {
-                        pRTController->StartJointTrajectory(pRTController->GetTrajGoal(),
-                                                            CRobotIndy7::REFINE_TRAJ_T_S);
                         pRobot->m_nRefineIter++;
                         DBG_LOG_INFO("[REFINE] pass %d — err %.1f mm, re-targeting",
                                      pRobot->m_nRefineIter, dErrMM);

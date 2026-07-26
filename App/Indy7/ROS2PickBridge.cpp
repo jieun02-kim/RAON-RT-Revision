@@ -98,8 +98,8 @@ CROS2PickBridge::Init()
     m_bInit = TRUE;
     printf("[PickBridge] up — sub %s, %s | param target %s\n",
            TOPIC_TARGET, TOPIC_DETECTIONS, PICK_LOGIC_NODE);
-    printf("[PickBridge] keys: 'p'=object menu, digit=select, 'v'=approach "
-           "(N=%d, std<%.0f mm, z+%.2f m)\n",
+    printf("[PickBridge] keys: 'p'=object menu, digit=select, 'v'=approach, "
+           "'b'=go home (N=%d, std<%.0f mm, z+%.2f m)\n",
            m_nGateSamples, m_dStdGateM * 1e3, m_dZMarginM);
     return TRUE;
 }
@@ -110,6 +110,22 @@ CROS2PickBridge::DeInit()
     if (!m_bInit)
         return TRUE;
     m_bInit = FALSE;
+
+    // Leave the pipeline neutral: desired_class is a LIVE param inside
+    // pick_logic and SURVIVES this app — a stale class kept /pick_target_base
+    // hot across restarts (2026-07-27). One quick best-effort attempt only;
+    // teardown must stay snappy (E7).
+    try
+    {
+        if (m_pParamClient && m_pParamClient->service_is_ready())
+        {
+            auto cFut = m_pParamClient->set_parameters(
+                {rclcpp::Parameter(PARAM_DESIRED, std::string())});
+            if (cFut.wait_for(500ms) == std::future_status::ready)
+                printf("[PickBridge] desired_class cleared (session end)\n");
+        }
+    }
+    catch (...) { /* teardown best-effort */ }
 
     m_bStop = true;
     if (m_bOwnContext && rclcpp::ok())
@@ -163,6 +179,12 @@ CROS2PickBridge::SpinLoop()
 void
 CROS2PickBridge::WorkerLoop()
 {
+    // Fresh session: neutralize any desired_class a previous app run left in
+    // pick_logic (LIVE param — it outlives us). Without this the pipeline
+    // keeps publishing the stale class from the moment we boot.
+    if (SetDesiredClass(std::string()))
+        printf("[PickBridge] desired_class reset for a fresh session\n");
+
     while (!m_bStop.load() && rclcpp::ok())
     {
         std::this_thread::sleep_for(50ms);
@@ -230,6 +252,7 @@ CROS2PickBridge::ShowMenu()
     std::vector<std::pair<std::string, int>> vVisible;
     {
         std::lock_guard<std::mutex> cLock(m_Mtx);
+        m_bAnnounceLock = false;   // new menu supersedes the previous session
         for (auto it = m_mapSeen.begin(); it != m_mapSeen.end();)
         {
             const double dAge =
@@ -262,9 +285,10 @@ CROS2PickBridge::ShowMenu()
     }
     printf("[PickBridge]   %d) AUTO (clear desired_class — best object)\n", nIdx);
     m_vMenu.push_back("");   // sentinel: auto
+    printf("[PickBridge]   %d) record HOME here (return later with 'b')\n", nIdx + 1);
     if (bPersonNear)
         printf("[PickBridge]   ! person in view — pick_logic will veto if close\n");
-    printf("[PickBridge] select 1-%d (0 = cancel)\n", nIdx);
+    printf("[PickBridge] select 1-%d (0 = cancel)\n", nIdx + 1);
     m_bMenuOpen.store(true, std::memory_order_release);
 }
 
@@ -280,6 +304,13 @@ CROS2PickBridge::HandleDigit(int anSel)
         printf("[PickBridge] menu cancelled\n");
         return;
     }
+    if (anSel == (int)m_vMenu.size() + 1)   // "record HOME" — last menu entry
+    {
+        m_bHomeRecordReq.store(true, std::memory_order_release);
+        printf("[PickBridge] HOME record requested — RT snapshots the current "
+               "joints ('b' returns there)\n");
+        return;
+    }
     if (anSel > (int)m_vMenu.size())
     {
         printf("[PickBridge] no entry %d — menu closed\n", anSel);
@@ -291,7 +322,10 @@ CROS2PickBridge::HandleDigit(int anSel)
     {
         {
             std::lock_guard<std::mutex> cLock(m_Mtx);
-            m_strSelected = strClass;
+            m_strSelected   = strClass;
+            m_bAnnounceLock = true;    // session starts: narrate lock state
+            m_bShownLocked  = false;
+            m_bLockedPrev   = false;
         }
         if (strClass.empty())
             printf("[PickBridge] desired_class cleared → AUTO select\n");
@@ -455,6 +489,11 @@ CROS2PickBridge::TickCollect()
            "[std mm %.1f/%.1f/%.1f, n=%d] — RT will start the approach\n",
            strClass.c_str(), dGoal[0], dGoal[1], dGoal[2],
            dStd[0] * 1e3, dStd[1] * 1e3, dStd[2] * 1e3, (int)vDone.size());
+
+    {   // session handed to RT — stop narrating lock flicker
+        std::lock_guard<std::mutex> cLock(m_Mtx);
+        m_bAnnounceLock = false;
+    }
 }
 
 /* ----------------------------------------------------------- lock watch -- */
@@ -464,33 +503,49 @@ CROS2PickBridge::TickLockWatch()
 {
     bool bLocked = false;
     Sample stCur;
+    int nPrint = 0;   // 0=silent, 1=locked, 2=lost
     {
         std::lock_guard<std::mutex> cLock(m_Mtx);
+        const auto tNow = std::chrono::steady_clock::now();
         if (m_bHaveSample)
         {
             const double dAge = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - m_stLatest.tStamp).count();
+                tNow - m_stLatest.tStamp).count();
             bLocked = (dAge < LOCK_MAX_AGE_S) && m_stLatest.bValid &&
                       (m_strSelected.empty() ||
                        m_stLatest.strClass == m_strSelected);
             stCur = m_stLatest;
         }
-        if (bLocked != m_bLockedPrev)
+        // RT-visible state tracks the instantaneous lock unconditionally.
+        m_bLocked.store(bLocked, std::memory_order_release);
+
+        if (m_bAnnounceLock)
         {
-            m_bLockedPrev = bLocked;
+            if (bLocked)
+            {
+                if (!m_bShownLocked) { nPrint = 1; m_bShownLocked = true; }
+            }
+            else
+            {
+                if (m_bLockedPrev)
+                    m_tLostSince = tNow;   // falling edge — start debounce
+                if (m_bShownLocked &&
+                    std::chrono::duration<double>(tNow - m_tLostSince).count()
+                        >= LOCK_LOST_DEBOUNCE_S)
+                {
+                    nPrint = 2;
+                    m_bShownLocked = false;
+                }
+            }
         }
-        else
-        {
-            m_bLocked.store(bLocked, std::memory_order_release);
-            return;
-        }
+        m_bLockedPrev = bLocked;
     }
 
-    m_bLocked.store(bLocked, std::memory_order_release);
-    if (bLocked)
+    if (nPrint == 1)
         printf("[PickBridge] TARGET LOCKED: %s @ base(%.3f, %.3f, %.3f) — "
                "'v' to approach\n",
                stCur.strClass.c_str(), stCur.dX, stCur.dY, stCur.dZ);
-    else
-        printf("[PickBridge] target lost\n");
+    else if (nPrint == 2)
+        printf("[PickBridge] target lost (>%.0f s) — reposition object or "
+               "'p' for a new menu\n", LOCK_LOST_DEBOUNCE_S);
 }
