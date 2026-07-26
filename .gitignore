@@ -18,3 +18,5 @@ log/
 .claude/settings.local.json
 .omc/
 tools/gate0_rtposix_test
+lib/
+*.a
