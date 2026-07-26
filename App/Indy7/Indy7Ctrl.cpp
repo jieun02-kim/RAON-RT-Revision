@@ -11,7 +11,7 @@
 #include <cmath>
 #include <sys/stat.h>
 
-CalibCapture s_calibCapture("/home/raimlab/RAON-RT/App/CalibUtils");
+CalibCapture s_calibCapture("/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260");
 
 #define CTRL_MODE_GRAV_COMP     0
 #define CTRL_MODE_FULL_DYN      1
@@ -23,7 +23,6 @@ void proc_ethercat_control(void* apRobot);
 void proc_keyboard_control(void* apRobot);
 void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
-void proc_visual_servo(void* apRobot);
 
 
 /****************************************************************************/
@@ -63,7 +62,6 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     AddTaskFunction(&proc_keyboard_control);
     AddTaskFunction(&proc_terminal_output);
     AddTaskFunction(&proc_logger);
-    AddTaskFunction(&proc_visual_servo);
 }
 
 CRobotIndy7::~CRobotIndy7()
@@ -90,9 +88,6 @@ CRobotIndy7::Init(BOOL abSim)
         DBG_LOG_ERROR("(%s) Failed to initialize RT Controller", "CRobotIndy7");
         return FALSE;
     }
-
-    if (!m_visualServo.Init())
-        DBG_LOG_WARN("(%s) VisualServo Init failed — VS disabled", "CRobotIndy7");
 
     if (!CRobot::Init(abSim))
         return FALSE;
@@ -384,6 +379,18 @@ CRobotIndy7::InitEtherCAT()
                 return FALSE;
             }
             AddAxis(m_pEcatAxis[nCnt]);
+
+            /* [kv260-merge] guide §14.2 #6: Init() never auto-selects the DC
+             * reference clock — pin slave 0 explicitly. No-op while the cfg
+             * leaves DC_SUPPORT off (author's proven SM-sync setup); becomes
+             * active the moment DC_SUPPORT=1 is enabled per-axis. */
+            if (nCnt == 0 && stSlaveInfo.bDCSupported)
+            {
+                if (FALSE == m_pEcatAxis[0]->GetEcatSlave().SetAsDCRef())
+                    DBG_LOG_WARN("(%s) SetAsDCRef(slave 0) failed", "CRobotIndy7");
+                else
+                    DBG_LOG_INFO("(%s) Slave 0 pinned as DC reference clock", "CRobotIndy7");
+            }
         }
         else if (nSlaveType == 1) // Sensor
         {
@@ -616,21 +623,6 @@ CRobotIndy7::DoInput()
                    m_Pose.m_rotation(1,0), m_Pose.m_rotation(1,1), m_Pose.m_rotation(1,2),
                    m_Pose.m_rotation(2,0), m_Pose.m_rotation(2,1), m_Pose.m_rotation(2,2));
             break;
-        case 'v':
-        case 'V':
-            if (!m_bVSTrigger.load()) {
-                m_visualServo.Start();
-                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
-                m_bVSTrigger = true;
-                printf("[VS] Visual Servoing ON\n");
-            } else {
-                m_visualServo.Stop();
-                m_bVSTrigger = false;
-                m_pController->SetControlMode(CControllerFullDynamicsRT::eGravityCompensation);
-                printf("[VS] Visual Servoing OFF — Gravity Compensation\n");
-            }
-            break;
-
         case 'a':
         case 'A':
         {
@@ -784,41 +776,9 @@ void proc_main_control(void* apRobot)
             }
         }
 
-        // Visual Servoing: Update() 이후 호출
-        if (bUseRTController && pRobot->m_bVSTrigger.load())
-        {
-            CControllerFullDynamicsRT::Pose vsGoal;
-            if (pRobot->m_visualServo.GetGoalPose(vsGoal))
-            {
-                // tcpPose를 현재 m_Q 기준으로 갱신 (eGravityComp 모드에서는 Update()에서 갱신 안 됨)
-                pRTController->ComputeTcpFK();
-                pRTController->goal_tcpPose = vsGoal;
-                pRTController->SetTargetPose_Jacobian();
-
-                // Q_ref가 계산됐으므로 CTC 모드로 전환 → 실제 관절 추종
-                pRTController->SetControlMode(
-                    CControllerFullDynamicsRT::eComputedTorque);
-
-                // 특이점 감지: 관절 속도가 임계값 초과 시
-                const double SINGULARITY_VEL_THRESHOLD = 0.45; // rad/s
-                for (int i = 0; i < (int)udof; ++i)
-                {
-                    if (std::fabs(pRobot->m_vCurrentVel[i]) > SINGULARITY_VEL_THRESHOLD)
-                    {
-                        pRobot->m_visualServo.NotifySingularity();
-                        pRTController->SetControlMode(
-                            CControllerFullDynamicsRT::eGravityCompensation);
-                        break;
-                    }
-                }
-            }
-            else
-            {
-                // 목표 없음 또는 SINGULARITY 상태 → 중력보상 유지
-                pRTController->SetControlMode(
-                    CControllerFullDynamicsRT::eGravityCompensation);
-            }
-        }
+        // [kv260-merge] ViSP visual-servo goal injection removed here.
+        // The ROS2 bridge (/pick_target_base) will provide goal poses instead;
+        // its safety-gated injection lands with the bridge wiring.
 
         //======================================================================
         // TCP Trajectory Logging
@@ -1237,8 +1197,8 @@ make_csv(CRobotIndy7* pRobot)
 void
 CRobotIndy7::SaveRobotPose()
 {
-    static const char* kDir  = "/home/raimlab/RAON-RT/App/Indy7/calib_data";
-    static const char* kPath = "/home/raimlab/RAON-RT/App/Indy7/calib_data/robot_poses.csv";
+    static const char* kDir  = "/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260";
+    static const char* kPath = "/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260/robot_poses.csv";
 
     mkdir(kDir, 0777);
     m_nPoseCapture++;
@@ -1269,29 +1229,6 @@ CRobotIndy7::SaveRobotPose()
     DBG_LOG_INFO("[SaveRobotPose] #%d saved: t=[%.4f, %.4f, %.4f]",
                  m_nPoseCapture, p[0], p[1], p[2]);
     printf("[robot_poses] #%d saved → %s\n", m_nPoseCapture, kPath);
-}
-
-void
-proc_visual_servo(void* apRobot)
-{
-    // Drop to non-RT: camera I/O (USB/RealSense) must not run at RT priority.
-    // pipe.start() and wait_for_frames() can block for tens of ms and would
-    // starve proc_ethercat_control, triggering Sync Manager watchdog on all slaves.
-    struct sched_param sp = {};
-    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
-
-    CRobotIndy7* pRobot = static_cast<CRobotIndy7*>(apRobot);
-    DBG_LOG_INFO("(proc_visual_servo) Visual Servo Task Started (non-RT)!");
-
-    while (!pRobot->CheckStopTask())
-    {
-        if (!pRobot->m_bVSTrigger.load()) {
-            usleep(10000);
-            continue;
-        }
-        pRobot->m_visualServo.Loop();
-    }
-    DBG_LOG_WARN("[proc_visual_servo] TASK ENDED!");
 }
 
 void

@@ -19,7 +19,10 @@
 #include "FullDynControllerRT.h"
 #include "DataRecorder.h"
 #include "CalibCapture.h"
-#include "VisualServo.h"
+// [kv260-merge] VisualServo (ViSP AprilTag) removed from the control app:
+// it opens the RealSense directly and cannot coexist with the perception
+// pipeline. Goal poses come from ROS2 (/pick_target_base) instead.
+// VisualServo.{h,cpp} remain in-tree (unbuilt) as closed-loop reference.
 
 
 typedef std::vector<double> VECDOUBLE;
@@ -89,7 +92,6 @@ protected:
 	friend void	proc_keyboard_control(void*);
 	friend void proc_terminal_output(void*);
 	friend void proc_logger(void*);
-	friend void proc_visual_servo(void*);
 	friend FILE* make_csv(CRobotIndy7*);
 
 private:
@@ -136,10 +138,6 @@ private:
 	void SaveISOHWResults();
 	void SaveRobotPose();
 	int  m_nPoseCapture{0};
-
-	// Visual Servoing
-	VisualServo                     m_visualServo;
-	std::atomic<bool>               m_bVSTrigger{false};
 
 	//=====================================================
 

@@ -14,8 +14,12 @@
 #include <fstream>
 #include <ctime>
 #include <sys/stat.h>
+/* [kv260-merge] SSE headers exist only on x86; the FTZ/DAZ intrinsics they
+ * serve are already __SSE__-guarded at the call sites (no aarch64 effect). */
+#if defined(__SSE__)
 #include <xmmintrin.h>
 #include <pmmintrin.h>
+#endif
 
 // RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
 RigidBodyDynamics::Math::Matrix3d

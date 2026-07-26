@@ -35,43 +35,62 @@ CSlaveNrmkEndtool::~CSlaveNrmkEndtool()
 
 BOOL CSlaveNrmkEndtool::RegisterPDO()
 {
+	/* [kv260-merge] signed capture revives the dead "<0" guards (UINT32 return made them no-ops) */
+	INT64 nPdoOff = -1;
     // Register Output PDOs (to slave)
-    if (0 > (m_stSlaveParams.GET_OFFSET(ILed) = RegisterPDOEntry(0x7000, 0x01, &m_stSlaveParams.GET_BITPOS(ILed), eOutput)))
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x01, &m_stSlaveParams.GET_BITPOS(ILed), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(IGripper) = RegisterPDOEntry(0x7000, 0x02, &m_stSlaveParams.GET_BITPOS(IGripper), eOutput)))
+    m_stSlaveParams.GET_OFFSET(ILed) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x02, &m_stSlaveParams.GET_BITPOS(IGripper), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTConfigParam) = RegisterPDOEntry(0x7000, 0x03, &m_stSlaveParams.GET_BITPOS(FTConfigParam), eOutput)))
+    m_stSlaveParams.GET_OFFSET(IGripper) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x03, &m_stSlaveParams.GET_BITPOS(FTConfigParam), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(LEDMode) = RegisterPDOEntry(0x7000, 0x04, &m_stSlaveParams.GET_BITPOS(LEDMode), eOutput)))
+    m_stSlaveParams.GET_OFFSET(FTConfigParam) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x04, &m_stSlaveParams.GET_BITPOS(LEDMode), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(LEDG) = RegisterPDOEntry(0x7000, 0x05, &m_stSlaveParams.GET_BITPOS(LEDG), eOutput)))
+    m_stSlaveParams.GET_OFFSET(LEDMode) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x05, &m_stSlaveParams.GET_BITPOS(LEDG), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(LEDR) = RegisterPDOEntry(0x7000, 0x06, &m_stSlaveParams.GET_BITPOS(LEDR), eOutput)))
+    m_stSlaveParams.GET_OFFSET(LEDG) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x06, &m_stSlaveParams.GET_BITPOS(LEDR), eOutput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(LEDB) = RegisterPDOEntry(0x7000, 0x07, &m_stSlaveParams.GET_BITPOS(LEDB), eOutput)))
+    m_stSlaveParams.GET_OFFSET(LEDR) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x7000, 0x07, &m_stSlaveParams.GET_BITPOS(LEDB), eOutput)))
         return FALSE;
+    m_stSlaveParams.GET_OFFSET(LEDB) = (UINT32)nPdoOff;
 
     // Register Input PDOs (from slave)
-    if (0 > (m_stSlaveParams.GET_OFFSET(IStatus) = RegisterPDOEntry(0x6000, 0x01, &m_stSlaveParams.GET_BITPOS(IStatus), eInput)))
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x01, &m_stSlaveParams.GET_BITPOS(IStatus), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(IButton) = RegisterPDOEntry(0x6000, 0x02, &m_stSlaveParams.GET_BITPOS(IButton), eInput)))
+    m_stSlaveParams.GET_OFFSET(IStatus) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x02, &m_stSlaveParams.GET_BITPOS(IButton), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawFx) = RegisterPDOEntry(0x6000, 0x03, &m_stSlaveParams.GET_BITPOS(FTRawFx), eInput)))
+    m_stSlaveParams.GET_OFFSET(IButton) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x03, &m_stSlaveParams.GET_BITPOS(FTRawFx), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawFy) = RegisterPDOEntry(0x6000, 0x04, &m_stSlaveParams.GET_BITPOS(FTRawFy), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawFx) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x04, &m_stSlaveParams.GET_BITPOS(FTRawFy), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawFz) = RegisterPDOEntry(0x6000, 0x05, &m_stSlaveParams.GET_BITPOS(FTRawFz), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawFy) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x05, &m_stSlaveParams.GET_BITPOS(FTRawFz), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawTx) = RegisterPDOEntry(0x6000, 0x06, &m_stSlaveParams.GET_BITPOS(FTRawTx), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawFz) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x06, &m_stSlaveParams.GET_BITPOS(FTRawTx), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawTy) = RegisterPDOEntry(0x6000, 0x07, &m_stSlaveParams.GET_BITPOS(FTRawTy), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawTx) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x07, &m_stSlaveParams.GET_BITPOS(FTRawTy), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTRawTz) = RegisterPDOEntry(0x6000, 0x08, &m_stSlaveParams.GET_BITPOS(FTRawTz), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawTy) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x08, &m_stSlaveParams.GET_BITPOS(FTRawTz), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTOverloadStatus) = RegisterPDOEntry(0x6000, 0x09, &m_stSlaveParams.GET_BITPOS(FTOverloadStatus), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTRawTz) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x09, &m_stSlaveParams.GET_BITPOS(FTOverloadStatus), eInput)))
         return FALSE;
-    if (0 > (m_stSlaveParams.GET_OFFSET(FTErrorFlag) = RegisterPDOEntry(0x6000, 0x0A, &m_stSlaveParams.GET_BITPOS(FTErrorFlag), eInput)))
+    m_stSlaveParams.GET_OFFSET(FTOverloadStatus) = (UINT32)nPdoOff;
+    if (0 > (nPdoOff = RegisterPDOEntry(0x6000, 0x0A, &m_stSlaveParams.GET_BITPOS(FTErrorFlag), eInput)))
         return FALSE;
+    m_stSlaveParams.GET_OFFSET(FTErrorFlag) = (UINT32)nPdoOff;
 
     return TRUE;
 }

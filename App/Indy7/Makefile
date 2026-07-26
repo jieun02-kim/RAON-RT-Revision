@@ -35,22 +35,18 @@ LDFLAG_ECAT = -L$(ECAT_LIB) -lEMasterApp
 LDFLAG_RT_POSIX = -L$(RT_POSIX_LIB) -lrtposix
 LDFLAGS = -lm -lrt -lpthread $(LDFLAG_ECAT) $(LDFLAG_RT_POSIX)
 
-# add RBDL and URDF Reader
+# RBDL + URDF reader (rbdl-orb). System install (/usr/local) by default;
+# override RBDL_DIR to point at a staged prefix for pre-flight builds.
+RBDL_DIR ?=
+ifneq ($(RBDL_DIR),)
+CFLAGS  += -I$(RBDL_DIR)/include
+LDFLAGS += -L$(RBDL_DIR)/lib -Wl,-rpath,$(RBDL_DIR)/lib
+endif
 LDFLAGS += -lrbdl -lrbdl_urdfreader
 
-# ViSP (ROS Jazzy) — used for hand-eye calibration and visual servoing
-VISP_INCLUDE = /home/raimlab/visp/build/include
-VISP_LIB     = /home/raimlab/visp/build/lib
-VISP_SRC = /home/raimlab/visp/modules
-CFLAGS  += -I$(VISP_INCLUDE) -I$(VISP_INCLUDE)/visp
-CFLAGS  += -I$(VISP_SRC)/detection/include
-CFLAGS  += -I$(VISP_SRC)/sensor/include
-CFLAGS  += -I$(VISP_SRC)/core/include
-CFLAGS  += -I$(VISP_SRC)/io/include
-CFLAGS  += -I/usr/include/opencv4
-CFLAGS  += -I/usr/include/pcl-1.14
-LDFLAGS += -L$(VISP_LIB) -lvisp_core -lvisp_io -lvisp_detection -lvisp_sensor
-LDFLAGS += -L/usr/local/lib/x86_64-linux-gnu -lrealsense2
+# [kv260-merge] ViSP / librealsense / OpenCV / PCL removed: the ViSP visual
+# servo is out of this app (camera stays with the ROS2 perception pipeline);
+# CalibCapture is now ViSP-free (Eigen AngleAxisd).
 
 #SOURCES
 SOURCES	+= $(GLOBAL_DIR)/ConfigParser.cpp
@@ -68,7 +64,6 @@ SOURCES	+= $(ROBOT_DIR)/Robot.cpp
 SOURCES	+= $(CURR_DIR)/Controller.cpp
 SOURCES	+= $(CURR_DIR)/FullDynControllerRT.cpp
 SOURCES	+= $(CURR_DIR)/CalibCapture.cpp
-SOURCES	+= $(CURR_DIR)/VisualServo.cpp
 SOURCES	+= $(CURR_DIR)/Indy7Ctrl.cpp
 SOURCES	+= $(CURR_DIR)/main.cpp
 
