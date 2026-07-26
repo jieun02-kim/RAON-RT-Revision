@@ -39,15 +39,23 @@ static void periodic_proc(void* arg)
 {
     CTX* c = (CTX*)arg;
 
+    /* Discard startup transient: set_task_period() arms the first deadline at
+     * setup time, so by the time the thread reaches its first wait the deadline
+     * is stale -> late first wakeup -> shortened next interval (grid self-heals).
+     * Not scheduler jitter; skip it. */
+    const long WARMUP = 10;
+
     wait_next_period(NULL);             /* align to the first period edge */
     RTTIME prev = read_timer();
     c->min_dt = (RTTIME)-1;
 
-    for (long i = 0; i < c->cycles; i++) {
+    for (long i = 0; i < c->cycles + WARMUP; i++) {
         wait_next_period(NULL);
         RTTIME now = read_timer();
         RTTIME dt  = now - prev;
         prev = now;
+        if (i < WARMUP)
+            continue;
 
         double err  = ((double)dt - (double)c->period) / 1000.0;  /* us */
         double aerr = err < 0 ? -err : err;
