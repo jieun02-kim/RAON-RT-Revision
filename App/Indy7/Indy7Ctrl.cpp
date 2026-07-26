@@ -1301,12 +1301,13 @@ proc_logger(void* apRobot)
 FILE*
 make_csv(CRobotIndy7* pRobot)
 {
-    mkdir("/home/raimlab/RAON-RT/App/Indy7/rt_log_results", 0777);
+    // [kv260-merge] was the author's absolute home path — every log write failed
+    mkdir("/home/ubuntu/RAON-RT-Revision/App/Indy7/rt_log_results", 0777);
     char szFilename[256];
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     snprintf(szFilename, sizeof(szFilename),
-        "/home/raimlab/RAON-RT/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
+        "/home/ubuntu/RAON-RT-Revision/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
         t->tm_hour, t->tm_min, t->tm_sec);
     FILE* fp = fopen(szFilename, "w");
