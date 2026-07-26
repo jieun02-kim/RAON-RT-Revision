@@ -1112,6 +1112,12 @@ proc_keyboard_control(void* apRobot)
             continue;
         }
 
+        // [kv260-merge] newline never carries a command; without this a piped
+        // "p\n" overwrites m_cKeyPress with '\n' before the 1 kHz consumer
+        // samples it (real-terminal Enter would clobber a pending key too).
+        if (cKeyPress == '\n' || cKeyPress == '\r')
+            continue;
+
         if ('q' == cKeyPress)
         {
             pRobot->StopTasks();
