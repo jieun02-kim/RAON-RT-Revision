@@ -85,9 +85,11 @@ private:
     void TickLockWatch();
     BOOL SetDesiredClass(const std::string& astrClass);
 
-    /* defaults — revisit the box at Phase 5 once the TF is calibrated;
-     * until then any motion consumer must widen/verify these deliberately. */
-    static constexpr double DEF_BOX[6]   = {0.20, 0.70, -0.45, 0.45, 0.05, 0.60};
+    /* Workspace box for the GOAL (z margin already added). Set from the
+     * 2026-07-27 hand-eye calibration: camera sits at base (0.762, -0.085,
+     * 0.925) looking down, table extends +X. z_max 0.50 keeps >0.4 m of
+     * clearance below the camera; x_max 0.85 is the practical Indy7 reach. */
+    static constexpr double DEF_BOX[6]   = {0.30, 0.85, -0.50, 0.45, 0.10, 0.50};
     static constexpr double DEF_ZMARGIN  = 0.15;   // [m] hover above the object
     static constexpr int    DEF_SAMPLES  = 15;     // ≈1 s @15 Hz
     static constexpr double DEF_STD_GATE = 0.008;  // [m] per-axis std gate

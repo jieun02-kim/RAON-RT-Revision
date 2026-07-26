@@ -21,3 +21,5 @@ tools/gate0_rtposix_test
 lib/
 *.a
 tools/phase3_logs/
+App/Indy7/rt_log_results/
+__pycache__/
