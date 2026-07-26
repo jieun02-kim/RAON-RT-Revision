@@ -23,6 +23,7 @@
 // it opens the RealSense directly and cannot coexist with the perception
 // pipeline. Goal poses come from ROS2 (/pick_target_base) instead.
 // VisualServo.{h,cpp} remain in-tree (unbuilt) as closed-loop reference.
+#include "ROS2PickBridge.h"
 
 
 typedef std::vector<double> VECDOUBLE;
@@ -60,6 +61,7 @@ public:
 
 	enum eISOHWState { eISO_HW_IDLE=0, eISO_HW_TO_TARGET, eISO_HW_TO_CLEARANCE, eISO_HW_DONE };
 	enum eRectState  { eRECT_IDLE=0, eRECT_TO_CORNER };
+	enum eApproachState { eAPPROACH_IDLE=0, eAPPROACH_MOVING };
 	
 	/* Controller */
 	CControllerFullDynamicsRT* GetController() { return m_pController; }
@@ -138,6 +140,14 @@ private:
 	void SaveISOHWResults();
 	void SaveRobotPose();
 	int  m_nPoseCapture{0};
+
+	// [kv260-merge] Gate 2b — perception pipeline bridge ('p'/digit/'v').
+	// Bridge threads are non-RT; the RT loop only uses its wait-free API.
+	// v1 approach = position-only IK (keeps current TCP orientation) via the
+	// proven 'n'-key sequence; top-down fixed R is deferred to Phase 5.
+	CROS2PickBridge*       m_pPickBridge{nullptr};
+	eApproachState         m_eApproachState{eAPPROACH_IDLE};
+	static constexpr double APPROACH_DURATION_S = 3.0;
 
 	//=====================================================
 

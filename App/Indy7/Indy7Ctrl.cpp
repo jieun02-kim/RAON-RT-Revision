@@ -89,6 +89,16 @@ CRobotIndy7::Init(BOOL abSim)
         return FALSE;
     }
 
+    // [kv260-merge] Gate 2b — perception-pipeline bridge. Non-fatal: the
+    // robot must stay usable standalone (no ROS2 pipeline running).
+    m_pPickBridge = new CROS2PickBridge();
+    if (FALSE == m_pPickBridge->Init())
+    {
+        DBG_LOG_WARN("(%s) ROS2 pick bridge unavailable — running without pipeline link", "CRobotIndy7");
+        delete m_pPickBridge;
+        m_pPickBridge = nullptr;
+    }
+
     if (!CRobot::Init(abSim))
         return FALSE;
 
@@ -105,6 +115,14 @@ CRobotIndy7::DeInit()
 
         delete[] m_pEcatSensor;
         m_pEcatSensor = nullptr;
+
+        // [kv260-merge] bridge teardown (joins its non-RT threads)
+        if (m_pPickBridge != nullptr)
+        {
+            m_pPickBridge->DeInit();
+            delete m_pPickBridge;
+            m_pPickBridge = nullptr;
+        }
 
         return TRUE;
     }
@@ -650,6 +668,31 @@ CRobotIndy7::DoInput()
             break;
         }
 
+        //==============================================================
+        // [kv260-merge] Gate 2b — pipeline pick flow ('p' → digit → 'v').
+        // Handlers only flip bridge atomics; all ROS2 work runs on the
+        // bridge's own non-RT threads.
+        case 'p':
+        case 'P':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->RequestMenu();
+            else
+                printf("[PickBridge] not available (init failed at startup)\n");
+            break;
+        case 'v':
+        case 'V':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->RequestApproach();
+            else
+                printf("[PickBridge] not available (init failed at startup)\n");
+            break;
+        case '0': case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->FeedDigit(m_cKeyPress);
+            break;
+        //==============================================================
+
         default:
             break;
     }
@@ -882,6 +925,56 @@ void proc_main_control(void* apRobot)
                     pRobot->m_nRectCornerIdx + 1,
                     pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[1],
                     pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[2]);
+            }
+        }
+        //======================================================================
+        // [kv260-merge] Vision approach — consume a gated goal from the ROS2
+        // bridge ('p' → digit → 'v'). Bridge already ran the N-frame std gate
+        // and the workspace-box check; here we mirror the proven 'n'-key
+        // sequence: position-only IK → quintic joint trajectory → IK6dof+CTC.
+        if (pRobot->m_pPickBridge != nullptr && bUseRTController)
+        {
+            if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_MOVING)
+            {
+                if (pRTController->IsTrajectoryDone())
+                {
+                    pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    const auto& tcp = pRTController->GetTcpPose();
+                    DBG_LOG_INFO("[APPROACH] done — holding at (%.3f, %.3f, %.3f); 'g'=grav-comp",
+                                 tcp.m_position[0], tcp.m_position[1], tcp.m_position[2]);
+                }
+            }
+            else if (!pRobot->m_bIsoHWTrigger.load() && !pRobot->m_bRectTrigger.load() &&
+                     pRobot->m_bRTControllerEnabled)
+            {
+                CROS2PickBridge::Goal stGoal;
+                if (pRobot->m_pPickBridge->PopGoal(stGoal))
+                {
+                    // grav-comp first: stop consuming any previous trajectory
+                    pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                    pRobot->m_pController->GetCurrentPose(pRobot->m_Pose);
+                    CControllerFullDynamicsRT::Pose stTarget = pRobot->m_Pose;  // keep current R
+                    stTarget.m_position[0] = stGoal.dX;
+                    stTarget.m_position[1] = stGoal.dY;
+                    stTarget.m_position[2] = stGoal.dZ;
+                    if (pRTController->SetTargetPosePositionOnly(stTarget))
+                    {
+                        pRTController->StartJointTrajectory(pRTController->GetTrajGoal(),
+                                                            CRobotIndy7::APPROACH_DURATION_S);
+                        pRobot->SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                        pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_MOVING;
+                        DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  [std mm %.1f/%.1f/%.1f n=%d]",
+                                     stGoal.szClass, stGoal.dX, stGoal.dY, stGoal.dZ,
+                                     CRobotIndy7::APPROACH_DURATION_S,
+                                     stGoal.dStdMM[0], stGoal.dStdMM[1], stGoal.dStdMM[2],
+                                     stGoal.nSamples);
+                    }
+                    else
+                    {
+                        DBG_LOG_ERROR("[APPROACH] IK failed for (%.3f, %.3f, %.3f) — staying in grav-comp",
+                                      stGoal.dX, stGoal.dY, stGoal.dZ);
+                    }
+                }
             }
         }
         //======================================================================
