@@ -20,6 +20,9 @@ typedef struct stConfigTask
 	INT32	nPriority;
 	INT32	nStartDelay;
 	INT32	nPeriod;
+	// [kv260-merge] D10: optional per-task CPU pin from the cfg (CPU= key).
+	// -1 keeps the RT-POSIX default (every task pinned to CPU0).
+	INT32	nCpu;
 
 	stConfigTask()
 	{
@@ -28,6 +31,7 @@ typedef struct stConfigTask
 		nPriority = 0;
 		nStartDelay = 0;
 		nPeriod = 0;
+		nCpu = -1;
 	}
 }ST_CONFIG_TASK;
 

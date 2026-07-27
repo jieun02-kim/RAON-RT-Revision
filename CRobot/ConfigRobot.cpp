@@ -109,6 +109,11 @@ CConfigRobot::ReadRTTaskConfig()
 			GetPrivateProfileString(strKey.c_str(), "START_DELAY", "0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
 			stTask.nStartDelay = atoi(str);
 
+			// [kv260-merge] D10: optional CPU pin (-1 = RT-POSIX default CPU0)
+			ZeroMemory(str);
+			GetPrivateProfileString(strKey.c_str(), "CPU", "-1", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+			stTask.nCpu = atoi(str);
+
 			m_vstTaskList.push_back(stTask);
 		}
 	}

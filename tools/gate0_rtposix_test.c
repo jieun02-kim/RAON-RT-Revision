@@ -7,9 +7,11 @@
  *
  * Build: gcc -O2 -Wall -I/opt/rt_posix/include -o gate0_rtposix_test \
  *            gate0_rtposix_test.c -L/opt/rt_posix/lib -lrtposix -lpthread -lrt -lm
- * Run:   sudo ./gate0_rtposix_test [cycles=5000] [period_ns=1000000] [prio=80] [v]
+ * Run:   sudo ./gate0_rtposix_test [cycles=5000] [period_ns=1000000] [prio=80] [cpu|v] [v]
  *        (non-root without rtprio ulimit -> NRT fallback, API mechanics only;
- *         4th arg enables the RT-POSIX low-level logger for diagnosis)
+ *         a numeric 4th/5th arg pins the task to that CPU — RT-POSIX default
+ *         is CPU0 — for the D10 3+1 isolation A/B; "v" enables the RT-POSIX
+ *         low-level logger for diagnosis)
  *
  * NOTE: wait_next_period()'s overrun detection in RT-POSIX compares the wrong
  *       direction at equal tv_sec (deadline-in-future counted as overrun), so
@@ -72,16 +74,30 @@ int main(int argc, char** argv)
     g_ctx.cycles = argc > 1 ? atol(argv[1])          : 5000;
     g_ctx.period = argc > 2 ? (RTTIME)atoll(argv[2]) : 1000000ULL;
     int prio     = argc > 3 ? atoi(argv[3])          : 80;
+    int cpu = -1, verbose = 0;
+    for (int i = 4; i < argc && i < 6; i++) {
+        if (0 == strcmp(argv[i], "v")) verbose = 1;
+        else                           cpu = atoi(argv[i]);
+    }
 
     mlockall(MCL_CURRENT | MCL_FUTURE);
-    init_lowlevel_logger(argc > 4 ? TRUE : FALSE);
+    init_lowlevel_logger(verbose ? TRUE : FALSE);
 
     /* 2 MB stack, mirroring CRobot::InitRTTasks — also dodges the RT-POSIX
      * aarch64 bug where DEFAULT_STKSIZE(64K) < PTHREAD_STACK_MIN(128K) -> EINVAL */
     const INT STK = 2 * 1024 * 1024;
 
     g_ctx.rt_mode = 1;
-    if (create_rt_task(&g_task, (const PCHAR)"GATE0", STK, prio) != RET_SUCC ||
+    int created = (create_rt_task(&g_task, (const PCHAR)"GATE0", STK, prio)
+                   == RET_SUCC);
+    if (created && cpu >= 0) {
+        if (set_cpu_affinity(&g_task, cpu) == RET_SUCC)
+            printf("[GATE0] task pinned to CPU%d\n", cpu);
+        else
+            printf("[GATE0] WARN: CPU%d pin failed — stays on the RT-POSIX "
+                   "default CPU0\n", cpu);
+    }
+    if (!created ||
         set_task_period(&g_task, SET_TM_NOW, g_ctx.period)       != RET_SUCC ||
         start_task(&g_task, &periodic_proc, &g_ctx)              != RET_SUCC) {
         printf("[GATE0] RT mode unavailable (rtprio/EPERM?) -> NRT fallback (mechanics only)\n");
