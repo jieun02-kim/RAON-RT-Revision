@@ -708,6 +708,17 @@ CRobotIndy7::DoInput()
             else
                 printf("[PickBridge] not available (init failed at startup)\n");
             break;
+        case 'k':
+        case 'K':
+            if (m_pController != NULL)
+            {
+                const bool bEn = !m_pController->m_bStickyEnable.load();
+                m_pController->m_bStickyEnable = bEn;
+                DBG_LOG_INFO("[STICKY] grav-comp hold %s (dead-band %.0f mrad)",
+                             bEn ? "ON" : "OFF — pure float",
+                             CControllerFullDynamicsRT::HOLD_DB_RAD * 1e3);
+            }
+            break;
         case 'b':
         case 'B':
         {

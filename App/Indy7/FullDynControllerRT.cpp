@@ -223,6 +223,11 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
 
     SetTcpReferencePose();
 
+    // sticky-float anchor is only meaningful while grav-comp is the ACTIVE
+    // mode — re-anchor fresh on the next grav-comp entry
+    if (m_eControlMode != eGravityCompensation)
+        m_bHoldAnchored = false;
+
     // Compute control based on selected mode
     BOOL result = FALSE;
     switch (m_eControlMode) {
@@ -275,11 +280,35 @@ CControllerFullDynamicsRT::ComputeGravityCompensation(std::vector<double>& avOut
 {
     // Gravity compensation: τ = g(q)
     RigidBodyDynamics::InverseDynamics(m_rbdlModel, m_Q, m_zero_vector, m_zero_vector, m_g);
-    
+
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         avOutputTorque[i] = m_g[i];
     }
-    
+
+    // [kv260-merge] Sticky-float hold (see header). Only when grav-comp is
+    // the ACTIVE mode — this function also serves as a fallback for other
+    // modes, which must stay pure g(q).
+    if (m_eControlMode == eGravityCompensation &&
+        m_bStickyEnable.load(std::memory_order_relaxed))
+    {
+        if (!m_bHoldAnchored)
+        {
+            m_Q_hold = m_Q;
+            m_bHoldAnchored = true;
+        }
+        for (unsigned int i = 0; i < m_uDOF; ++i)
+        {
+            double dErr = m_Q[i] - m_Q_hold[i];
+            if (dErr > HOLD_DB_RAD)          // pushed past the dead-band:
+                m_Q_hold[i] = m_Q[i] - HOLD_DB_RAD;   // the anchor drags along
+            else if (dErr < -HOLD_DB_RAD)
+                m_Q_hold[i] = m_Q[i] + HOLD_DB_RAD;
+            dErr = m_Q[i] - m_Q_hold[i];
+            avOutputTorque[i] += -HOLD_KP_FRAC * m_Kp[i] * dErr
+                                 - HOLD_KD_FRAC * m_Kd[i] * m_Qd[i];
+        }
+    }
+
     return TRUE;
 }
 

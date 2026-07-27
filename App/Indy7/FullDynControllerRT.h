@@ -78,6 +78,17 @@ public:
     // because an unsatisfiable soft residual keeps that flag false.
     static constexpr float  IK_ORI_WEIGHT    = 0.3f;
     static constexpr double IK_POS_TOL_M     = 0.002;
+
+    // [kv260-merge] Sticky-float hold: grav-comp + a weak per-joint spring to
+    // an anchor that DRAGS when pushed past the dead-band and freezes when
+    // released. Stops the residual-model sink (the model can't be perfect —
+    // link mass % errors + friction) while staying hand-guidable; the spring
+    // force is bounded by construction (max = frac*Kp*DB per joint).
+    // Toggle with 'k' (default ON).
+    static constexpr double HOLD_DB_RAD  = 0.03;   // dead-band [rad]
+    static constexpr double HOLD_KP_FRAC = 0.15;   // of the joint Kp
+    static constexpr double HOLD_KD_FRAC = 0.08;   // of the joint Kd
+    std::atomic<bool> m_bStickyEnable{true};
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
   
 
@@ -236,6 +247,10 @@ private:
     // Control gains
     std::vector<double> m_Kp;                           // Position gains
     std::vector<double> m_Kd;                           // Velocity gains
+
+    // sticky-float anchor (grav-comp only; reset on mode change)
+    RigidBodyDynamics::Math::VectorNd m_Q_hold;
+    bool m_bHoldAnchored{false};
 
     // 5th-order polynomial trajectory
     struct TrajState {
