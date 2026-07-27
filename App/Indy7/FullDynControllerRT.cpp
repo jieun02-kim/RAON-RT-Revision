@@ -298,6 +298,12 @@ CControllerFullDynamicsRT::ComputeGravityCompensation(std::vector<double>& avOut
         }
         for (unsigned int i = 0; i < m_uDOF; ++i)
         {
+            if (std::fabs(m_Qd[i]) > HOLD_UNLOCK_QD)
+            {
+                // clearly being hand-guided — anchor follows, no spring
+                m_Q_hold[i] = m_Q[i];
+                continue;
+            }
             double dErr = m_Q[i] - m_Q_hold[i];
             if (dErr > HOLD_DB_RAD)          // pushed past the dead-band:
                 m_Q_hold[i] = m_Q[i] - HOLD_DB_RAD;   // the anchor drags along

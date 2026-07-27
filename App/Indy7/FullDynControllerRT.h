@@ -87,7 +87,13 @@ public:
     // Toggle with 'k' (default ON).
     static constexpr double HOLD_DB_RAD  = 0.03;   // dead-band [rad]
     static constexpr double HOLD_KP_FRAC = 0.15;   // of the joint Kp
-    static constexpr double HOLD_KD_FRAC = 0.08;   // of the joint Kd
+    static constexpr double HOLD_KD_FRAC = 0.03;   // of the joint Kd (feel)
+    // Per-joint velocity gate: while a joint is clearly being hand-guided
+    // (|qd| above this) its anchor just follows — guiding feels like pure
+    // grav-comp. Creep from model residual is far slower than this, so the
+    // spring still catches sinking. (Operator feedback 2026-07-27: the
+    // always-on spring made guiding feel stiff.)
+    static constexpr double HOLD_UNLOCK_QD = 0.08; // [rad/s]
     std::atomic<bool> m_bStickyEnable{true};
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
   
