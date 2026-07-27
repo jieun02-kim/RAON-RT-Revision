@@ -119,6 +119,12 @@ public:
     BOOL SetReadyAnchor(const RigidBodyDynamics::Math::VectorNd& aqAnchor);
     // Bootstrap-candidate sanity: reject wrist-folded branches outright.
     static constexpr double SEED_WRIST_MAX_RAD = 2.0;   // |J4|,|J5| cap
+    // Record-time coverage feedback: after SetReadyAnchor the workspace
+    // probes are re-verified ONE PER CYCLE in the RT loop (a 9-solve burst
+    // would stall the 1 kHz task) and a summary is logged — the operator
+    // learns immediately whether the posture they just recorded covers the
+    // box, instead of finding out next boot.
+    void TickAnchorVerify();
     BOOL HasReadySeed() const { return m_bReadySet; }
     const RigidBodyDynamics::Math::VectorNd& GetReadyQ() const { return m_QReady; }
     // Pure solve, no motion: seed = q_ready, soft-R = q_ready's own FK
@@ -255,10 +261,14 @@ public:
 
 
 private:
-    // [kv260-merge] ready-seed state (set once at init, read-only afterwards)
+    // [kv260-merge] ready-seed state (init or SetReadyAnchor; main-control
+    // thread only)
     RigidBodyDynamics::Math::VectorNd m_QReady;
     RigidBodyDynamics::Math::Matrix3d m_EReady;   // base->body FK R at q_ready
     bool m_bReadySet{false};
+    std::vector<RigidBodyDynamics::Math::Vector3d> m_vProbeStore;
+    int m_nAnchorVerifyIdx{-1};    // -1 = idle; else next probe to verify
+    int m_nAnchorVerifyPass{0};
     // Revolute FK is 2π-periodic: fold each joint of aq to the equivalent
     // nearest aqRef, then push into the URDF limits if just outside. Returns
     // false if any joint has no in-limit representative.

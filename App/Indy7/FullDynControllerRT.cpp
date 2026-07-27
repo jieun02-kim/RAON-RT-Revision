@@ -790,6 +790,8 @@ CControllerFullDynamicsRT::ComputeReadySeed(
     // local solver then stays in that demonstrated branch), then a
     // deterministic ladder that covers both elbow branches and a left/right
     // lean without assuming the (machine-converted) URDF's sign conventions.
+    m_vProbeStore = avProbes;   // kept for record-time anchor verification
+
     RigidBodyDynamics::Math::VectorNd vqZero =
         RigidBodyDynamics::Math::VectorNd::Zero(m_uDOF);
     static const double s_aadLadder[][6] = {
@@ -932,7 +934,55 @@ CControllerFullDynamicsRT::SetReadyAnchor(
                  "from here",
                  m_QReady[0], m_QReady[1], m_QReady[2],
                  m_QReady[3], m_QReady[4], m_QReady[5]);
+    if (!m_vProbeStore.empty())
+    {
+        m_nAnchorVerifyIdx  = 0;      // amortized coverage check starts now
+        m_nAnchorVerifyPass = 0;
+    }
     return TRUE;
+}
+
+void
+CControllerFullDynamicsRT::TickAnchorVerify()
+{
+    if (m_nAnchorVerifyIdx < 0 || !m_bReadySet) return;
+    if (m_nAnchorVerifyIdx >= (int)m_vProbeStore.size())
+    {
+        m_nAnchorVerifyIdx = -1;
+        return;
+    }
+
+    const RigidBodyDynamics::Math::Vector3d vProbe =
+        m_vProbeStore[m_nAnchorVerifyIdx];
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErr = 0.0;
+    bool   bOK  = false;
+    if (SolvePositionIK(m_QReady, vProbe, IK_ORI_WEIGHT, &m_EReady,
+                        vqSol, dErr) &&
+        FoldAndCheckLimits(vqSol, m_QReady))
+    {
+        double dDqMax = 0.0;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(vqSol[i] - m_QReady[i]);
+            if (dDq > dDqMax) dDqMax = dDq;
+        }
+        bOK = (dDqMax <= IK_DQ_MAX_RAD);
+    }
+    if (bOK) m_nAnchorVerifyPass++;
+    else
+        DBG_LOG_WARN("[SEED] probe (%.2f, %.2f, %.2f) unreachable from the "
+                     "recorded posture", vProbe[0], vProbe[1], vProbe[2]);
+
+    m_nAnchorVerifyIdx++;
+    if (m_nAnchorVerifyIdx >= (int)m_vProbeStore.size())
+    {
+        DBG_LOG_INFO("[SEED] anchor coverage: %d/%d workspace probes "
+                     "reachable from the recorded posture (misses are box "
+                     "corners — fine unless objects sit there)",
+                     m_nAnchorVerifyPass, (int)m_vProbeStore.size());
+        m_nAnchorVerifyIdx = -1;
+    }
 }
 
 BOOL

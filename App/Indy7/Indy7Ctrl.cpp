@@ -1188,6 +1188,12 @@ void proc_main_control(void* apRobot)
                 pRobot->m_pPickBridge->PersistReadySeed(adQ, nN);
             }
         }
+        // [kv260-merge] amortized anchor-coverage verification: one IK solve
+        // per cycle for a few cycles right after a HOME record (same per-cycle
+        // cost as the field-proven 'v' solve; a 9-solve burst would stall the
+        // loop). No-op while idle.
+        if (pRobot->m_pController != NULL)
+            pRobot->m_pController->TickAnchorVerify();
         //======================================================================
         // [kv260-merge] Vision approach — consume a gated goal from the ROS2
         // bridge ('p' → digit → 'v'). Bridge already ran the N-frame std gate
