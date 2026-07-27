@@ -61,7 +61,7 @@ public:
 
 	enum eISOHWState { eISO_HW_IDLE=0, eISO_HW_TO_TARGET, eISO_HW_TO_CLEARANCE, eISO_HW_DONE };
 	enum eRectState  { eRECT_IDLE=0, eRECT_TO_CORNER };
-	enum eApproachState { eAPPROACH_IDLE=0, eAPPROACH_MOVING };
+	enum eApproachState { eAPPROACH_IDLE=0, eAPPROACH_MOVING, eAPPROACH_STAGING };
 	
 	/* Controller */
 	CControllerFullDynamicsRT* GetController() { return m_pController; }
@@ -148,6 +148,20 @@ private:
 	CROS2PickBridge*       m_pPickBridge{nullptr};
 	eApproachState         m_eApproachState{eAPPROACH_IDLE};
 	static constexpr double APPROACH_DURATION_S = 3.0;
+
+	// [kv260-merge] Ready-seed approach (2026-07-27): every goal is solved
+	// from the init-computed q_ready (deterministic — same target, same
+	// solution, regardless of where the operator parked the arm). If the
+	// solution is within IK_DQ_MAX_RAD of the current posture we go direct;
+	// otherwise we STAGE: joint-move to q_ready (the 'b'-class proven
+	// primitive), settle, then fire the goal leg. Leg 2 only fires if mode
+	// and servo are still exactly as we left them — anything else cancels
+	// (a deferred surprise motion is the j→v trap all over again).
+	BOOL TryReadyApproach(const CROS2PickBridge::Goal& astGoal, BOOL abAllowStage);
+	CROS2PickBridge::Goal  m_stStagedGoal{};
+	int                    m_nStageSettleCnt{0};
+	static constexpr double STAGE_VEL_EPS    = 0.05;  // [rad/s] Σ|qd| gate
+	static constexpr int    STAGE_SETTLE_CYC = 200;   // 0.2 s below eps
 
 	// [kv260-merge] HOME: the 'p'-menu entry snapshots the CURRENT JOINTS
 	// (no IK — returning to a recorded q has no branch-jump risk by

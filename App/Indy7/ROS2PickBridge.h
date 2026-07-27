@@ -75,6 +75,17 @@ public:
     void SetZMarginM(double adMargin)   { m_dZMarginM = adMargin; }
     void SetGate(int anSamples, double adStdGateM, double adTimeoutS);
 
+    /* Workspace box for the GOAL (z margin already added). Set from the
+     * 2026-07-27 hand-eye calibration: camera sits at base (0.762, -0.085,
+     * 0.925) looking down, table extends +X. z_max 0.50 keeps >0.4 m of
+     * clearance below the camera; x_max 0.85 is the practical Indy7 reach.
+     * Public: the app derives the ready-seed IK probes from the same box. */
+    static constexpr double DEF_BOX[6]   = {0.30, 0.85, -0.50, 0.45, 0.10, 0.50};
+    // Axis-aligned box passes goals the arm can't radially reach (orange at
+    // r_xy 0.87 stalled IK 46 mm short, 2026-07-27) — gate the horizontal
+    // radius too. Indy7 reach 0.8 m nominal.
+    static constexpr double DEF_RMAX_XY  = 0.80;   // [m] from base axis
+
 private:
     void SpinLoop();
     void WorkerLoop();
@@ -87,15 +98,6 @@ private:
     void TickLockWatch();
     BOOL SetDesiredClass(const std::string& astrClass);
 
-    /* Workspace box for the GOAL (z margin already added). Set from the
-     * 2026-07-27 hand-eye calibration: camera sits at base (0.762, -0.085,
-     * 0.925) looking down, table extends +X. z_max 0.50 keeps >0.4 m of
-     * clearance below the camera; x_max 0.85 is the practical Indy7 reach. */
-    static constexpr double DEF_BOX[6]   = {0.30, 0.85, -0.50, 0.45, 0.10, 0.50};
-    // Axis-aligned box passes goals the arm can't radially reach (orange at
-    // r_xy 0.87 stalled IK 46 mm short, 2026-07-27) — gate the horizontal
-    // radius too. Indy7 reach 0.8 m nominal.
-    static constexpr double DEF_RMAX_XY  = 0.80;   // [m] from base axis
     static constexpr double DEF_ZMARGIN  = 0.15;   // [m] hover above the object
     static constexpr int    DEF_SAMPLES  = 15;     // ≈1 s @15 Hz
     static constexpr double DEF_STD_GATE = 0.008;  // [m] per-axis std gate

@@ -630,6 +630,14 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
         CS.AddOrientationConstraint(m_body_id, astTargetPose.m_rotation.transpose(),
                                     (float)adOriWeight);
     (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
+    // 2π fold: a "wound" return (J3 at 10.42 rad) is the in-range solution in
+    // disguise — folding by 2π steps leaves the FK pose EXACTLY unchanged.
+    if (!FoldAndCheckLimits(vjointspace, m_Q))
+    {
+        DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution outside "
+                      "joint limits even after 2π fold");
+        return FALSE;
+    }
     // Soft residual keeps RBDL's flag false — judge by the FK position error.
     const RigidBodyDynamics::Math::Vector3d vPosSol =
         RigidBodyDynamics::CalcBodyToBaseCoordinates(
@@ -699,6 +707,202 @@ CControllerFullDynamicsRT::StartJointTrajectory(
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
     DBG_LOG_INFO("(StartJointTrajectory) T=%.2f s", T);
+    return TRUE;
+}
+
+//============================================================================
+// [kv260-merge] Deterministic ready-seed IK — see header for the rationale.
+// URDF joint limits (indy7.urdf <limit> tags): J1-J5 ±175°, J6 ±215°.
+// RBDL's IK iteration is limit-blind, so the check lives here.
+//============================================================================
+static const double s_adJointLo[6] = {-3.0543261909900767, -3.0543261909900767,
+                                      -3.0543261909900767, -3.0543261909900767,
+                                      -3.0543261909900767, -3.7524578917878086};
+static const double s_adJointHi[6] = { 3.0543261909900767,  3.0543261909900767,
+                                       3.0543261909900767,  3.0543261909900767,
+                                       3.0543261909900767,  3.7524578917878086};
+
+double
+CControllerFullDynamicsRT::ScaledTrajTime(double adDqMax, double adTBase)
+{
+    double dT = adTBase;
+    const double dT_need = 1.875 * adDqMax / IK_QD_PEAK_RADPS;  // quintic peak
+    if (dT_need > dT)
+        dT = (dT_need < IK_T_MAX_S) ? dT_need : IK_T_MAX_S;
+    return dT;
+}
+
+bool
+CControllerFullDynamicsRT::FoldAndCheckLimits(
+    RigidBodyDynamics::Math::VectorNd& aq,
+    const RigidBodyDynamics::Math::VectorNd& aqRef) const
+{
+    bool bOK = true;
+    for (unsigned int i = 0; i < m_uDOF && i < 6; i++)
+    {
+        double dQ = aq[i] - 2.0 * M_PI *
+                    std::round((aq[i] - aqRef[i]) / (2.0 * M_PI));
+        if (dQ < s_adJointLo[i] && dQ + 2.0 * M_PI <= s_adJointHi[i])
+            dQ += 2.0 * M_PI;
+        else if (dQ > s_adJointHi[i] && dQ - 2.0 * M_PI >= s_adJointLo[i])
+            dQ -= 2.0 * M_PI;
+        aq[i] = dQ;
+        if (dQ < s_adJointLo[i] || dQ > s_adJointHi[i]) bOK = false;
+    }
+    return bOK;
+}
+
+BOOL
+CControllerFullDynamicsRT::SolvePositionIK(
+    const RigidBodyDynamics::Math::VectorNd& aqSeed,
+    const RigidBodyDynamics::Math::Vector3d& avTarget,
+    double adOriWeight,
+    const RigidBodyDynamics::Math::Matrix3d* apEOri,
+    RigidBodyDynamics::Math::VectorNd& aqSol,
+    double& adPosErrM)
+{
+    aqSol = aqSeed;
+    RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+    CS.num_steps      = 1000;
+    CS.step_tol       = 1.0e-10;
+    CS.constraint_tol = 1.0e-8;
+    CS.AddPointConstraint(m_body_id, tcp_local_point, avTarget);
+    if (adOriWeight > 0.0 && apEOri != NULL)
+        CS.AddOrientationConstraint(m_body_id, *apEOri, (float)adOriWeight);
+    (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, aqSeed, CS, aqSol);
+    const RigidBodyDynamics::Math::Vector3d vPosSol =
+        RigidBodyDynamics::CalcBodyToBaseCoordinates(
+            m_rbdlModel, aqSol, m_body_id, tcp_local_point);
+    adPosErrM = (vPosSol - avTarget).norm();
+    return (adPosErrM <= IK_POS_TOL_M) ? TRUE : FALSE;
+}
+
+BOOL
+CControllerFullDynamicsRT::ComputeReadySeed(
+    const std::vector<RigidBodyDynamics::Math::Vector3d>& avProbes,
+    const RigidBodyDynamics::Math::Vector3d& avCenter)
+{
+    // Non-RT: runs once at init, before the control threads start.
+    // Bootstrap: pure-position solve (w=0 — no soft-R local-minimum
+    // mechanism) of the box CENTER from a deterministic seed ladder. The
+    // ladder covers both elbow branches and a left/right lean so it works
+    // without assuming the (machine-converted) URDF's sign conventions.
+    RigidBodyDynamics::Math::VectorNd vqZero =
+        RigidBodyDynamics::Math::VectorNd::Zero(m_uDOF);
+    static const double s_aadLadder[][6] = {
+        { 0.0,  0.0,  0.0, 0.0,  0.0, 0.0},
+        { 0.0,  0.6, -0.6, 0.0,  0.0, 0.0},
+        { 0.0, -0.6,  0.6, 0.0,  0.0, 0.0},
+        { 0.0,  0.6,  0.6, 0.0, -0.6, 0.0},
+        { 0.0, -0.6, -0.6, 0.0,  0.6, 0.0},
+        { 1.0,  0.6, -0.6, 0.0,  0.0, 0.0},
+        {-1.0,  0.6, -0.6, 0.0,  0.0, 0.0},
+    };
+    const int nLadder = (int)(sizeof(s_aadLadder) / sizeof(s_aadLadder[0]));
+
+    m_bReadySet = false;
+    RigidBodyDynamics::Math::VectorNd vqBest;
+    RigidBodyDynamics::Math::Matrix3d mEBest;
+    int nBestPass = -1;
+
+    for (int s = 0; s < nLadder; s++)
+    {
+        RigidBodyDynamics::Math::VectorNd vqSeed = vqZero;
+        for (unsigned int i = 0; i < m_uDOF && i < 6; i++)
+            vqSeed[i] = s_aadLadder[s][i];
+
+        RigidBodyDynamics::Math::VectorNd vqCand;
+        double dErr = 0.0;
+        if (!SolvePositionIK(vqSeed, avCenter, 0.0, NULL, vqCand, dErr))
+            continue;
+        if (!FoldAndCheckLimits(vqCand, vqZero))   // fold toward mid-range
+            continue;
+
+        // Verify the candidate EXACTLY the way runtime will use it: solve
+        // each probe from it with the soft-R of its own posture.
+        const RigidBodyDynamics::Math::Matrix3d mECand =
+            RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, vqCand,
+                                                        m_body_id);
+        int nPass = 0;
+        for (size_t p = 0; p < avProbes.size(); p++)
+        {
+            RigidBodyDynamics::Math::VectorNd vqSol;
+            double dProbeErr = 0.0;
+            if (!SolvePositionIK(vqCand, avProbes[p], IK_ORI_WEIGHT, &mECand,
+                                 vqSol, dProbeErr))
+                continue;
+            if (!FoldAndCheckLimits(vqSol, vqCand))
+                continue;
+            double dDqMax = 0.0;
+            for (unsigned int i = 0; i < m_uDOF; i++)
+            {
+                const double dDq = std::fabs(vqSol[i] - vqCand[i]);
+                if (dDq > dDqMax) dDqMax = dDq;
+            }
+            if (dDqMax <= IK_DQ_MAX_RAD) nPass++;
+        }
+
+        if (nPass > nBestPass)
+        {
+            nBestPass = nPass;
+            vqBest    = vqCand;
+            mEBest    = mECand;
+        }
+        if (nPass == (int)avProbes.size())
+            break;                                  // perfect — stop early
+    }
+
+    if (nBestPass < 0)
+    {
+        DBG_LOG_WARN("[SEED] could not bootstrap a ready posture for the "
+                     "workspace center (%.2f, %.2f, %.2f) — falling back to "
+                     "live-posture seeding",
+                     avCenter[0], avCenter[1], avCenter[2]);
+        return FALSE;
+    }
+
+    m_QReady   = vqBest;
+    m_EReady   = mEBest;
+    m_bReadySet = true;
+    DBG_LOG_INFO("[SEED] ready posture q = [%.2f %.2f %.2f %.2f %.2f %.2f] rad"
+                 " — %d/%d workspace probes verified (center OK)",
+                 m_QReady[0], m_QReady[1], m_QReady[2],
+                 m_QReady[3], m_QReady[4], m_QReady[5],
+                 nBestPass, (int)avProbes.size());
+    if (nBestPass < (int)avProbes.size())
+        DBG_LOG_WARN("[SEED] %d probe(s) near the box edge unreachable from "
+                     "q_ready — approaches there will report no-solution",
+                     (int)avProbes.size() - nBestPass);
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::SolveReadyIK(
+    const RigidBodyDynamics::Math::Vector3d& avTarget,
+    RigidBodyDynamics::Math::VectorNd& aqSol,
+    double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
+{
+    if (!m_bReadySet) return FALSE;
+    if (!SolvePositionIK(m_QReady, avTarget, IK_ORI_WEIGHT, &m_EReady,
+                         aqSol, adPosErrM))
+    {
+        DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm "
+                     "(target outside the verified workspace?)",
+                     adPosErrM * 1e3);
+        return FALSE;
+    }
+    if (!FoldAndCheckLimits(aqSol, m_QReady))
+    {
+        DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
+        return FALSE;
+    }
+    adDqMaxFromCur = 0.0;
+    anDqAxis      = -1;
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const double dDq = std::fabs(aqSol[i] - m_Q[i]);
+        if (dDq > adDqMaxFromCur) { adDqMaxFromCur = dDq; anDqAxis = (int)i; }
+    }
     return TRUE;
 }
 

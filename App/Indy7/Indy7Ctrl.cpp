@@ -89,6 +89,31 @@ CRobotIndy7::Init(BOOL abSim)
         return FALSE;
     }
 
+    // [kv260-merge] Deterministic ready seed: bootstrap ONE posture from the
+    // measured workspace box and verify its (r-gate-clamped) corners, so every
+    // approach solves from the same seed no matter where the operator parked
+    // the arm. Non-fatal: on failure approaches fall back to live-posture
+    // seeding (the pre-2026-07-27 behavior).
+    {
+        using RigidBodyDynamics::Math::Vector3d;
+        const double* pdBox  = CROS2PickBridge::DEF_BOX;
+        const double  dRMax  = CROS2PickBridge::DEF_RMAX_XY;
+        Vector3d vCenter(0.5 * (pdBox[0] + pdBox[1]),
+                         0.5 * (pdBox[2] + pdBox[3]),
+                         0.5 * (pdBox[4] + pdBox[5]));
+        std::vector<Vector3d> vProbes;
+        for (int ix = 0; ix < 2; ix++)
+            for (int iy = 0; iy < 2; iy++)
+                for (int iz = 0; iz < 2; iz++)
+                {
+                    double dX = pdBox[ix], dY = pdBox[2 + iy];
+                    const double dR = std::sqrt(dX * dX + dY * dY);
+                    if (dR > dRMax) { dX *= dRMax / dR; dY *= dRMax / dR; }
+                    vProbes.push_back(Vector3d(dX, dY, pdBox[4 + iz]));
+                }
+        m_pController->ComputeReadySeed(vProbes, vCenter);
+    }
+
     // [kv260-merge] Gate 2b — perception-pipeline bridge. Non-fatal: the
     // robot must stay usable standalone (no ROS2 pipeline running).
     m_pPickBridge = new CROS2PickBridge();
@@ -722,7 +747,11 @@ CRobotIndy7::DoInput()
         case 'b':
         case 'B':
         {
-            if (!m_bHomeSet)
+            // [kv260-merge] no user HOME recorded → fall back to the computed
+            // q_ready (same posture every approach solves from)
+            const bool bUseReady = (!m_bHomeSet && m_pController != NULL &&
+                                    m_pController->HasReadySeed());
+            if (!m_bHomeSet && !bUseReady)
             {
                 DBG_LOG_WARN("[HOME] no home recorded — 'p' menu, last entry");
                 break;
@@ -747,22 +776,22 @@ CRobotIndy7::DoInput()
             // the quintic's peak speed like E13 and go.
             m_bRefineActive  = false;
             m_eApproachState = eAPPROACH_IDLE;
+            const RigidBodyDynamics::Math::VectorNd& vqTarget =
+                bUseReady ? m_pController->GetReadyQ() : m_vHomeQ;
             double dDqMax = 0.0;
-            for (size_t i = 0; i < m_vCurrentPos.size(); i++)
+            for (size_t i = 0; i < m_vCurrentPos.size() &&
+                               i < (size_t)vqTarget.size(); i++)
             {
-                const double dDq = std::fabs(m_vHomeQ[i] - m_vCurrentPos[i]);
+                const double dDq = std::fabs(vqTarget[i] - m_vCurrentPos[i]);
                 if (dDq > dDqMax) dDqMax = dDq;
             }
-            double dT = APPROACH_DURATION_S;
-            const double dT_need = 1.875 * dDqMax /
-                CControllerFullDynamicsRT::IK_QD_PEAK_RADPS;
-            if (dT_need > dT)
-                dT = (dT_need < CControllerFullDynamicsRT::IK_T_MAX_S)
-                     ? dT_need : CControllerFullDynamicsRT::IK_T_MAX_S;
+            const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+                dDqMax, APPROACH_DURATION_S);
             SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
-            m_pController->StartJointTrajectory(m_vHomeQ, dT);
+            m_pController->StartJointTrajectory(vqTarget, dT);
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-            DBG_LOG_INFO("[HOME] returning, T=%.1f s (dq_max %.2f rad)",
+            DBG_LOG_INFO("[HOME] returning%s, T=%.1f s (dq_max %.2f rad)",
+                         bUseReady ? " to computed q_ready (no user HOME)" : "",
                          dT, dDqMax);
             break;
         }
@@ -829,6 +858,83 @@ CRobotIndy7::StartRefine(const CControllerFullDynamicsRT::Pose& astDesired)
     m_nRefineIter = 0;
     m_nRefineSettleCnt = 0;
     m_bRefineActive = true;
+}
+
+// [kv260-merge] One ready-seed approach attempt (rationale in the header).
+// Called from the main-control SM only. Returns TRUE when a motion started
+// (direct goal leg or the staging leg); FALSE means nothing moved.
+BOOL
+CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
+                              BOOL abAllowStage)
+{
+    CControllerFullDynamicsRT* pC = m_pController;
+
+    CControllerFullDynamicsRT::Pose stTarget;
+    pC->GetCurrentPose(stTarget);            // R rides along for refine/logs
+    stTarget.m_position[0] = astGoal.dX;
+    stTarget.m_position[1] = astGoal.dY;
+    stTarget.m_position[2] = astGoal.dZ;
+
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErrM = 0.0, dDqMax = 0.0;
+    int    nAxis = -1;
+    if (!pC->SolveReadyIK(stTarget.m_position, vqSol, dErrM, dDqMax, nAxis))
+    {
+        DBG_LOG_ERROR("[APPROACH] no reachable solution for (%.3f, %.3f, %.3f)"
+                      " even from q_ready — move the object closer",
+                      astGoal.dX, astGoal.dY, astGoal.dZ);
+        return FALSE;
+    }
+
+    if (dDqMax <= CControllerFullDynamicsRT::IK_DQ_MAX_RAD)
+    {
+        const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+            dDqMax, APPROACH_DURATION_S);
+        // grav-comp bracket: the IK6dof consumer must not see a half-built
+        // trajectory (same pattern as 'b')
+        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+        pC->StartJointTrajectory(vqSol, dT);
+        SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+        m_eApproachState = eAPPROACH_MOVING;
+        StartRefine(stTarget);
+        DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  "
+                     "[ready-seed direct, dq %.2f rad J%d]  "
+                     "[std mm %.1f/%.1f/%.1f n=%d]",
+                     astGoal.szClass, astGoal.dX, astGoal.dY, astGoal.dZ, dT,
+                     dDqMax, nAxis,
+                     astGoal.dStdMM[0], astGoal.dStdMM[1], astGoal.dStdMM[2],
+                     astGoal.nSamples);
+        return TRUE;
+    }
+
+    if (!abAllowStage)
+    {
+        DBG_LOG_ERROR("[APPROACH] solution still %.2f rad away (J%d) after "
+                      "staging — holding at q_ready", dDqMax, nAxis);
+        return FALSE;
+    }
+
+    // stage: 'b'-class joint move to q_ready, goal leg fires on settle
+    const RigidBodyDynamics::Math::VectorNd& vqReady = pC->GetReadyQ();
+    double dDqHome = 0.0;
+    for (size_t i = 0; i < m_vCurrentPos.size() &&
+                       i < (size_t)vqReady.size(); i++)
+    {
+        const double dDq = std::fabs(vqReady[i] - m_vCurrentPos[i]);
+        if (dDq > dDqHome) dDqHome = dDq;
+    }
+    const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+        dDqHome, APPROACH_DURATION_S);
+    m_stStagedGoal    = astGoal;
+    m_nStageSettleCnt = 0;
+    SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+    pC->StartJointTrajectory(vqReady, dT);
+    SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+    m_eApproachState = eAPPROACH_STAGING;
+    DBG_LOG_INFO("[APPROACH] %s: solution %.2f rad away (J%d) — staging via "
+                 "q_ready first (T=%.1f s), goal leg follows",
+                 astGoal.szClass, dDqMax, nAxis, dT);
+    return TRUE;
 }
 
 BOOL
@@ -1061,6 +1167,47 @@ void proc_main_control(void* apRobot)
                                  tcp.m_position[0], tcp.m_position[1], tcp.m_position[2]);
                 }
             }
+            else if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_STAGING)
+            {
+                // [kv260-merge] staged approach leg 2 — fire ONLY if the run
+                // is still exactly as we left it (IK6dof + servo on). Any
+                // operator intervention cancels the stashed goal instead of
+                // deferring it (a deferred motion is the j→v surprise again).
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                    if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (pRTController->GetControlMode() !=
+                        CControllerFullDynamicsRT::eInverseKinematics_6dof || !bServoAll)
+                {
+                    pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    DBG_LOG_WARN("[APPROACH] staging cancelled (mode change / "
+                                 "servo off) — goal dropped");
+                }
+                else if (!pRTController->IsTrajectoryRefDone())
+                {
+                    pRobot->m_nStageSettleCnt = 0;
+                }
+                else if ([&]{   // wait until the arm has actually stopped
+                    double dVelSq = 0.0;
+                    for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                        dVelSq += pRobot->m_vCurrentVel[nCnt] * pRobot->m_vCurrentVel[nCnt];
+                    if (dVelSq > CRobotIndy7::STAGE_VEL_EPS * CRobotIndy7::STAGE_VEL_EPS)
+                    {
+                        pRobot->m_nStageSettleCnt = 0;
+                        return false;
+                    }
+                    return ++pRobot->m_nStageSettleCnt >= CRobotIndy7::STAGE_SETTLE_CYC;
+                }())
+                {
+                    // arrived at q_ready — the goal leg is near by init
+                    // verification, so no further staging is allowed
+                    pRobot->m_nStageSettleCnt = 0;
+                    pRobot->m_eApproachState  = CRobotIndy7::eAPPROACH_IDLE;
+                    if (!pRobot->TryReadyApproach(pRobot->m_stStagedGoal, FALSE))
+                        DBG_LOG_WARN("[APPROACH] staged goal leg did not start"
+                                     " — holding at q_ready; 'g'=grav-comp");
+                }
+            }
             else if (!pRobot->m_bIsoHWTrigger.load() && !pRobot->m_bRectTrigger.load() &&
                      pRobot->m_bRTControllerEnabled)
             {
@@ -1079,9 +1226,17 @@ void proc_main_control(void* apRobot)
                         DBG_LOG_ERROR("[APPROACH] goal discarded — servo OFF. "
                                       "Press 'h' (servo on) first, then 'v' again.");
                     }
+                    else if (pRTController->HasReadySeed())
+                    {
+                        // [kv260-merge] deterministic path: solve from
+                        // q_ready, then direct or staged (TryReadyApproach).
+                        // If nothing started, the arm floats in grav-comp.
+                        pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                        (void)pRobot->TryReadyApproach(stGoal, TRUE);
+                    }
                     else
                     {
-                    // grav-comp first: stop consuming any previous trajectory
+                    // legacy live-posture seeding (ready seed unavailable)
                     pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
                     pRobot->m_pController->GetCurrentPose(pRobot->m_Pose);
                     CControllerFullDynamicsRT::Pose stTarget = pRobot->m_Pose;  // keep current R
@@ -1108,7 +1263,7 @@ void proc_main_control(void* apRobot)
                         DBG_LOG_ERROR("[APPROACH] IK failed for (%.3f, %.3f, %.3f) — staying in grav-comp",
                                       stGoal.dX, stGoal.dY, stGoal.dZ);
                     }
-                    }  // servo-on path
+                    }  // servo-on legacy path
                 }
             }
         }

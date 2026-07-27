@@ -96,7 +96,34 @@ public:
     static constexpr double HOLD_UNLOCK_QD = 0.08; // [rad/s]
     std::atomic<bool> m_bStickyEnable{true};
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
-  
+
+    // [kv260-merge] Deterministic ready-seed IK (2026-07-27, operator request).
+    // RBDL IK is a LOCAL iterative solver whose only branch-selection input is
+    // the seed; seeding from the live posture made approach success depend on
+    // where the operator happened to park the arm (field failures: branch-flip
+    // REFUSED / soft-R local-minimum residual). The seed is a COMPUTATIONAL
+    // start point — it does not need to be the physical posture — so we
+    // bootstrap ONE posture from the measured workspace box at init, verify it
+    // against the box corners, and solve every approach from it: same target →
+    // same solution, regardless of the start posture. The arm then only has to
+    // TRAVEL (direct if the solution is within IK_DQ_MAX_RAD, staged via
+    // q_ready otherwise — the app decides).
+    BOOL ComputeReadySeed(const std::vector<RigidBodyDynamics::Math::Vector3d>& avProbes,
+                          const RigidBodyDynamics::Math::Vector3d& avCenter);
+    BOOL HasReadySeed() const { return m_bReadySet; }
+    const RigidBodyDynamics::Math::VectorNd& GetReadyQ() const { return m_QReady; }
+    // Pure solve, no motion: seed = q_ready, soft-R = q_ready's own FK
+    // orientation (fixed → deterministic). Folds the solution to the 2π-branch
+    // nearest q_ready and checks URDF joint limits. adDqMaxFromCur/anDqAxis
+    // report the largest travel from the CURRENT posture for the caller's
+    // direct-vs-stage decision.
+    BOOL SolveReadyIK(const RigidBodyDynamics::Math::Vector3d& avTarget,
+                      RigidBodyDynamics::Math::VectorNd& aqSol,
+                      double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis);
+    // E13 speed cap as a reusable rule: stretch T so the quintic peak joint
+    // speed (1.875*dq/T) never exceeds IK_QD_PEAK_RADPS, capped at IK_T_MAX_S.
+    static double ScaledTrajTime(double adDqMax, double adTBase);
+
 
     // Controller modes
     enum eControlMode {
@@ -219,6 +246,24 @@ public:
 
 
 private:
+    // [kv260-merge] ready-seed state (set once at init, read-only afterwards)
+    RigidBodyDynamics::Math::VectorNd m_QReady;
+    RigidBodyDynamics::Math::Matrix3d m_EReady;   // base->body FK R at q_ready
+    bool m_bReadySet{false};
+    // Revolute FK is 2π-periodic: fold each joint of aq to the equivalent
+    // nearest aqRef, then push into the URDF limits if just outside. Returns
+    // false if any joint has no in-limit representative.
+    bool FoldAndCheckLimits(RigidBodyDynamics::Math::VectorNd& aq,
+                            const RigidBodyDynamics::Math::VectorNd& aqRef) const;
+    // One position-IK solve from an explicit seed (apEOri: optional base->body
+    // soft-R target). Acceptance by FK residual, not RBDL's flag.
+    BOOL SolvePositionIK(const RigidBodyDynamics::Math::VectorNd& aqSeed,
+                         const RigidBodyDynamics::Math::Vector3d& avTarget,
+                         double adOriWeight,
+                         const RigidBodyDynamics::Math::Matrix3d* apEOri,
+                         RigidBodyDynamics::Math::VectorNd& aqSol,
+                         double& adPosErrM);
+
     // RBDL model and dynamics
     RigidBodyDynamics::Model m_rbdlModel;
     TSTRING m_strURDFPath;
