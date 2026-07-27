@@ -187,13 +187,21 @@
       <inertia ixx="0.00078982" ixy="-3.4e-07" ixz="8.3e-07" iyy="0.00079764" iyz="-5.08e-06" izz="0.00058319"/>
     </inertial>
   </link>
+  <!-- [kv260-merge 2026-07-27] End-of-arm payload, measured on the real robot:
+       RFT76-HA01 F/T sensor (D76 x 17 mm, 200 g) bolted straight to the
+       flange + metal tag plate (D90 x 5 mm, ~85 g Al estimate). This mass was
+       missing entirely, which is what made grav-comp sink and CTC droop grow
+       when the arm extends. Geometry from the hand-eye eMo solve: the flange
+       FACE sits at z=-0.071 in this tcp frame (TCP origin floats ~53 mm past
+       the physical tool tip), so the composite CoM (285 g) lands at z=-0.060.
+       Inertia = solid-cylinder estimate about the CoM (r~0.04 m). -->
   <link name="tcp">
     <inertial>
-      <mass value="0.0"/>
-      <origin rpy="0 0 0" xyz="0 0 0.03"/>
-      <inertia ixx="0.001" ixy="0" ixz="0"
-              iyy="0.001" iyz="0"
-              izz="0.001"/>
+      <mass value="0.285"/>
+      <origin rpy="0 0 0" xyz="0 0 -0.060"/>
+      <inertia ixx="0.00015" ixy="0" ixz="0"
+              iyy="0.00015" iyz="0"
+              izz="0.00025"/>
     </inertial>
   </link>
   <joint name="global" type="fixed">
