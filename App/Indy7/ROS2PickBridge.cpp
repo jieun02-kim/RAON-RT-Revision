@@ -474,6 +474,13 @@ CROS2PickBridge::TickCollect()
                m_dBox[0], m_dBox[1], m_dBox[2], m_dBox[3], m_dBox[4], m_dBox[5]);
         return;
     }
+    const double dRxy = std::sqrt(dGoal[0] * dGoal[0] + dGoal[1] * dGoal[1]);
+    if (dRxy > DEF_RMAX_XY)
+    {
+        printf("[PickBridge] GATE FAIL: goal r_xy %.3f m > reach %.2f m — "
+               "move the object closer to the robot\n", dRxy, DEF_RMAX_XY);
+        return;
+    }
 
     // SPSC handshake: ready==false here (checked in StartCollect), safe to write.
     m_stGoal.dX = dGoal[0];

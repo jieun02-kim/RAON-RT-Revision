@@ -575,7 +575,8 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
 }
 
 BOOL
-CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose)
+CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
+                                                     double adOriWeight)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
@@ -590,8 +591,9 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose)
     // base->body) enters as a SOFT regularizer that keeps the solution on
     // the current branch without making it hypersensitive to the start pose.
     CS.AddPointConstraint(m_body_id, tcp_local_point, astTargetPose.m_position);
-    CS.AddOrientationConstraint(m_body_id, astTargetPose.m_rotation.transpose(),
-                                IK_ORI_WEIGHT);
+    if (adOriWeight > 0.0)
+        CS.AddOrientationConstraint(m_body_id, astTargetPose.m_rotation.transpose(),
+                                    (float)adOriWeight);
     (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
     // Soft residual keeps RBDL's flag false — judge by the FK position error.
     const RigidBodyDynamics::Math::Vector3d vPosSol =

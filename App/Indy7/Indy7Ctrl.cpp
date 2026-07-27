@@ -722,6 +722,16 @@ CRobotIndy7::DoInput()
                 DBG_LOG_WARN("[HOME] controller not enabled ('r' first)");
                 break;
             }
+            {
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < GetTotalAxis(); i++)
+                    if (!m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (!bServoAll)
+                {
+                    DBG_LOG_WARN("[HOME] servo OFF — press 'h' first");
+                    break;
+                }
+            }
             // pure joint-space return: no IK, so no branch risk — just cap
             // the quintic's peak speed like E13 and go.
             m_bRefineActive  = false;
@@ -1046,6 +1056,20 @@ void proc_main_control(void* apRobot)
                 CROS2PickBridge::Goal stGoal;
                 if (pRobot->m_pPickBridge->PopGoal(stGoal))
                 {
+                    // Brakes engaged? The whole approach+refine would then run
+                    // against a frozen arm and read as a huge "droop"
+                    // (operator hit this with j->v on 2026-07-27). Discard —
+                    // deferring the goal would fire surprise motion at 'h'.
+                    bool bServo = true;
+                    for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                        if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bServo = false; break; }
+                    if (!bServo)
+                    {
+                        DBG_LOG_ERROR("[APPROACH] goal discarded — servo OFF. "
+                                      "Press 'h' (servo on) first, then 'v' again.");
+                    }
+                    else
+                    {
                     // grav-comp first: stop consuming any previous trajectory
                     pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
                     pRobot->m_pController->GetCurrentPose(pRobot->m_Pose);
@@ -1073,6 +1097,7 @@ void proc_main_control(void* apRobot)
                         DBG_LOG_ERROR("[APPROACH] IK failed for (%.3f, %.3f, %.3f) — staying in grav-comp",
                                       stGoal.dX, stGoal.dY, stGoal.dZ);
                     }
+                    }  // servo-on path
                 }
             }
         }
@@ -1126,9 +1151,11 @@ void proc_main_control(void* apRobot)
                 else
                 {
                     pRobot->m_stRefineCmd.m_position += CRobotIndy7::REFINE_DAMPING * vErr;   // damped bias
-                    // E13: trajectory (incl. any T stretch) starts inside
+                    // E13: trajectory (incl. any T stretch) starts inside.
+                    // Ori weight 0: refine biases are small LOCAL moves — the
+                    // soft keep-R trade stalls on large biases (regression).
                     pRTController->SetTrajectoryDuration(CRobotIndy7::REFINE_TRAJ_T_S);
-                    if (pRTController->SetTargetPosePositionOnly(pRobot->m_stRefineCmd))
+                    if (pRTController->SetTargetPosePositionOnly(pRobot->m_stRefineCmd, 0.0))
                     {
                         pRobot->m_nRefineIter++;
                         DBG_LOG_INFO("[REFINE] pass %d — err %.1f mm, re-targeting",

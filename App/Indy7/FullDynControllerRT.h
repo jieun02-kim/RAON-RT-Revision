@@ -185,7 +185,12 @@ public:
 
     BOOL GetCurrentPose(Pose& astCurrPose);
     BOOL SetTargetPose(Pose astTargetPose);
-    BOOL SetTargetPosePositionOnly(Pose astTargetPose);
+    // adOriWeight: soft keep-R weight. Default for approaches; pass 0.0 for
+    // small LOCAL re-targets (refine) — with a large bias the soft-R trade
+    // stalls at a position/orientation equilibrium and the FK acceptance
+    // rejects it (2026-07-27 regression). The dq gate still applies.
+    BOOL SetTargetPosePositionOnly(Pose astTargetPose,
+                                   double adOriWeight = IK_ORI_WEIGHT);
     BOOL SetTargetPose_Jacobian();           // visual servoing용 (매 사이클 목표 추종)
     BOOL LogDistanceError(Pose astTargetPose);
 
