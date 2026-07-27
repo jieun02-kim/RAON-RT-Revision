@@ -81,16 +81,21 @@ public:
     void SetZMarginM(double adMargin)   { m_dZMarginM = adMargin; }
     void SetGate(int anSamples, double adStdGateM, double adTimeoutS);
 
-    /* Workspace box for the GOAL (z margin already added). Set from the
-     * 2026-07-27 hand-eye calibration: camera sits at base (0.762, -0.085,
-     * 0.925) looking down, table extends +X. z_max 0.50 keeps >0.4 m of
-     * clearance below the camera; x_max 0.85 is the practical Indy7 reach.
+    /* Workspace box for the GOAL (z margin already added). Drawn from the
+     * 2026-07-27 hand-eye calibration; E21 re-base (same evening): the robot
+     * base was shoved (yaw +5.14 deg, t (+4.5, +10.4) cm), so the SAME
+     * physical table region maps to the ranges below (old box corners run
+     * through the fitted transform, AABB, rounded outward). x_max no longer
+     * encodes "reach" — hover reachability is decided per-goal by the
+     * deterministic ready-seed IK (RT refuses infeasible goals cleanly, no
+     * motion); the box only rejects absurd goals (behind the robot / z band;
+     * z_max 0.50 keeps clearance below the camera).
      * Public: the app derives the ready-seed IK probes from the same box. */
-    static constexpr double DEF_BOX[6]   = {0.30, 0.85, -0.50, 0.45, 0.10, 0.50};
-    // Axis-aligned box passes goals the arm can't radially reach (orange at
-    // r_xy 0.87 stalled IK 46 mm short, 2026-07-27) — gate the horizontal
-    // radius too. Indy7 reach 0.8 m nominal.
-    static constexpr double DEF_RMAX_XY  = 0.80;   // [m] from base axis
+    static constexpr double DEF_BOX[6]   = {0.30, 0.94, -0.37, 0.63, 0.10, 0.50};
+    // Coarse sanity net only: the old 0.80 was an empirical guess made in
+    // the pre-shift frame and blocked objects the arm demonstrably reaches
+    // (2026-07-27 field) — genuine reach is the IK solver's verdict.
+    static constexpr double DEF_RMAX_XY  = 0.92;   // [m] from base axis
 
 private:
     void SpinLoop();
