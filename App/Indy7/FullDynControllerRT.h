@@ -78,6 +78,14 @@ public:
     // because an unsatisfiable soft residual keeps that flag false.
     static constexpr float  IK_ORI_WEIGHT    = 0.3f;
     static constexpr double IK_POS_TOL_M     = 0.002;
+    // Far-reach fallback (2026-07-27 E23): the soft-R solve can equilibrate
+    // SHORT of a far target (E18's gradient stall — banana at r 0.83
+    // "missed" by 235 mm while mustard at r 0.86 missed by 62 mm: the
+    // residual measures where the solver stalled, not the true shortfall).
+    // SolveReadyIK then retries pure-position from the same q_ready seed and
+    // accepts only if the tool attitude stays within this cone of the ready
+    // posture; fold/limits/dq gates still guard the output.
+    static constexpr double APPROACH_RDEV_MAX_DEG = 60.0;
 
     // [kv260-merge] Sticky-float hold: grav-comp + a weak per-joint spring to
     // an anchor that DRAGS when pushed past the dead-band and freezes when

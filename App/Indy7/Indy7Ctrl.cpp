@@ -935,6 +935,9 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
         SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
         m_eApproachState = eAPPROACH_MOVING;
         StartRefine(stTarget);
+        // 'd' (LogDistanceError) reads goal_tcpPose — the joint-trajectory
+        // path never filled it, so 'd' showed a bogus 0,0,0 target (E23).
+        pC->goal_tcpPose = stTarget;
         DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  "
                      "[ready-seed direct, dq %.2f rad J%d]  "
                      "[std mm %.1f/%.1f/%.1f n=%d]",

@@ -969,18 +969,46 @@ CControllerFullDynamicsRT::SolveReadyIK(
     double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
 {
     if (!m_bReadySet) return FALSE;
+    bool bRelaxed = false;
     if (!SolvePositionIK(m_QReady, avTarget, IK_ORI_WEIGHT, &m_EReady,
                          aqSol, adPosErrM))
     {
-        DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm "
-                     "(target outside the verified workspace?)",
-                     adPosErrM * 1e3);
-        return FALSE;
+        // E23: soft-R stall, not necessarily out of reach — retry pure
+        // position from the same deterministic seed (attitude capped below).
+        if (!SolvePositionIK(m_QReady, avTarget, 0.0, NULL,
+                             aqSol, adPosErrM))
+        {
+            DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
+                         "position-only (genuinely out of reach)",
+                         adPosErrM * 1e3);
+            return FALSE;
+        }
+        bRelaxed = true;
     }
     if (!CheckLimitsPhysical(aqSol))    // validity on the PHYSICAL posture
     {
         DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
         return FALSE;
+    }
+    if (bRelaxed)
+    {
+        const RigidBodyDynamics::Math::Matrix3d E_sol =
+            RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aqSol,
+                                                        m_body_id);
+        const RigidBodyDynamics::Math::Matrix3d R_err =
+            E_sol * m_EReady.transpose();
+        double dCosA = (R_err.trace() - 1.0) / 2.0;
+        if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
+        const double dDevDeg = std::acos(dCosA) * 180.0 / M_PI;
+        if (dDevDeg > APPROACH_RDEV_MAX_DEG)
+        {
+            DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool "
+                         "tilt (%.0f deg > %.0f) — refused; move the object "
+                         "closer", dDevDeg, APPROACH_RDEV_MAX_DEG);
+            return FALSE;
+        }
+        DBG_LOG_INFO("(SolveReadyIK) far-reach: soft-R relaxed, tool tilts "
+                     "%.0f deg from the ready attitude", dDevDeg);
     }
     // Execution frame: fold to the lap nearest the LIVE counters so the
     // commanded travel is the true physical delta (never extra turns).
