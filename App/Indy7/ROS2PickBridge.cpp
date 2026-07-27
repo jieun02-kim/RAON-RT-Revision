@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace std::chrono_literals;
@@ -201,7 +202,54 @@ CROS2PickBridge::WorkerLoop()
 
         TickCollect();
         TickLockWatch();
+        TickSeedPersist();
     }
+}
+
+/* ------------------------------------------------- ready-seed persistence -- */
+
+const char*
+CROS2PickBridge::ReadySeedPath()
+{
+    static char s_acPath[512] = {0};
+    if (s_acPath[0] == '\0')
+    {
+        const char* pcHome = getenv("HOME");
+        snprintf(s_acPath, sizeof(s_acPath), "%s/.indy7_ready_seed",
+                 (pcHome != NULL) ? pcHome : "/tmp");
+    }
+    return s_acPath;
+}
+
+void
+CROS2PickBridge::PersistReadySeed(const double* aqRad, int anDof)
+{
+    if (aqRad == NULL || anDof <= 0) return;
+    if (anDof > 8) anDof = 8;
+    for (int i = 0; i < anDof; i++) m_adSeedMail[i] = aqRad[i];
+    m_nSeedMailN.store(anDof, std::memory_order_release);
+}
+
+void
+CROS2PickBridge::TickSeedPersist()
+{
+    const int nN = m_nSeedMailN.load(std::memory_order_acquire);
+    if (nN <= 0) return;
+    double adQ[8];
+    for (int i = 0; i < nN; i++) adQ[i] = m_adSeedMail[i];
+    m_nSeedMailN.store(0, std::memory_order_release);
+
+    FILE* pFile = fopen(ReadySeedPath(), "w");
+    if (pFile == NULL)
+    {
+        printf("[PickBridge] WARN: cannot write %s\n", ReadySeedPath());
+        return;
+    }
+    for (int i = 0; i < nN; i++) fprintf(pFile, "%.9f ", adQ[i]);
+    fprintf(pFile, "\n");
+    fclose(pFile);
+    printf("[PickBridge] operator seed persisted → %s (next boot anchors here)\n",
+           ReadySeedPath());
 }
 
 /* ----------------------------------------------------------- callbacks -- */

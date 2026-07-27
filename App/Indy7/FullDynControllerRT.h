@@ -109,7 +109,16 @@ public:
     // TRAVEL (direct if the solution is within IK_DQ_MAX_RAD, staged via
     // q_ready otherwise — the app decides).
     BOOL ComputeReadySeed(const std::vector<RigidBodyDynamics::Math::Vector3d>& avProbes,
-                          const RigidBodyDynamics::Math::Vector3d& avCenter);
+                          const RigidBodyDynamics::Math::Vector3d& avCenter,
+                          const RigidBodyDynamics::Math::VectorNd* apAnchorSeed = NULL);
+    // Re-base q_ready on a REAL posture (the operator's recorded HOME): a
+    // branch a human demonstrated beats any synthetic bootstrap. Field lesson
+    // 2026-07-27: the seed ladder found a kinematically-valid but contorted
+    // branch (J4 2.61 / J5 1.65 rad — wrist folded into the body) because
+    // reach+limits+dq alone don't make a posture sane.
+    BOOL SetReadyAnchor(const RigidBodyDynamics::Math::VectorNd& aqAnchor);
+    // Bootstrap-candidate sanity: reject wrist-folded branches outright.
+    static constexpr double SEED_WRIST_MAX_RAD = 2.0;   // |J4|,|J5| cap
     BOOL HasReadySeed() const { return m_bReadySet; }
     const RigidBodyDynamics::Math::VectorNd& GetReadyQ() const { return m_QReady; }
     // Pure solve, no motion: seed = q_ready, soft-R = q_ready's own FK

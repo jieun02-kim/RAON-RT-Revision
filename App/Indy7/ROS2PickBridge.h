@@ -68,6 +68,12 @@ public:
     BOOL HasLockedTarget() const { return m_bLocked.load(std::memory_order_acquire); }
     // TRUE once after the menu's "record HOME" entry — RT snapshots joints.
     BOOL PopHomeRecord() { return m_bHomeRecordReq.exchange(false, std::memory_order_acq_rel); }
+    // [kv260-merge] Persist the operator's recorded posture so the NEXT boot
+    // anchors its IK bootstrap to a demonstrated branch (2026-07-27 field:
+    // the synthetic ladder produced a contorted q_ready). RT fills the
+    // mailbox wait-free; the worker thread does the file IO.
+    void PersistReadySeed(const double* aqRad, int anDof);
+    static const char* ReadySeedPath();   // $HOME/.indy7_ready_seed
 
     /* ---- non-RT configuration (call before OP; defaults below) ---- */
     void SetWorkspaceBox(double adXMin, double adXMax, double adYMin,
@@ -96,7 +102,12 @@ private:
     void StartCollect();
     void TickCollect();
     void TickLockWatch();
+    void TickSeedPersist();
     BOOL SetDesiredClass(const std::string& astrClass);
+
+    // seed-persist mailbox (single producer = RT, single consumer = worker)
+    double           m_adSeedMail[8] = {0};
+    std::atomic<int> m_nSeedMailN{0};
 
     static constexpr double DEF_ZMARGIN  = 0.15;   // [m] hover above the object
     static constexpr int    DEF_SAMPLES  = 15;     // ≈1 s @15 Hz

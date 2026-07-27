@@ -111,7 +111,34 @@ CRobotIndy7::Init(BOOL abSim)
                     if (dR > dRMax) { dX *= dRMax / dR; dY *= dRMax / dR; }
                     vProbes.push_back(Vector3d(dX, dY, pdBox[4 + iz]));
                 }
-        m_pController->ComputeReadySeed(vProbes, vCenter);
+        // A persisted operator posture (a previous session's recorded HOME)
+        // anchors the bootstrap to a branch a human actually demonstrated —
+        // the synthetic ladder alone once produced a contorted q_ready
+        // (2026-07-27 field, J4 2.61 / J5 1.65 rad).
+        RigidBodyDynamics::Math::VectorNd vqFileSeed;
+        bool bFileSeed = false;
+        {
+            FILE* pSeedFile = fopen(CROS2PickBridge::ReadySeedPath(), "r");
+            if (pSeedFile != NULL)
+            {
+                double adQ[8];
+                int    nRead = 0;
+                while (nRead < 8 && fscanf(pSeedFile, "%lf", &adQ[nRead]) == 1)
+                    nRead++;
+                fclose(pSeedFile);
+                const int nDof = (int)m_pcConfigRobot->GetSystemConf().nRobotAxis;
+                if (nRead >= nDof && nDof > 0)
+                {
+                    vqFileSeed.resize(nDof);
+                    for (int i = 0; i < nDof; i++) vqFileSeed[i] = adQ[i];
+                    bFileSeed = true;
+                    DBG_LOG_INFO("[SEED] persisted operator posture found (%s)",
+                                 CROS2PickBridge::ReadySeedPath());
+                }
+            }
+        }
+        m_pController->ComputeReadySeed(vProbes, vCenter,
+                                        bFileSeed ? &vqFileSeed : NULL);
     }
 
     // [kv260-merge] Gate 2b — perception-pipeline bridge. Non-fatal: the
@@ -1148,6 +1175,18 @@ void proc_main_control(void* apRobot)
                          pRobot->m_vHomeQ[0], pRobot->m_vHomeQ[1],
                          pRobot->m_vHomeQ[2], pRobot->m_vHomeQ[3],
                          pRobot->m_vHomeQ[4], pRobot->m_vHomeQ[5]);
+            // [kv260-merge] the recorded posture IS the best IK anchor — a
+            // branch demonstrated by a human beats any synthetic bootstrap.
+            // Re-base q_ready now and persist for the next boot (file IO is
+            // on the bridge worker; here only a wait-free mailbox fill).
+            if (pRobot->m_pController != NULL)
+                pRobot->m_pController->SetReadyAnchor(pRobot->m_vHomeQ);
+            {
+                double adQ[8];
+                int    nN = (int)uDof < 8 ? (int)uDof : 8;
+                for (int i = 0; i < nN; i++) adQ[i] = pRobot->m_vHomeQ[i];
+                pRobot->m_pPickBridge->PersistReadySeed(adQ, nN);
+            }
         }
         //======================================================================
         // [kv260-merge] Vision approach — consume a gated goal from the ROS2
