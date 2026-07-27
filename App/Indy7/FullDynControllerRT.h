@@ -112,13 +112,22 @@ public:
                           const RigidBodyDynamics::Math::Vector3d& avCenter,
                           const RigidBodyDynamics::Math::VectorNd* apAnchorSeed = NULL);
     // Re-base q_ready on a REAL posture (the operator's recorded HOME): a
-    // branch a human demonstrated beats any synthetic bootstrap. Field lesson
-    // 2026-07-27: the seed ladder found a kinematically-valid but contorted
-    // branch (J4 2.61 / J5 1.65 rad — wrist folded into the body) because
-    // reach+limits+dq alone don't make a posture sane.
+    // branch a human demonstrated is the ONLY trusted anchor. Field lessons
+    // 2026-07-27: synthetic ladder bootstraps produced kinematically-valid
+    // but contorted postures TWICE (J4 2.61 wrist fold; then J2 -2.80 elbow
+    // fold) — reach+limits+dq alone don't make a posture sane, so the ladder
+    // was removed: no anchor, no q_ready (live-posture seeding until HOME is
+    // recorded).
     BOOL SetReadyAnchor(const RigidBodyDynamics::Math::VectorNd& aqAnchor);
-    // Bootstrap-candidate sanity: reject wrist-folded branches outright.
-    static constexpr double SEED_WRIST_MAX_RAD = 2.0;   // |J4|,|J5| cap
+    // Express a joint goal in the LIVE counter frame: fold each joint to the
+    // 2π-equivalent nearest the reference. The multiturn counters can hold
+    // whole extra turns (E17 / E-stop bus-power cycles re-reference them:
+    // J1 -6.2, J4 -18.9 rad observed with the arm physically near zero), and
+    // a goal expressed in another lap would command REAL full-turn rotations.
+    // Folding toward the live q caps every joint's commanded travel at <= π.
+    static void FoldTowardRef(RigidBodyDynamics::Math::VectorNd& aq,
+                              const RigidBodyDynamics::Math::VectorNd& aqRef,
+                              unsigned int auDof);
     // Record-time coverage feedback: after SetReadyAnchor the workspace
     // probes are re-verified ONE PER CYCLE in the RT loop (a 9-solve burst
     // would stall the 1 kHz task) and a summary is logged — the operator
@@ -269,11 +278,11 @@ private:
     std::vector<RigidBodyDynamics::Math::Vector3d> m_vProbeStore;
     int m_nAnchorVerifyIdx{-1};    // -1 = idle; else next probe to verify
     int m_nAnchorVerifyPass{0};
-    // Revolute FK is 2π-periodic: fold each joint of aq to the equivalent
-    // nearest aqRef, then push into the URDF limits if just outside. Returns
-    // false if any joint has no in-limit representative.
-    bool FoldAndCheckLimits(RigidBodyDynamics::Math::VectorNd& aq,
-                            const RigidBodyDynamics::Math::VectorNd& aqRef) const;
+    // Canonicalize IN PLACE (fold toward mid-range zero) and check the URDF
+    // limits — validity is judged on the PHYSICAL posture, never on a wound
+    // counter representation. Returns false if any joint has no in-limit
+    // representative.
+    bool CheckLimitsPhysical(RigidBodyDynamics::Math::VectorNd& aq) const;
     // One position-IK solve from an explicit seed (apEOri: optional base->body
     // soft-R target). Acceptance by FK residual, not RBDL's flag.
     BOOL SolvePositionIK(const RigidBodyDynamics::Math::VectorNd& aqSeed,

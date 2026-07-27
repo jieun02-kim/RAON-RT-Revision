@@ -632,12 +632,21 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
     (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
     // 2π fold: a "wound" return (J3 at 10.42 rad) is the in-range solution in
     // disguise — folding by 2π steps leaves the FK pose EXACTLY unchanged.
-    if (!FoldAndCheckLimits(vjointspace, m_Q))
+    // Validity is judged on the PHYSICAL (zero-folded) posture; execution is
+    // then re-expressed in the LIVE counter frame (the counters themselves
+    // can be wound whole turns — E17/E-stop legacy) so the quintic never
+    // commands real extra turns.
     {
-        DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution outside "
-                      "joint limits even after 2π fold");
-        return FALSE;
+        RigidBodyDynamics::Math::VectorNd vqPhys = vjointspace;
+        if (!CheckLimitsPhysical(vqPhys))
+        {
+            DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution "
+                          "outside joint limits even after 2π fold");
+            return FALSE;
+        }
+        vjointspace = vqPhys;
     }
+    FoldTowardRef(vjointspace, m_Q, m_uDOF);
     // Soft residual keeps RBDL's flag false — judge by the FK position error.
     const RigidBodyDynamics::Math::Vector3d vPosSol =
         RigidBodyDynamics::CalcBodyToBaseCoordinates(
@@ -732,16 +741,26 @@ CControllerFullDynamicsRT::ScaledTrajTime(double adDqMax, double adTBase)
     return dT;
 }
 
-bool
-CControllerFullDynamicsRT::FoldAndCheckLimits(
+void
+CControllerFullDynamicsRT::FoldTowardRef(
     RigidBodyDynamics::Math::VectorNd& aq,
-    const RigidBodyDynamics::Math::VectorNd& aqRef) const
+    const RigidBodyDynamics::Math::VectorNd& aqRef,
+    unsigned int auDof)
+{
+    for (unsigned int i = 0; i < auDof && (int)i < aq.size() &&
+                             (int)i < aqRef.size(); i++)
+        aq[i] -= 2.0 * M_PI * std::round((aq[i] - aqRef[i]) / (2.0 * M_PI));
+}
+
+bool
+CControllerFullDynamicsRT::CheckLimitsPhysical(
+    RigidBodyDynamics::Math::VectorNd& aq) const
 {
     bool bOK = true;
     for (unsigned int i = 0; i < m_uDOF && i < 6; i++)
     {
         double dQ = aq[i] - 2.0 * M_PI *
-                    std::round((aq[i] - aqRef[i]) / (2.0 * M_PI));
+                    std::round(aq[i] / (2.0 * M_PI));       // fold toward 0
         if (dQ < s_adJointLo[i] && dQ + 2.0 * M_PI <= s_adJointHi[i])
             dQ += 2.0 * M_PI;
         else if (dQ > s_adJointHi[i] && dQ - 2.0 * M_PI >= s_adJointLo[i])
@@ -784,129 +803,76 @@ CControllerFullDynamicsRT::ComputeReadySeed(
     const RigidBodyDynamics::Math::VectorNd* apAnchorSeed)
 {
     // Non-RT: runs once at init, before the control threads start.
-    // Bootstrap: pure-position solve (w=0 — no soft-R local-minimum
-    // mechanism) of the box CENTER. Seed order: the PERSISTED OPERATOR
-    // POSTURE first (apAnchorSeed, a previous session's recorded HOME — the
-    // local solver then stays in that demonstrated branch), then a
-    // deterministic ladder that covers both elbow branches and a left/right
-    // lean without assuming the (machine-converted) URDF's sign conventions.
+    // ANCHOR-ONLY (v3): q_ready is only ever an operator-demonstrated
+    // posture — either the persisted file (a previous session's recorded
+    // HOME) here, or a live SetReadyAnchor at record time. The synthetic
+    // seed ladder was removed after producing two contorted postures.
+    (void)avCenter;
     m_vProbeStore = avProbes;   // kept for record-time anchor verification
+    m_bReadySet   = false;
 
-    RigidBodyDynamics::Math::VectorNd vqZero =
-        RigidBodyDynamics::Math::VectorNd::Zero(m_uDOF);
-    static const double s_aadLadder[][6] = {
-        { 0.0,  0.0,  0.0, 0.0,  0.0, 0.0},
-        { 0.0,  0.6, -0.6, 0.0,  0.0, 0.0},
-        { 0.0, -0.6,  0.6, 0.0,  0.0, 0.0},
-        { 0.0,  0.6,  0.6, 0.0, -0.6, 0.0},
-        { 0.0, -0.6, -0.6, 0.0,  0.6, 0.0},
-        { 1.0,  0.6, -0.6, 0.0,  0.0, 0.0},
-        {-1.0,  0.6, -0.6, 0.0,  0.0, 0.0},
-    };
-    const int nLadder = (int)(sizeof(s_aadLadder) / sizeof(s_aadLadder[0]));
-
-    std::vector<RigidBodyDynamics::Math::VectorNd> vSeeds;
-    if (apAnchorSeed != NULL && (unsigned int)apAnchorSeed->size() >= m_uDOF)
+    if (apAnchorSeed == NULL || (unsigned int)apAnchorSeed->size() < m_uDOF)
     {
-        RigidBodyDynamics::Math::VectorNd vq(m_uDOF);
-        for (unsigned int i = 0; i < m_uDOF; i++) vq[i] = (*apAnchorSeed)[i];
-        vSeeds.push_back(vq);
-    }
-    for (int s = 0; s < nLadder; s++)
-    {
-        RigidBodyDynamics::Math::VectorNd vq = vqZero;
-        for (unsigned int i = 0; i < m_uDOF && i < 6; i++)
-            vq[i] = s_aadLadder[s][i];
-        vSeeds.push_back(vq);
-    }
-
-    m_bReadySet = false;
-    RigidBodyDynamics::Math::VectorNd vqBest;
-    RigidBodyDynamics::Math::Matrix3d mEBest;
-    int  nBestPass       = -1;
-    bool bBestFromAnchor = false;
-
-    for (size_t s = 0; s < vSeeds.size(); s++)
-    {
-        const RigidBodyDynamics::Math::VectorNd& vqSeed = vSeeds[s];
-        const bool bAnchor = (apAnchorSeed != NULL && s == 0);
-
-        RigidBodyDynamics::Math::VectorNd vqCand;
-        double dErr = 0.0;
-        if (!SolvePositionIK(vqSeed, avCenter, 0.0, NULL, vqCand, dErr))
-            continue;
-        // fold toward the seed (anchor case: stay in the demonstrated branch)
-        if (!FoldAndCheckLimits(vqCand, bAnchor ? vqSeed : vqZero))
-            continue;
-        // Sanity beyond math (2026-07-27 field): a wrist-folded candidate is
-        // kinematically fine and physically absurd — reject outright.
-        if (m_uDOF >= 5 &&
-            (std::fabs(vqCand[3]) > SEED_WRIST_MAX_RAD ||
-             std::fabs(vqCand[4]) > SEED_WRIST_MAX_RAD))
-        {
-            DBG_LOG_WARN("[SEED] candidate rejected: wrist fold (J4 %.2f / "
-                         "J5 %.2f rad)", vqCand[3], vqCand[4]);
-            continue;
-        }
-
-        // Verify the candidate EXACTLY the way runtime will use it: solve
-        // each probe from it with the soft-R of its own posture.
-        const RigidBodyDynamics::Math::Matrix3d mECand =
-            RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, vqCand,
-                                                        m_body_id);
-        int nPass = 0;
-        for (size_t p = 0; p < avProbes.size(); p++)
-        {
-            RigidBodyDynamics::Math::VectorNd vqSol;
-            double dProbeErr = 0.0;
-            if (!SolvePositionIK(vqCand, avProbes[p], IK_ORI_WEIGHT, &mECand,
-                                 vqSol, dProbeErr))
-                continue;
-            if (!FoldAndCheckLimits(vqSol, vqCand))
-                continue;
-            double dDqMax = 0.0;
-            for (unsigned int i = 0; i < m_uDOF; i++)
-            {
-                const double dDq = std::fabs(vqSol[i] - vqCand[i]);
-                if (dDq > dDqMax) dDqMax = dDq;
-            }
-            if (dDqMax <= IK_DQ_MAX_RAD) nPass++;
-        }
-
-        if (nPass > nBestPass)
-        {
-            nBestPass       = nPass;
-            vqBest          = vqCand;
-            mEBest          = mECand;
-            bBestFromAnchor = bAnchor;
-        }
-        if (nPass == (int)avProbes.size())
-            break;                                  // perfect — stop early
-    }
-
-    if (nBestPass < 0)
-    {
-        DBG_LOG_WARN("[SEED] could not bootstrap a sane ready posture for the "
-                     "workspace center (%.2f, %.2f, %.2f) — falling back to "
-                     "live-posture seeding. Record HOME ('p' menu) to anchor.",
-                     avCenter[0], avCenter[1], avCenter[2]);
+        DBG_LOG_WARN("[SEED] no operator seed on file — approaches use "
+                     "live-posture seeding until HOME is recorded "
+                     "('p' menu, last entry)");
         return FALSE;
     }
 
-    m_QReady   = vqBest;
-    m_EReady   = mEBest;
+    RigidBodyDynamics::Math::VectorNd vq(m_uDOF);
+    for (unsigned int i = 0; i < m_uDOF; i++) vq[i] = (*apAnchorSeed)[i];
+    const RigidBodyDynamics::Math::VectorNd vqRaw = vq;
+    if (!CheckLimitsPhysical(vq))
+    {
+        DBG_LOG_WARN("[SEED] persisted seed invalid (outside limits after "
+                     "fold) — ignoring; record HOME to re-create");
+        return FALSE;
+    }
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const int nTurns = (int)std::round((vqRaw[i] - vq[i]) / (2.0 * M_PI));
+        if (nTurns != 0)
+            DBG_LOG_INFO("[SEED] note: J%d in the seed file was wound %+d "
+                         "turn(s) (E17/E-stop counter legacy) — folded to the "
+                         "physical posture", (int)i, nTurns);
+    }
+
+    m_QReady    = vq;
+    m_EReady    = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel,
+                                                              m_QReady,
+                                                              m_body_id);
     m_bReadySet = true;
-    DBG_LOG_INFO("[SEED] ready posture q = [%.2f %.2f %.2f %.2f %.2f %.2f] rad"
-                 " — %d/%d workspace probes verified (center OK)%s",
+
+    // Inline coverage verification (init is non-RT — a full pass is fine
+    // here; record-time re-verification is amortized in TickAnchorVerify).
+    int nPass = 0;
+    for (size_t p = 0; p < avProbes.size(); p++)
+    {
+        RigidBodyDynamics::Math::VectorNd vqSol;
+        double dErr = 0.0;
+        if (!SolvePositionIK(m_QReady, avProbes[p], IK_ORI_WEIGHT, &m_EReady,
+                             vqSol, dErr))
+            continue;
+        if (!CheckLimitsPhysical(vqSol))
+            continue;
+        double dDqMax = 0.0;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(vqSol[i] - m_QReady[i]);
+            if (dDq > dDqMax) dDqMax = dDq;
+        }
+        if (dDqMax <= IK_DQ_MAX_RAD) nPass++;
+    }
+
+    DBG_LOG_INFO("[SEED] ready posture q = [%.2f %.2f %.2f %.2f %.2f %.2f] "
+                 "rad [operator anchor] — %d/%d workspace probes reachable",
                  m_QReady[0], m_QReady[1], m_QReady[2],
                  m_QReady[3], m_QReady[4], m_QReady[5],
-                 nBestPass, (int)avProbes.size(),
-                 bBestFromAnchor ? " [anchored to operator posture]"
-                                 : " [synthetic — record HOME to re-base]");
-    if (nBestPass < (int)avProbes.size())
-        DBG_LOG_WARN("[SEED] %d probe(s) near the box edge unreachable from "
-                     "q_ready — approaches there will report no-solution",
-                     (int)avProbes.size() - nBestPass);
+                 nPass, (int)avProbes.size());
+    if (nPass < (int)avProbes.size())
+        DBG_LOG_WARN("[SEED] %d probe(s) near the box edge unreachable — "
+                     "fine unless objects sit there",
+                     (int)avProbes.size() - nPass);
     return TRUE;
 }
 
@@ -917,12 +883,23 @@ CControllerFullDynamicsRT::SetReadyAnchor(
     if ((unsigned int)aqAnchor.size() < m_uDOF) return FALSE;
     RigidBodyDynamics::Math::VectorNd vq(m_uDOF);
     for (unsigned int i = 0; i < m_uDOF; i++) vq[i] = aqAnchor[i];
-    const RigidBodyDynamics::Math::VectorNd vqRef = vq;
-    if (!FoldAndCheckLimits(vq, vqRef))   // fold vs itself = pure limit check
+    const RigidBodyDynamics::Math::VectorNd vqRaw = vq;
+    // canonicalize: the LIVE counters may be wound whole turns (E17/E-stop
+    // legacy — J1 -6.2 / J4 -18.9 rad observed with the arm physically near
+    // zero), so the anchor is stored as the PHYSICAL posture.
+    if (!CheckLimitsPhysical(vq))
     {
         DBG_LOG_WARN("[SEED] anchor posture outside joint limits — keeping "
                      "the previous seed");
         return FALSE;
+    }
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const int nTurns = (int)std::round((vqRaw[i] - vq[i]) / (2.0 * M_PI));
+        if (nTurns != 0)
+            DBG_LOG_INFO("[SEED] note: J%d counter is wound %+d turn(s) "
+                         "(E17/E-stop legacy) — folded; motions stay in the "
+                         "live counter frame", (int)i, nTurns);
     }
     m_QReady    = vq;
     m_EReady    = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel,
@@ -959,7 +936,7 @@ CControllerFullDynamicsRT::TickAnchorVerify()
     bool   bOK  = false;
     if (SolvePositionIK(m_QReady, vProbe, IK_ORI_WEIGHT, &m_EReady,
                         vqSol, dErr) &&
-        FoldAndCheckLimits(vqSol, m_QReady))
+        CheckLimitsPhysical(vqSol))
     {
         double dDqMax = 0.0;
         for (unsigned int i = 0; i < m_uDOF; i++)
@@ -1000,11 +977,14 @@ CControllerFullDynamicsRT::SolveReadyIK(
                      adPosErrM * 1e3);
         return FALSE;
     }
-    if (!FoldAndCheckLimits(aqSol, m_QReady))
+    if (!CheckLimitsPhysical(aqSol))    // validity on the PHYSICAL posture
     {
         DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
         return FALSE;
     }
+    // Execution frame: fold to the lap nearest the LIVE counters so the
+    // commanded travel is the true physical delta (never extra turns).
+    FoldTowardRef(aqSol, m_Q, m_uDOF);
     adDqMaxFromCur = 0.0;
     anDqAxis      = -1;
     for (unsigned int i = 0; i < m_uDOF; i++)

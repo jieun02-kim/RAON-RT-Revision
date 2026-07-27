@@ -803,8 +803,19 @@ CRobotIndy7::DoInput()
             // the quintic's peak speed like E13 and go.
             m_bRefineActive  = false;
             m_eApproachState = eAPPROACH_IDLE;
-            const RigidBodyDynamics::Math::VectorNd& vqTarget =
+            RigidBodyDynamics::Math::VectorNd vqTarget =
                 bUseReady ? m_pController->GetReadyQ() : m_vHomeQ;
+            // Counter-frame safety (E20): fold each joint toward the LIVE
+            // counter — a lap mismatch between record time and replay time
+            // (E-stop bus-power cycles re-reference the multiturn encoders)
+            // would otherwise command REAL full-turn rotations.
+            {
+                const size_t uN = m_vCurrentPos.size();
+                RigidBodyDynamics::Math::VectorNd vqCur(uN);
+                for (size_t i = 0; i < uN; i++) vqCur[i] = m_vCurrentPos[i];
+                CControllerFullDynamicsRT::FoldTowardRef(vqTarget, vqCur,
+                                                         (unsigned int)uN);
+            }
             double dDqMax = 0.0;
             for (size_t i = 0; i < m_vCurrentPos.size() &&
                                i < (size_t)vqTarget.size(); i++)
@@ -941,8 +952,18 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
         return FALSE;
     }
 
-    // stage: 'b'-class joint move to q_ready, goal leg fires on settle
-    const RigidBodyDynamics::Math::VectorNd& vqReady = pC->GetReadyQ();
+    // stage: 'b'-class joint move to q_ready, goal leg fires on settle.
+    // E20: q_ready is stored canonically (physical posture) while the live
+    // counters may be wound — fold toward the current counter so the staging
+    // move is the true physical delta, never extra turns.
+    RigidBodyDynamics::Math::VectorNd vqReady = pC->GetReadyQ();
+    {
+        const size_t uN = m_vCurrentPos.size();
+        RigidBodyDynamics::Math::VectorNd vqCur(uN);
+        for (size_t i = 0; i < uN; i++) vqCur[i] = m_vCurrentPos[i];
+        CControllerFullDynamicsRT::FoldTowardRef(vqReady, vqCur,
+                                                 (unsigned int)uN);
+    }
     double dDqHome = 0.0;
     for (size_t i = 0; i < m_vCurrentPos.size() &&
                        i < (size_t)vqReady.size(); i++)
@@ -1177,14 +1198,18 @@ void proc_main_control(void* apRobot)
                          pRobot->m_vHomeQ[4], pRobot->m_vHomeQ[5]);
             // [kv260-merge] the recorded posture IS the best IK anchor — a
             // branch demonstrated by a human beats any synthetic bootstrap.
-            // Re-base q_ready now and persist for the next boot (file IO is
-            // on the bridge worker; here only a wait-free mailbox fill).
-            if (pRobot->m_pController != NULL)
-                pRobot->m_pController->SetReadyAnchor(pRobot->m_vHomeQ);
+            // Re-base q_ready now; on success persist the CANONICAL
+            // (zero-folded) values — never raw counters, which can be wound
+            // whole turns (E20) — for the next boot (file IO is on the
+            // bridge worker; here only a wait-free mailbox fill).
+            if (pRobot->m_pController != NULL &&
+                pRobot->m_pController->SetReadyAnchor(pRobot->m_vHomeQ))
             {
+                const RigidBodyDynamics::Math::VectorNd& vqA =
+                    pRobot->m_pController->GetReadyQ();
                 double adQ[8];
-                int    nN = (int)uDof < 8 ? (int)uDof : 8;
-                for (int i = 0; i < nN; i++) adQ[i] = pRobot->m_vHomeQ[i];
+                int    nN = (int)vqA.size() < 8 ? (int)vqA.size() : 8;
+                for (int i = 0; i < nN; i++) adQ[i] = vqA[i];
                 pRobot->m_pPickBridge->PersistReadySeed(adQ, nN);
             }
         }
