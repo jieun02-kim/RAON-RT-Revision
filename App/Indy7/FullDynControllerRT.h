@@ -78,6 +78,12 @@ public:
     // because an unsatisfiable soft residual keeps that flag false.
     static constexpr float  IK_ORI_WEIGHT    = 0.3f;
     static constexpr double IK_POS_TOL_M     = 0.002;
+    // Newton budget for EXPLORATORY ladder rungs. A converging solve from a
+    // good seed finishes in a few dozen steps (~0.2 ms); a stalling one burns
+    // the whole default 1000 and costs ~8 ms. Four of those put SolveReadyIK
+    // at 31.99 ms inside the 1 kHz cycle (2026-07-28 mustard). The rung that
+    // actually has to answer — pure position — still gets the full budget.
+    static constexpr int    IK_PROBE_STEPS   = 150;
     // Far-reach fallback (2026-07-27 E23): the soft-R solve can equilibrate
     // SHORT of a far target (E18's gradient stall — banana at r 0.83
     // "missed" by 235 mm while mustard at r 0.86 missed by 62 mm: the
@@ -307,7 +313,8 @@ private:
                          double adOriWeight,
                          const RigidBodyDynamics::Math::Matrix3d* apEOri,
                          RigidBodyDynamics::Math::VectorNd& aqSol,
-                         double& adPosErrM);
+                         double& adPosErrM,
+                         int anMaxSteps = 1000);
     // Angle (deg) between the tool attitude at aq and the ready attitude
     // m_EReady. This is the quantity APPROACH_RDEV_MAX_DEG gates on, and the
     // one the E25 polish pass tries to shrink.

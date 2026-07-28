@@ -625,7 +625,11 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = 1000;
+    // abQuiet marks an exploratory refine rung: cap its Newton budget for the
+    // same reason SolveReadyIK caps its ladder — a stalling solve that runs to
+    // 1000 steps costs ~8 ms inside the 1 kHz cycle. The final rung is the one
+    // whose verdict counts, so it keeps the full budget.
+    CS.num_steps      = abQuiet ? (unsigned int)IK_PROBE_STEPS : 1000u;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     // [kv260-merge] E13 (2026-07-27 table strike): a point-only constraint
@@ -791,11 +795,12 @@ CControllerFullDynamicsRT::SolvePositionIK(
     double adOriWeight,
     const RigidBodyDynamics::Math::Matrix3d* apEOri,
     RigidBodyDynamics::Math::VectorNd& aqSol,
-    double& adPosErrM)
+    double& adPosErrM,
+    int anMaxSteps)
 {
     aqSol = aqSeed;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = 1000;
+    CS.num_steps      = (unsigned int)anMaxSteps;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     CS.AddPointConstraint(m_body_id, tcp_local_point, avTarget);
@@ -1009,19 +1014,28 @@ CControllerFullDynamicsRT::SolveReadyIK(
 
     double dWUsed  = -1.0;
     int    nSolves = 0;
+    // Warm start: a failed rung stops where the position and attitude
+    // gradients balance. That point is far closer to the next (weaker) rung's
+    // answer than q_ready is, and it was itself reached FROM q_ready, so the
+    // branch — the whole reason q_ready exists — is preserved and the chain
+    // stays deterministic. Combined with the IK_PROBE_STEPS cap this is what
+    // keeps a descending ladder from costing 32 ms.
+    RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
     for (int i = 0; i < nLadder; i++)
     {
         nSolves++;
-        if (SolvePositionIK(m_QReady, avTarget, adLadder[i], &m_EReady,
-                            aqSol, adPosErrM))
+        if (SolvePositionIK(vqSeed, avTarget, adLadder[i], &m_EReady,
+                            aqSol, adPosErrM, IK_PROBE_STEPS))
         { dWUsed = adLadder[i]; break; }
+        vqSeed = aqSol;             // stalled iterate seeds the next rung
     }
 
     if (dWUsed < 0.0)
     {
-        // Bottom rung: position only, attitude unconstrained.
+        // Bottom rung: position only, attitude unconstrained. This one has to
+        // answer "is it reachable at all", so it gets the full Newton budget.
         nSolves++;
-        if (!SolvePositionIK(m_QReady, avTarget, 0.0, NULL, aqSol, adPosErrM))
+        if (!SolvePositionIK(vqSeed, avTarget, 0.0, NULL, aqSol, adPosErrM))
         {
             DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
                          "position-only (genuinely out of reach)",
@@ -1044,7 +1058,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
             double dErrPol = 0.0;
             nSolves++;
             if (!SolvePositionIK(aqSol, avTarget, adLadder[k], &m_EReady,
-                                 vqPol, dErrPol))
+                                 vqPol, dErrPol, IK_PROBE_STEPS))
                 continue;                   // this weight loses the position
             const double dDevPol = AttitudeDevDeg(vqPol);
             if (dDevPol < dDevBest)
