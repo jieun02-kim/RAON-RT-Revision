@@ -265,8 +265,17 @@ public:
     // small LOCAL re-targets (refine) — with a large bias the soft-R trade
     // stalls at a position/orientation equilibrium and the FK acceptance
     // rejects it (2026-07-27 regression). The dq gate still applies.
+    // abQuiet: suppress the refusal logs. Used by the E26 refine ladder, where
+    // a rung failing is normal — only the last rung's failure is real news.
     BOOL SetTargetPosePositionOnly(Pose astTargetPose,
-                                   double adOriWeight = IK_ORI_WEIGHT);
+                                   double adOriWeight = IK_ORI_WEIGHT,
+                                   BOOL abQuiet = FALSE);
+    // Tool attitude (body->base, the Pose::m_rotation convention) at an
+    // arbitrary joint vector. E26: lets the caller anchor refine on the
+    // attitude the approach SOLUTION reaches instead of on whatever attitude
+    // the arm happened to be parked in when the goal was accepted.
+    RigidBodyDynamics::Math::Matrix3d ToolRotAt(
+        const RigidBodyDynamics::Math::VectorNd& aq);
     BOOL SetTargetPose_Jacobian();           // visual servoing용 (매 사이클 목표 추종)
     BOOL LogDistanceError(Pose astTargetPose);
 
@@ -299,6 +308,10 @@ private:
                          const RigidBodyDynamics::Math::Matrix3d* apEOri,
                          RigidBodyDynamics::Math::VectorNd& aqSol,
                          double& adPosErrM);
+    // Angle (deg) between the tool attitude at aq and the ready attitude
+    // m_EReady. This is the quantity APPROACH_RDEV_MAX_DEG gates on, and the
+    // one the E25 polish pass tries to shrink.
+    double AttitudeDevDeg(const RigidBodyDynamics::Math::VectorNd& aq);
 
     // RBDL model and dynamics
     RigidBodyDynamics::Model m_rbdlModel;

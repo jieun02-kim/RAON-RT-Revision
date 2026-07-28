@@ -924,6 +924,15 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
         return FALSE;
     }
 
+    // E26: anchor refine on the attitude the SOLUTION reaches, not on wherever
+    // the arm happened to be parked when the goal was accepted. GetCurrentPose
+    // above filled m_rotation with the pre-approach attitude, so every refine
+    // pass was measuring (and, once weighted, would have been pulling toward)
+    // the park pose — 24 deg away on tennis_ball. With the solution's own
+    // attitude as the reference, "R held within N deg" finally means "how far
+    // refine has drifted from the approach".
+    stTarget.m_rotation = pC->ToolRotAt(vqSol);
+
     if (dDqMax <= CControllerFullDynamicsRT::IK_DQ_MAX_RAD)
     {
         const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
@@ -1391,10 +1400,24 @@ void proc_main_control(void* apRobot)
                 {
                     pRobot->m_stRefineCmd.m_position += CRobotIndy7::REFINE_DAMPING * vErr;   // damped bias
                     // E13: trajectory (incl. any T stretch) starts inside.
-                    // Ori weight 0: refine biases are small LOCAL moves — the
-                    // soft keep-R trade stalls on large biases (regression).
+                    // E26 ladder: a flat weight of 0 left the tool free to
+                    // wander the 3-dim nullspace between passes, so the
+                    // position correction arrived polluted by an attitude
+                    // change and the residual bounced (tennis_ball 37.9 -> 23.7
+                    // -> 39.9 mm, R drifting 20-29 deg, max iters at 14.8 mm).
+                    // E18 showed a FIXED 0.3 stalls on large biases; these are
+                    // 10-26 mm, so walk down instead. The last rung IS the old
+                    // behaviour, which makes this strictly no worse: it can
+                    // only hold attitude where holding it is free.
                     pRTController->SetTrajectoryDuration(CRobotIndy7::REFINE_TRAJ_T_S);
-                    if (pRTController->SetTargetPosePositionOnly(pRobot->m_stRefineCmd, 0.0))
+                    static const double adRefineW[] = { 0.1, 0.03, 0.01, 0.0 };
+                    const int nRefineW = (int)(sizeof(adRefineW) / sizeof(adRefineW[0]));
+                    BOOL bStarted = FALSE;
+                    for (int k = 0; k < nRefineW && !bStarted; k++)
+                        bStarted = pRTController->SetTargetPosePositionOnly(
+                                       pRobot->m_stRefineCmd, adRefineW[k],
+                                       (k < nRefineW - 1) ? TRUE : FALSE);
+                    if (bStarted)
                     {
                         pRobot->m_nRefineIter++;
                         DBG_LOG_INFO("[REFINE] pass %d — err %.1f mm, re-targeting",

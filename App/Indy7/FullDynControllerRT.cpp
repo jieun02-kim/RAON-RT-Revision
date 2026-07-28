@@ -609,9 +609,19 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
     return TRUE;
 }
 
+RigidBodyDynamics::Math::Matrix3d
+CControllerFullDynamicsRT::ToolRotAt(const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    // CalcBodyWorldOrientation returns base->body; Pose::m_rotation is
+    // body->base (SetTargetPosePositionOnly transposes it back for RBDL).
+    return RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aq,
+                                                       m_body_id).transpose();
+}
+
 BOOL
 CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
-                                                     double adOriWeight)
+                                                     double adOriWeight,
+                                                     BOOL abQuiet)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
@@ -640,8 +650,9 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
         RigidBodyDynamics::Math::VectorNd vqPhys = vjointspace;
         if (!CheckLimitsPhysical(vqPhys))
         {
-            DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution "
-                          "outside joint limits even after 2π fold");
+            if (!abQuiet)
+                DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution "
+                              "outside joint limits even after 2π fold");
             return FALSE;
         }
         vjointspace = vqPhys;
@@ -654,8 +665,9 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
     const double dPosErr = (vPosSol - astTargetPose.m_position).norm();
     if (dPosErr > IK_POS_TOL_M)
     {
-        DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed — residual "
-                     "%.1f mm > %.1f mm", dPosErr * 1e3, IK_POS_TOL_M * 1e3);
+        if (!abQuiet)
+            DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed — residual "
+                         "%.1f mm > %.1f mm", dPosErr * 1e3, IK_POS_TOL_M * 1e3);
         return FALSE;
     }
 
@@ -668,10 +680,11 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
     }
     if (dDqMax > IK_DQ_MAX_RAD)
     {
-        DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: J%d jumps %.2f rad "
-                      "(> %.1f) — IK branch flip. Reposition the arm (grav-comp) "
-                      "closer to the target posture and retry.",
-                      nDqAxis, dDqMax, IK_DQ_MAX_RAD);
+        if (!abQuiet)
+            DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: J%d jumps %.2f rad "
+                          "(> %.1f) — IK branch flip. Reposition the arm (grav-comp) "
+                          "closer to the target posture and retry.",
+                          nDqAxis, dDqMax, IK_DQ_MAX_RAD);
         return FALSE;
     }
 
@@ -700,8 +713,8 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
     m_traj.active    = true;
     goal_tcpPose     = astTargetPose;
     DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s, "
-                 "dq_max %.2f rad (J%d), R held within %.1f deg",
-                 m_traj.T, dDqMax, nDqAxis, dOriDevDeg);
+                 "dq_max %.2f rad (J%d), w=%.2f, R held within %.1f deg",
+                 m_traj.T, dDqMax, nDqAxis, adOriWeight, dOriDevDeg);
 
     return TRUE;
 }
@@ -962,6 +975,18 @@ CControllerFullDynamicsRT::TickAnchorVerify()
     }
 }
 
+double
+CControllerFullDynamicsRT::AttitudeDevDeg(
+    const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    const RigidBodyDynamics::Math::Matrix3d E_sol =
+        RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aq, m_body_id);
+    const RigidBodyDynamics::Math::Matrix3d R_err = E_sol * m_EReady.transpose();
+    double dCosA = (R_err.trace() - 1.0) / 2.0;
+    if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
+    return std::acos(dCosA) * 180.0 / M_PI;
+}
+
 BOOL
 CControllerFullDynamicsRT::SolveReadyIK(
     const RigidBodyDynamics::Math::Vector3d& avTarget,
@@ -969,37 +994,91 @@ CControllerFullDynamicsRT::SolveReadyIK(
     double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
 {
     if (!m_bReadySet) return FALSE;
-    bool bRelaxed = false;
-    if (!SolvePositionIK(m_QReady, avTarget, IK_ORI_WEIGHT, &m_EReady,
-                         aqSol, adPosErrM))
+
+    const uint64_t tIkStart = read_timer();
+
+    // E25: walk the orientation weight DOWN a ladder instead of dropping it.
+    // E23 tried IK_ORI_WEIGHT and then jumped straight to 0, so any target the
+    // soft constraint could not satisfy fell through to a pure-position solve
+    // whose attitude is an accident of the descent path. That is not a reach
+    // limit: banana at 0.877 m from the base origin was refused at 87 deg
+    // while the FARTHER mustard at 0.912 m passed at 36 deg. Each rung keeps
+    // as much of the ready attitude as the reach still allows.
+    static const double adLadder[] = { IK_ORI_WEIGHT, 0.1, 0.03, 0.01 };
+    static const int    nLadder    = (int)(sizeof(adLadder) / sizeof(adLadder[0]));
+
+    double dWUsed  = -1.0;
+    int    nSolves = 0;
+    for (int i = 0; i < nLadder; i++)
     {
-        // E23: soft-R stall, not necessarily out of reach — retry pure
-        // position from the same deterministic seed (attitude capped below).
-        if (!SolvePositionIK(m_QReady, avTarget, 0.0, NULL,
-                             aqSol, adPosErrM))
+        nSolves++;
+        if (SolvePositionIK(m_QReady, avTarget, adLadder[i], &m_EReady,
+                            aqSol, adPosErrM))
+        { dWUsed = adLadder[i]; break; }
+    }
+
+    if (dWUsed < 0.0)
+    {
+        // Bottom rung: position only, attitude unconstrained.
+        nSolves++;
+        if (!SolvePositionIK(m_QReady, avTarget, 0.0, NULL, aqSol, adPosErrM))
         {
             DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
                          "position-only (genuinely out of reach)",
                          adPosErrM * 1e3);
             return FALSE;
         }
-        bRelaxed = true;
+        dWUsed = 0.0;
+
+        // E25 polish: position is satisfied now, but the attitude is wherever
+        // the descent happened to stop. Re-solve FROM THAT SOLUTION with a
+        // light weight — the point constraint is already met, so the solver
+        // has only the nullspace left and spends it pulling the tool back
+        // toward the ready attitude. The strongest weight that still holds
+        // position wins; the unpolished solution is kept if none does, or if
+        // the polish does not actually improve the deviation.
+        double dDevBest = AttitudeDevDeg(aqSol);
+        for (int k = 1; k < nLadder; k++)
+        {
+            RigidBodyDynamics::Math::VectorNd vqPol = aqSol;
+            double dErrPol = 0.0;
+            nSolves++;
+            if (!SolvePositionIK(aqSol, avTarget, adLadder[k], &m_EReady,
+                                 vqPol, dErrPol))
+                continue;                   // this weight loses the position
+            const double dDevPol = AttitudeDevDeg(vqPol);
+            if (dDevPol < dDevBest)
+            {
+                DBG_LOG_INFO("(SolveReadyIK) polish w=%.2f pulled the tool "
+                             "%.0f -> %.0f deg (pos %.1f mm)",
+                             adLadder[k], dDevBest, dDevPol, dErrPol * 1e3);
+                aqSol     = vqPol;
+                adPosErrM = dErrPol;
+                dDevBest  = dDevPol;
+            }
+            break;      // first weight that holds position is the strongest
+        }
     }
+
+    // The solves all run inside the 1 kHz control cycle. Measure rather than
+    // guess: if this ever exceeds the budget the ladder has to be amortized
+    // one rung per cycle, the way the anchor coverage check already is.
+    const double dIkMs = (double)(read_timer() - tIkStart) / 1.0e6;
+    if (dIkMs > 0.8)
+        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms — over the "
+                     "1 kHz cycle budget, amortize the ladder", nSolves, dIkMs);
+    else
+        DBG_LOG_INFO("(SolveReadyIK) ladder settled at w=%.2f after %d solve(s), "
+                     "%.2f ms", dWUsed, nSolves, dIkMs);
+
     if (!CheckLimitsPhysical(aqSol))    // validity on the PHYSICAL posture
     {
         DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
         return FALSE;
     }
-    if (bRelaxed)
+    if (dWUsed < (double)IK_ORI_WEIGHT)     // any rung below nominal is relaxed
     {
-        const RigidBodyDynamics::Math::Matrix3d E_sol =
-            RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aqSol,
-                                                        m_body_id);
-        const RigidBodyDynamics::Math::Matrix3d R_err =
-            E_sol * m_EReady.transpose();
-        double dCosA = (R_err.trace() - 1.0) / 2.0;
-        if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
-        const double dDevDeg = std::acos(dCosA) * 180.0 / M_PI;
+        const double dDevDeg = AttitudeDevDeg(aqSol);
         if (dDevDeg > APPROACH_RDEV_MAX_DEG)
         {
             DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool "
@@ -1007,8 +1086,8 @@ CControllerFullDynamicsRT::SolveReadyIK(
                          "closer", dDevDeg, APPROACH_RDEV_MAX_DEG);
             return FALSE;
         }
-        DBG_LOG_INFO("(SolveReadyIK) far-reach: soft-R relaxed, tool tilts "
-                     "%.0f deg from the ready attitude", dDevDeg);
+        DBG_LOG_INFO("(SolveReadyIK) far-reach: w relaxed to %.2f, tool tilts "
+                     "%.0f deg from the ready attitude", dWUsed, dDevDeg);
     }
     // Execution frame: fold to the lap nearest the LIVE counters so the
     // commanded travel is the true physical delta (never extra turns).
