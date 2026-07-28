@@ -986,6 +986,22 @@ CControllerFullDynamicsRT::TickAnchorVerify()
 }
 
 double
+CControllerFullDynamicsRT::ReadyBranchGap(
+    const RigidBodyDynamics::Math::VectorNd& aq, int& anAxis)
+{
+    RigidBodyDynamics::Math::VectorNd vq = aq;
+    FoldTowardRef(vq, m_QReady, m_uDOF);   // 2π laps are not branch changes
+    double dMax = 0.0;
+    anAxis = -1;
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const double d = std::fabs(vq[i] - m_QReady[i]);
+        if (d > dMax) { dMax = d; anAxis = (int)i; }
+    }
+    return dMax;
+}
+
+double
 CControllerFullDynamicsRT::AttitudeDevDeg(
     const RigidBodyDynamics::Math::VectorNd& aq)
 {
@@ -1027,11 +1043,17 @@ CControllerFullDynamicsRT::SolveReadyIK(
     // capping the Newton budget was the other half and it corrupted the
     // solutions, see IK_SOLVE_STEPS.)
     RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
+    int nBranchAxis = -1;
     for (int i = 0; i < nLadder; i++)
     {
         nSolves++;
+        // A rung passes only if it reaches the point AND stays on the q_ready
+        // branch. Position alone is not enough: the shoulder-flipped solution
+        // hits the same point with the same tool attitude, so neither the 2 mm
+        // test nor the 60 deg gate can see it.
         if (SolvePositionIK(vqSeed, avTarget, adLadder[i], &m_EReady,
-                            aqSol, adPosErrM, IK_SOLVE_STEPS))
+                            aqSol, adPosErrM, IK_SOLVE_STEPS) &&
+            ReadyBranchGap(aqSol, nBranchAxis) <= IK_DQ_MAX_RAD)
         { dWUsed = adLadder[i]; break; }
         vqSeed = aqSol;             // stalled iterate seeds the next rung
     }
@@ -1047,6 +1069,18 @@ CControllerFullDynamicsRT::SolveReadyIK(
                          "position-only (genuinely out of reach)",
                          adPosErrM * 1e3);
             return FALSE;
+        }
+        {
+            const double dGap = ReadyBranchGap(aqSol, nBranchAxis);
+            if (dGap > IK_DQ_MAX_RAD)
+            {
+                DBG_LOG_WARN("(SolveReadyIK) only reachable on a different arm "
+                             "branch (J%d %.2f rad from q_ready) — refused. "
+                             "Staging cannot close this: it moves the arm TO "
+                             "q_ready, which is where the gap is measured from",
+                             nBranchAxis, dGap);
+                return FALSE;
+            }
         }
         dWUsed = 0.0;
 

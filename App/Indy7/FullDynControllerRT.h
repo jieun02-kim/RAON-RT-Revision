@@ -334,6 +334,16 @@ private:
                          RigidBodyDynamics::Math::VectorNd& aqSol,
                          double& adPosErrM,
                          int anMaxSteps = 1000);
+    // Largest per-joint distance from q_ready after folding aq toward it, with
+    // the offending axis. A solution is only useful if it sits on the SAME
+    // branch as q_ready: the solver can reach an identical point with the
+    // shoulder swung ~180 deg round and the remaining joints folded back, so
+    // the TOOL ATTITUDE barely moves and APPROACH_RDEV_MAX_DEG waves it
+    // through (measured: J0 3.13 rad away, tool tilt 1 deg). Staging cannot
+    // rescue that — staging moves the arm TO q_ready, which is exactly where
+    // this gap is measured from.
+    double ReadyBranchGap(const RigidBodyDynamics::Math::VectorNd& aq,
+                          int& anAxis);
     // Angle (deg) between the tool attitude at aq and the ready attitude
     // m_EReady. This is the quantity APPROACH_RDEV_MAX_DEG gates on, and the
     // one the E25 polish pass tries to shrink.
