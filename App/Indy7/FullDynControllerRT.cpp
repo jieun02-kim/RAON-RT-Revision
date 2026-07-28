@@ -587,7 +587,11 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = 1000;   // default 100 → 수렴 기회 늘리기
+    // ⚠ num_steps is an RBDL *output* (iterations performed); the input limit
+    // is max_steps (default 300). This line has never had any effect. Do NOT
+    // "fix" it to max_steps=1000: at ~35 us/step that is a 35 ms stall inside
+    // the 1 kHz cycle. 300 is what this path has always run at, and it works.
+    CS.num_steps      = 1000;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     CS.AddFullConstraint(m_body_id, tcp_local_point, astTargetPose.m_position, astTargetPose.m_rotation.transpose());
@@ -625,11 +629,10 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    // abQuiet marks an exploratory refine rung: cap its Newton budget for the
-    // same reason SolveReadyIK caps its ladder — a stalling solve that runs to
-    // 1000 steps costs ~8 ms inside the 1 kHz cycle. The final rung is the one
-    // whose verdict counts, so it keeps the full budget.
-    CS.num_steps      = abQuiet ? (unsigned int)IK_PROBE_STEPS : 1000u;
+    // abQuiet only suppresses this rung's refusal logs — NOT its Newton budget.
+    // Starving an exploratory rung was tried and it corrupted the solutions
+    // (see IK_SOLVE_STEPS). max_steps is the limit; num_steps is RBDL's output.
+    CS.max_steps      = (unsigned int)IK_SOLVE_STEPS;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     // [kv260-merge] E13 (2026-07-27 table strike): a point-only constraint
@@ -800,7 +803,9 @@ CControllerFullDynamicsRT::SolvePositionIK(
 {
     aqSol = aqSeed;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = (unsigned int)anMaxSteps;
+    // CS.num_steps is an OUTPUT (iterations performed); CS.max_steps is the
+    // input limit. Writing num_steps, as this code did, capped nothing.
+    CS.max_steps      = (unsigned int)anMaxSteps;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     CS.AddPointConstraint(m_body_id, tcp_local_point, avTarget);
@@ -1018,14 +1023,15 @@ CControllerFullDynamicsRT::SolveReadyIK(
     // gradients balance. That point is far closer to the next (weaker) rung's
     // answer than q_ready is, and it was itself reached FROM q_ready, so the
     // branch — the whole reason q_ready exists — is preserved and the chain
-    // stays deterministic. Combined with the IK_PROBE_STEPS cap this is what
-    // keeps a descending ladder from costing 32 ms.
+    // stays deterministic. (This is the surviving half of the 32 ms attack —
+    // capping the Newton budget was the other half and it corrupted the
+    // solutions, see IK_SOLVE_STEPS.)
     RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
     for (int i = 0; i < nLadder; i++)
     {
         nSolves++;
         if (SolvePositionIK(vqSeed, avTarget, adLadder[i], &m_EReady,
-                            aqSol, adPosErrM, IK_PROBE_STEPS))
+                            aqSol, adPosErrM, IK_SOLVE_STEPS))
         { dWUsed = adLadder[i]; break; }
         vqSeed = aqSol;             // stalled iterate seeds the next rung
     }
@@ -1058,7 +1064,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
             double dErrPol = 0.0;
             nSolves++;
             if (!SolvePositionIK(aqSol, avTarget, adLadder[k], &m_EReady,
-                                 vqPol, dErrPol, IK_PROBE_STEPS))
+                                 vqPol, dErrPol, IK_SOLVE_STEPS))
                 continue;                   // this weight loses the position
             const double dDevPol = AttitudeDevDeg(vqPol);
             if (dDevPol < dDevBest)
@@ -1670,7 +1676,11 @@ CControllerFullDynamicsRT::ComputeInverseKinematics_6dof(std::vector<double>& av
 
         // 6DOF IK: position + orientation 동시 제약 → m_Q_ik_target에 저장
         RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-        CS.num_steps      = 1000;   // default 100 → 수렴 기회 늘리기
+        // ⚠ num_steps is an RBDL *output* (iterations performed); the input limit
+    // is max_steps (default 300). This line has never had any effect. Do NOT
+    // "fix" it to max_steps=1000: at ~35 us/step that is a 35 ms stall inside
+    // the 1 kHz cycle. 300 is what this path has always run at, and it works.
+    CS.num_steps      = 1000;
         CS.step_tol       = 1.0e-10;
         CS.constraint_tol = 1.0e-8;
         CS.AddFullConstraint(m_body_id, tcp_local_point, goal_tcpPose.m_position, goal_tcpPose.m_rotation.transpose());
@@ -1914,6 +1924,8 @@ CControllerFullDynamicsRT::RunISOCubeIKValidation()
             RigidBodyDynamics::Math::VectorNd q_sol  = q_seed;
 
             RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+            // ⚠ output field, not a limit — see the note above. Effective
+            // budget here is RBDL's default max_steps = 300.
             CS.num_steps      = 1000;
             CS.step_tol       = 1.0e-10;
             CS.constraint_tol = 1.0e-8;

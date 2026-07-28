@@ -78,12 +78,31 @@ public:
     // because an unsatisfiable soft residual keeps that flag false.
     static constexpr float  IK_ORI_WEIGHT    = 0.3f;
     static constexpr double IK_POS_TOL_M     = 0.002;
-    // Newton budget for EXPLORATORY ladder rungs. A converging solve from a
-    // good seed finishes in a few dozen steps (~0.2 ms); a stalling one burns
-    // the whole default 1000 and costs ~8 ms. Four of those put SolveReadyIK
-    // at 31.99 ms inside the 1 kHz cycle (2026-07-28 mustard). The rung that
-    // actually has to answer — pure position — still gets the full budget.
-    static constexpr int    IK_PROBE_STEPS   = 150;
+    // Newton budget, written to RBDL's CS.max_steps.
+    //
+    // ⚠ The trap: CS.num_steps is an OUTPUT ("the number of iterations
+    // performed"); CS.max_steps is the input limit (RBDL default 300). The
+    // pre-existing `CS.num_steps = 1000  // 수렴 기회 늘리기` never did
+    // anything, and neither did a first attempt to CAP the ladder there.
+    //
+    // ⚠ And do not try to cap it now that the right field is being written:
+    // that was tried (40 steps for exploratory rungs, 2026-07-28 17:18) and it
+    // fixed the timing while WRECKING the solutions. A ladder rung asks "does
+    // this weight converge?", and a starved solver answers wrong in both
+    // directions — rungs that would have converged fail, and under-converged
+    // points pass the 2 mm position test while being poor solutions. Measured:
+    // mustard went from (w=0.01, dq 1.11 rad, direct, refine 3 passes to
+    // 7.0 mm) to (w=0.10, dq 2.98 rad, staged, staged leg refused) and
+    // (w=0.00, tilt 3 deg, refine oscillating to 16.7 mm).
+    //
+    // So the budget stays full and the ladder costs up to ~32 ms. That is a
+    // real 1 kHz violation — the honest fix is to move the solve OFF the RT
+    // thread (the bridge already owns a non-RT worker; it would need its own
+    // RBDL model instance, the model not being thread-safe) and hand RT a
+    // finished joint vector. Until then the WARN below marks the event; it is
+    // one-shot at operator command with the arm static in grav-comp, and the
+    // bus has been measured unharmed through it.
+    static constexpr int    IK_SOLVE_STEPS   = 300;
     // Far-reach fallback (2026-07-27 E23): the soft-R solve can equilibrate
     // SHORT of a far target (E18's gradient stall — banana at r 0.83
     // "missed" by 235 mm while mustard at r 0.86 missed by 62 mm: the
