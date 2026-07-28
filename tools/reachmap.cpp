@@ -266,7 +266,10 @@ int main(int argc, char** argv)
     for (size_t m = 0; m < stOpt.vMarks.size(); m++)
         fprintf(pOut, "# mark %.6f %.6f %.6f %s\n", stOpt.vMarks[m].x,
                 stOpt.vMarks[m].y, stOpt.vMarks[m].z, stOpt.vMarks[m].label.c_str());
-    fprintf(pOut, "x,y,z,verdict,w,tilt_deg,gap_rad,gap_axis,pos_err_mm,solves,ms,label\n");
+    // seed/cands are multi-start only; the baseline map has neither, which is
+    // why reachmap_compare.py treats them as optional.
+    fprintf(pOut, "x,y,z,verdict,w,tilt_deg,gap_rad,gap_axis,pos_err_mm,"
+                  "solves,ms,seed,cands,label\n");
 
     // One cell: ask the robot's own solver, then record what it did.
     struct Cell { double x, y, z; std::string label; };
@@ -323,10 +326,11 @@ int main(int argc, char** argv)
         dMsSum += d.dMs;
         if (d.dMs > dMsMax) dMsMax = d.dMs;
 
-        fprintf(pOut, "%.4f,%.4f,%.4f,%s,%.2f,%.2f,%.4f,%d,%.2f,%d,%.3f,%s\n",
+        fprintf(pOut, "%.4f,%.4f,%.4f,%s,%.2f,%.2f,%.4f,%d,%.2f,%d,%.3f,"
+                      "%d,%d,%s\n",
                 c.x, c.y, c.z, VerdictName(d.eVerdict), d.dW, d.dTiltDeg,
                 d.dBranchGap, d.nBranchAxis, d.dPosErrM * 1e3, d.nSolves, d.dMs,
-                c.label.c_str());
+                d.nSeed, d.nCandidates, c.label.c_str());
 
         if ((i % 200) == 0 || i + 1 == vCells.size())
         {
