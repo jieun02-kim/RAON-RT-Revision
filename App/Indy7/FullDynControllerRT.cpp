@@ -1013,12 +1013,30 @@ CControllerFullDynamicsRT::AttitudeDevDeg(
     return std::acos(dCosA) * 180.0 / M_PI;
 }
 
+// [kv260-merge] Record what the solve did — see IkDiag in the header. Called
+// at every SolveReadyIK exit; the two attitude/branch numbers are one FK and
+// one fold each, which is why this is affordable on the pass path too.
+void
+CControllerFullDynamicsRT::StampIkDiag(
+    eIkVerdict aeVerdict, double adW, int anSolves, uint64_t atStart,
+    const RigidBodyDynamics::Math::VectorNd& aq, double adPosErrM)
+{
+    m_stIkDiag.eVerdict = aeVerdict;
+    m_stIkDiag.dW       = adW;
+    m_stIkDiag.nSolves  = anSolves;
+    m_stIkDiag.dMs      = (double)(read_timer() - atStart) / 1.0e6;
+    m_stIkDiag.dPosErrM = adPosErrM;
+    m_stIkDiag.dTiltDeg = AttitudeDevDeg(aq);
+    m_stIkDiag.dBranchGap = ReadyBranchGap(aq, m_stIkDiag.nBranchAxis);
+}
+
 BOOL
 CControllerFullDynamicsRT::SolveReadyIK(
     const RigidBodyDynamics::Math::Vector3d& avTarget,
     RigidBodyDynamics::Math::VectorNd& aqSol,
     double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
 {
+    m_stIkDiag = IkDiag{eIkNoSeed, -1.0, 0, 0.0, 0.0, 0.0, 0.0, -1};
     if (!m_bReadySet) return FALSE;
 
     const uint64_t tIkStart = read_timer();
@@ -1065,6 +1083,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
         nSolves++;
         if (!SolvePositionIK(vqSeed, avTarget, 0.0, NULL, aqSol, adPosErrM))
         {
+            StampIkDiag(eIkNoSolution, 0.0, nSolves, tIkStart, aqSol, adPosErrM);
             DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
                          "position-only (genuinely out of reach)",
                          adPosErrM * 1e3);
@@ -1074,6 +1093,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
             const double dGap = ReadyBranchGap(aqSol, nBranchAxis);
             if (dGap > IK_DQ_MAX_RAD)
             {
+                StampIkDiag(eIkBranch, 0.0, nSolves, tIkStart, aqSol, adPosErrM);
                 DBG_LOG_WARN("(SolveReadyIK) only reachable on a different arm "
                              "branch (J%d %.2f rad from q_ready) — refused. "
                              "Staging cannot close this: it moves the arm TO "
@@ -1100,6 +1120,25 @@ CControllerFullDynamicsRT::SolveReadyIK(
             if (!SolvePositionIK(aqSol, avTarget, adLadder[k], &m_EReady,
                                  vqPol, dErrPol, IK_SOLVE_STEPS))
                 continue;                   // this weight loses the position
+            // E28 (2026-07-28, found by the offline reach map): polish runs
+            // AFTER the branch check above, and it is selected on attitude
+            // alone — so it could hand back a solution on the far branch and
+            // nothing downstream would notice. It is exactly the case E27
+            // exists to stop, and a flipped posture often has the BETTER
+            // attitude, so polish actively prefers it. Field-scale example:
+            // target (0.828, 0.234, 0.300) passed the bottom-rung check, then
+            // polish moved it to a J2 gap of 2.96 rad and it was accepted.
+            // Re-check and keep the unpolished (in-branch) solution instead.
+            int nPolAxis = -1;
+            const double dPolGap = ReadyBranchGap(vqPol, nPolAxis);
+            if (dPolGap > IK_DQ_MAX_RAD)
+            {
+                DBG_LOG_WARN("(SolveReadyIK) polish w=%.2f would flip the arm "
+                             "branch (J%d %.2f rad from q_ready) — polish "
+                             "dropped, keeping the in-branch solution",
+                             adLadder[k], nPolAxis, dPolGap);
+                break;
+            }
             const double dDevPol = AttitudeDevDeg(vqPol);
             if (dDevPol < dDevBest)
             {
@@ -1119,14 +1158,16 @@ CControllerFullDynamicsRT::SolveReadyIK(
     // one rung per cycle, the way the anchor coverage check already is.
     const double dIkMs = (double)(read_timer() - tIkStart) / 1.0e6;
     if (dIkMs > 0.8)
-        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms — over the "
-                     "1 kHz cycle budget, amortize the ladder", nSolves, dIkMs);
+        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms (settled at "
+                     "w=%.2f) — over the 1 kHz cycle budget, amortize the "
+                     "ladder", nSolves, dIkMs, dWUsed);
     else
         DBG_LOG_INFO("(SolveReadyIK) ladder settled at w=%.2f after %d solve(s), "
                      "%.2f ms", dWUsed, nSolves, dIkMs);
 
     if (!CheckLimitsPhysical(aqSol))    // validity on the PHYSICAL posture
     {
+        StampIkDiag(eIkLimits, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
         DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
         return FALSE;
     }
@@ -1135,6 +1176,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
         const double dDevDeg = AttitudeDevDeg(aqSol);
         if (dDevDeg > APPROACH_RDEV_MAX_DEG)
         {
+            StampIkDiag(eIkTilt, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
             DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool "
                          "tilt (%.0f deg > %.0f) — refused; move the object "
                          "closer", dDevDeg, APPROACH_RDEV_MAX_DEG);
@@ -1143,6 +1185,7 @@ CControllerFullDynamicsRT::SolveReadyIK(
         DBG_LOG_INFO("(SolveReadyIK) far-reach: w relaxed to %.2f, tool tilts "
                      "%.0f deg from the ready attitude", dWUsed, dDevDeg);
     }
+    StampIkDiag(eIkPass, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
     // Execution frame: fold to the lap nearest the LIVE counters so the
     // commanded travel is the true physical delta (never extra turns).
     FoldTowardRef(aqSol, m_Q, m_uDOF);

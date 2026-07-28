@@ -181,6 +181,33 @@ public:
     // speed (1.875*dq/T) never exceeds IK_QD_PEAK_RADPS, capped at IK_T_MAX_S.
     static double ScaledTrajTime(double adDqMax, double adTBase);
 
+    // [kv260-merge] What SolveReadyIK actually did, as data (2026-07-28).
+    // Every field below was already computed inside the solve and thrown away
+    // after being printf'd — and the over-budget WARN path did not even print
+    // the winning weight, hiding it exactly when the ladder ran deepest. The
+    // offline reach-map tool needs these per target, and re-deriving them
+    // outside would be a second implementation free to drift from this one.
+    // Written unconditionally at every exit; costs a handful of stores.
+    enum eIkVerdict {
+        eIkPass = 0,
+        eIkNoSolution,      // position unreachable even with R unconstrained
+        eIkBranch,          // reachable only on a different arm branch (E27)
+        eIkLimits,          // solution outside URDF joint limits
+        eIkTilt,            // relaxed rung exceeded APPROACH_RDEV_MAX_DEG
+        eIkNoSeed           // q_ready not set — nothing to solve from
+    };
+    struct IkDiag {
+        eIkVerdict eVerdict;
+        double     dW;              // winning ladder weight (-1 if none)
+        int        nSolves;         // RBDL InverseKinematics calls
+        double     dMs;             // wall time of the whole ladder
+        double     dPosErrM;        // final position residual
+        double     dTiltDeg;        // tool attitude deviation from q_ready
+        double     dBranchGap;      // max per-joint distance from q_ready
+        int        nBranchAxis;     // which joint carried that gap
+    };
+    const IkDiag& GetLastIkDiag() const { return m_stIkDiag; }
+
 
     // Controller modes
     enum eControlMode {
@@ -317,6 +344,7 @@ private:
     RigidBodyDynamics::Math::VectorNd m_QReady;
     RigidBodyDynamics::Math::Matrix3d m_EReady;   // base->body FK R at q_ready
     bool m_bReadySet{false};
+    IkDiag m_stIkDiag{eIkNoSeed, -1.0, 0, 0.0, 0.0, 0.0, 0.0, -1};
     std::vector<RigidBodyDynamics::Math::Vector3d> m_vProbeStore;
     int m_nAnchorVerifyIdx{-1};    // -1 = idle; else next probe to verify
     int m_nAnchorVerifyPass{0};
@@ -348,6 +376,10 @@ private:
     // m_EReady. This is the quantity APPROACH_RDEV_MAX_DEG gates on, and the
     // one the E25 polish pass tries to shrink.
     double AttitudeDevDeg(const RigidBodyDynamics::Math::VectorNd& aq);
+    void StampIkDiag(eIkVerdict aeVerdict, double adW, int anSolves,
+                     uint64_t atStart,
+                     const RigidBodyDynamics::Math::VectorNd& aq,
+                     double adPosErrM);
 
     // RBDL model and dynamics
     RigidBodyDynamics::Model m_rbdlModel;

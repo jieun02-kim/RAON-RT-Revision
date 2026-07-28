@@ -24,6 +24,7 @@
 #define __ROS2_PICK_BRIDGE__
 
 #include "Defines.h"
+#include "WorkspaceBox.h"
 
 #include <atomic>
 #include <chrono>
@@ -81,21 +82,15 @@ public:
     void SetZMarginM(double adMargin)   { m_dZMarginM = adMargin; }
     void SetGate(int anSamples, double adStdGateM, double adTimeoutS);
 
-    /* Workspace box for the GOAL (z margin already added). Drawn from the
-     * 2026-07-27 hand-eye calibration; E21 re-base (same evening): the robot
-     * base was shoved (yaw +5.14 deg, t (+4.5, +10.4) cm), so the SAME
-     * physical table region maps to the ranges below (old box corners run
-     * through the fitted transform, AABB, rounded outward). x_max no longer
-     * encodes "reach" — hover reachability is decided per-goal by the
-     * deterministic ready-seed IK (RT refuses infeasible goals cleanly, no
-     * motion); the box only rejects absurd goals (behind the robot / z band;
-     * z_max 0.50 keeps clearance below the camera).
-     * Public: the app derives the ready-seed IK probes from the same box. */
-    static constexpr double DEF_BOX[6]   = {0.30, 0.94, -0.37, 0.63, 0.10, 0.50};
-    // Coarse sanity net only: the old 0.80 was an empirical guess made in
-    // the pre-shift frame and blocked objects the arm demonstrably reaches
-    // (2026-07-27 field) — genuine reach is the IK solver's verdict.
-    static constexpr double DEF_RMAX_XY  = 0.92;   // [m] from base axis
+    /* The measured box and its radius cap now live in WorkspaceBox.h so the
+     * ROS-free consumers (the app's IK probes, the offline reach-map tool)
+     * can read them without rclcpp. The rationale for each number is there;
+     * these names are kept because the app and bridge both spell them this
+     * way. Public: the app derives the ready-seed IK probes from the box. */
+    static constexpr double DEF_BOX[6]   = {kv260::WS_BOX[0], kv260::WS_BOX[1],
+                                            kv260::WS_BOX[2], kv260::WS_BOX[3],
+                                            kv260::WS_BOX[4], kv260::WS_BOX[5]};
+    static constexpr double DEF_RMAX_XY  = kv260::WS_RMAX_XY;   // [m] from base axis
 
 private:
     void SpinLoop();
