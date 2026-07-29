@@ -1019,7 +1019,8 @@ CControllerFullDynamicsRT::AttitudeDevDeg(
 void
 CControllerFullDynamicsRT::StampIkDiag(
     eIkVerdict aeVerdict, double adW, int anSolves, uint64_t atStart,
-    const RigidBodyDynamics::Math::VectorNd& aq, double adPosErrM)
+    const RigidBodyDynamics::Math::VectorNd& aq, double adPosErrM,
+    int anSeed, int anCandidates)
 {
     m_stIkDiag.eVerdict = aeVerdict;
     m_stIkDiag.dW       = adW;
@@ -1028,6 +1029,57 @@ CControllerFullDynamicsRT::StampIkDiag(
     m_stIkDiag.dPosErrM = adPosErrM;
     m_stIkDiag.dTiltDeg = AttitudeDevDeg(aq);
     m_stIkDiag.dBranchGap = ReadyBranchGap(aq, m_stIkDiag.nBranchAxis);
+    m_stIkDiag.nSeed       = anSeed;
+    m_stIkDiag.nCandidates = anCandidates;
+}
+
+// [kv260-merge] Branch seeds — see IK_NUM_SEEDS in the header.
+//
+// Indy7's joint axes at q=0 are Z, Y, Y, Z, Y, Z: J0 is base yaw, J1/J2 are a
+// parallel pair forming a planar arm in the vertical plane, and J3/J4/J5 are
+// the wrist. That gives the three classic branch choices, applied here as
+// discrete transforms of the reference posture:
+//
+//   bit 0  base    J0 += pi with the planar pair mirrored — reach the same
+//                  point from the opposite side of the base
+//   bit 1  elbow   negate the elbow (up <-> down) in the planar pair
+//   bit 2  wrist   J3 += pi, J4 = -J4, J5 += pi — exact for an intersecting
+//                  Z-Y-Z wrist, approximate here (the 183 mm J3-J5 offset)
+//
+// These are START POINTS, not answers. They only have to be closer to the
+// target basin than q_ready is; the solver walks the rest. Index 0 is the
+// identity so the fast path stays bit-identical to the previous solver.
+void
+CControllerFullDynamicsRT::BuildBranchSeeds(
+    const RigidBodyDynamics::Math::VectorNd& aqRef,
+    std::vector<RigidBodyDynamics::Math::VectorNd>& avSeeds) const
+{
+    avSeeds.clear();
+    avSeeds.reserve(IK_NUM_SEEDS);
+    for (int nMask = 0; nMask < IK_NUM_SEEDS; nMask++)
+    {
+        RigidBodyDynamics::Math::VectorNd vq = aqRef;
+        if ((nMask & 1) && m_uDOF > 3)          // base flip
+        {
+            vq[0] += M_PI;
+            vq[1]  = -vq[1];
+            vq[2]  = -vq[2];
+            vq[3]  = -vq[3];
+        }
+        if ((nMask & 2) && m_uDOF > 2)          // elbow up <-> down
+        {
+            const double dElbow = vq[2];
+            vq[2] = -dElbow;
+            vq[1] =  vq[1] + dElbow;            // keep the hand roughly put
+        }
+        if ((nMask & 4) && m_uDOF > 5)          // wrist flip
+        {
+            vq[3] += M_PI;
+            vq[4]  = -vq[4];
+            vq[5] += M_PI;
+        }
+        avSeeds.push_back(vq);
+    }
 }
 
 BOOL
@@ -1036,166 +1088,249 @@ CControllerFullDynamicsRT::SolveReadyIK(
     RigidBodyDynamics::Math::VectorNd& aqSol,
     double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
 {
-    m_stIkDiag = IkDiag{eIkNoSeed, -1.0, 0, 0.0, 0.0, 0.0, 0.0, -1};
+    m_stIkDiag = IkDiag{eIkNoSeed, -1.0, 0, 0.0, 0.0, 0.0, 0.0, -1, -1, 0};
     if (!m_bReadySet) return FALSE;
 
     const uint64_t tIkStart = read_timer();
+    int  nSolves    = 0;
+    bool bReachable = false;      // some solve met the 2 mm test, somewhere
 
-    // E25: walk the orientation weight DOWN a ladder instead of dropping it.
-    // E23 tried IK_ORI_WEIGHT and then jumped straight to 0, so any target the
-    // soft constraint could not satisfy fell through to a pure-position solve
-    // whose attitude is an accident of the descent path. That is not a reach
-    // limit: banana at 0.877 m from the base origin was refused at 87 deg
-    // while the FARTHER mustard at 0.912 m passed at 36 deg. Each rung keeps
-    // as much of the ready attitude as the reach still allows.
-    static const double adLadder[] = { IK_ORI_WEIGHT, 0.1, 0.03, 0.01 };
-    static const int    nLadder    = (int)(sizeof(adLadder) / sizeof(adLadder[0]));
-
-    double dWUsed  = -1.0;
-    int    nSolves = 0;
-    // Warm start: a failed rung stops where the position and attitude
-    // gradients balance. That point is far closer to the next (weaker) rung's
-    // answer than q_ready is, and it was itself reached FROM q_ready, so the
-    // branch — the whole reason q_ready exists — is preserved and the chain
-    // stays deterministic. (This is the surviving half of the 32 ms attack —
-    // capping the Newton budget was the other half and it corrupted the
-    // solutions, see IK_SOLVE_STEPS.)
-    RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
-    int nBranchAxis = -1;
-    for (int i = 0; i < nLadder; i++)
+    // Every candidate is judged by the same gates, in one place: joint limits,
+    // distance from the q_ready branch, and — only where the attitude was
+    // relaxed — the tool tilt cone. (Position is inside SolvePositionIK.) E28
+    // happened because ONE path, polish, skipped the branch gate; a single
+    // gate function is how that stops recurring.
+    struct Cand {
+        RigidBodyDynamics::Math::VectorNd q;
+        double dPosErr, dW, dTilt, dGap;
+        int    nAxis, nSeed;
+    };
+    auto Accept = [&](RigidBodyDynamics::Math::VectorNd& avq, double adW,
+                      double adErr, int anSeed, Cand& astOut) -> bool
     {
-        nSolves++;
-        // A rung passes only if it reaches the point AND stays on the q_ready
-        // branch. Position alone is not enough: the shoulder-flipped solution
-        // hits the same point with the same tool attitude, so neither the 2 mm
-        // test nor the 60 deg gate can see it.
-        if (SolvePositionIK(vqSeed, avTarget, adLadder[i], &m_EReady,
-                            aqSol, adPosErrM, IK_SOLVE_STEPS) &&
-            ReadyBranchGap(aqSol, nBranchAxis) <= IK_DQ_MAX_RAD)
-        { dWUsed = adLadder[i]; break; }
-        vqSeed = aqSol;             // stalled iterate seeds the next rung
-    }
+        if (!CheckLimitsPhysical(avq)) return false;
+        int nAxis = -1;
+        const double dGap = ReadyBranchGap(avq, nAxis);
+        if (dGap > IK_DQ_MAX_RAD) return false;
+        const double dTilt = AttitudeDevDeg(avq);
+        if (adW < (double)IK_ORI_WEIGHT && dTilt > APPROACH_RDEV_MAX_DEG)
+            return false;
+        astOut = Cand{avq, adErr, adW, dTilt, dGap, nAxis, anSeed};
+        return true;
+    };
 
-    if (dWUsed < 0.0)
+    // Position is already satisfied, so a light weight spends only the
+    // nullspace pulling the tool back toward the ready attitude. Goes through
+    // Accept() like everything else (E28), and is kept only if the tilt really
+    // improves.
+    auto Polish = [&](Cand& astC)
     {
-        // Bottom rung: position only, attitude unconstrained. This one has to
-        // answer "is it reachable at all", so it gets the full Newton budget.
-        nSolves++;
-        if (!SolvePositionIK(vqSeed, avTarget, 0.0, NULL, aqSol, adPosErrM))
+        if (astC.dW > 0.0) return;
+        static const double adPolishW[] = { 0.1, 0.03, 0.01 };
+        for (int k = 0; k < 3; k++)
         {
-            StampIkDiag(eIkNoSolution, 0.0, nSolves, tIkStart, aqSol, adPosErrM);
-            DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
-                         "position-only (genuinely out of reach)",
-                         adPosErrM * 1e3);
-            return FALSE;
-        }
-        {
-            const double dGap = ReadyBranchGap(aqSol, nBranchAxis);
-            if (dGap > IK_DQ_MAX_RAD)
-            {
-                StampIkDiag(eIkBranch, 0.0, nSolves, tIkStart, aqSol, adPosErrM);
-                DBG_LOG_WARN("(SolveReadyIK) only reachable on a different arm "
-                             "branch (J%d %.2f rad from q_ready) — refused. "
-                             "Staging cannot close this: it moves the arm TO "
-                             "q_ready, which is where the gap is measured from",
-                             nBranchAxis, dGap);
-                return FALSE;
-            }
-        }
-        dWUsed = 0.0;
-
-        // E25 polish: position is satisfied now, but the attitude is wherever
-        // the descent happened to stop. Re-solve FROM THAT SOLUTION with a
-        // light weight — the point constraint is already met, so the solver
-        // has only the nullspace left and spends it pulling the tool back
-        // toward the ready attitude. The strongest weight that still holds
-        // position wins; the unpolished solution is kept if none does, or if
-        // the polish does not actually improve the deviation.
-        double dDevBest = AttitudeDevDeg(aqSol);
-        for (int k = 1; k < nLadder; k++)
-        {
-            RigidBodyDynamics::Math::VectorNd vqPol = aqSol;
-            double dErrPol = 0.0;
             nSolves++;
-            if (!SolvePositionIK(aqSol, avTarget, adLadder[k], &m_EReady,
-                                 vqPol, dErrPol, IK_SOLVE_STEPS))
-                continue;                   // this weight loses the position
-            // E28 (2026-07-28, found by the offline reach map): polish runs
-            // AFTER the branch check above, and it is selected on attitude
-            // alone — so it could hand back a solution on the far branch and
-            // nothing downstream would notice. It is exactly the case E27
-            // exists to stop, and a flipped posture often has the BETTER
-            // attitude, so polish actively prefers it. Field-scale example:
-            // target (0.828, 0.234, 0.300) passed the bottom-rung check, then
-            // polish moved it to a J2 gap of 2.96 rad and it was accepted.
-            // Re-check and keep the unpolished (in-branch) solution instead.
-            int nPolAxis = -1;
-            const double dPolGap = ReadyBranchGap(vqPol, nPolAxis);
-            if (dPolGap > IK_DQ_MAX_RAD)
-            {
-                DBG_LOG_WARN("(SolveReadyIK) polish w=%.2f would flip the arm "
-                             "branch (J%d %.2f rad from q_ready) — polish "
-                             "dropped, keeping the in-branch solution",
-                             adLadder[k], nPolAxis, dPolGap);
-                break;
-            }
-            const double dDevPol = AttitudeDevDeg(vqPol);
-            if (dDevPol < dDevBest)
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            Cand   stP;
+            if (!SolvePositionIK(astC.q, avTarget, adPolishW[k], &m_EReady,
+                                 vq, dErr, IK_SOLVE_STEPS))
+                continue;                   // this weight loses the point
+            if (Accept(vq, adPolishW[k], dErr, astC.nSeed, stP) &&
+                stP.dTilt < astC.dTilt)
             {
                 DBG_LOG_INFO("(SolveReadyIK) polish w=%.2f pulled the tool "
-                             "%.0f -> %.0f deg (pos %.1f mm)",
-                             adLadder[k], dDevBest, dDevPol, dErrPol * 1e3);
-                aqSol     = vqPol;
-                adPosErrM = dErrPol;
-                dDevBest  = dDevPol;
+                             "%.0f -> %.0f deg", adPolishW[k], astC.dTilt,
+                             stP.dTilt);
+                astC = stP;
             }
             break;      // first weight that holds position is the strongest
         }
+    };
+
+    // Express the answer in the LIVE counter frame so the commanded travel is
+    // the true physical delta (never extra turns), and report the largest
+    // travel for the caller's direct-vs-stage decision.
+    auto Finish = [&](RigidBodyDynamics::Math::VectorNd& avq)
+    {
+        FoldTowardRef(avq, m_Q, m_uDOF);
+        adDqMaxFromCur = 0.0;
+        anDqAxis       = -1;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(avq[i] - m_Q[i]);
+            if (dDq > adDqMaxFromCur) { adDqMaxFromCur = dDq; anDqAxis = (int)i; }
+        }
+    };
+
+    Cand stBest;
+    bool bHave = false;
+
+    // ---- Stage 1: the q_ready ladder — unchanged from the previous solver ---
+    // Runs FIRST and in full, because it is not just a fallback: the ladder
+    // walks the attitude down gradually and the warm start carries that into
+    // the w=0 rung, which is where the good attitudes come from. Solving w=0
+    // straight from q_ready instead — the first version of this branch did —
+    // still reached the targets but left the tool at 53-57 deg where the
+    // ladder gives 3. So Stage 1 stays whole, and multi-start below is what
+    // happens only when it comes back with nothing.
+    {
+        static const double adLadder[] = { IK_ORI_WEIGHT, 0.1, 0.03, 0.01 };
+        RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
+        for (int i = 0; i < 4 && !bHave; i++)
+        {
+            nSolves++;
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            const bool bHit = SolvePositionIK(vqSeed, avTarget, adLadder[i],
+                                              &m_EReady, vq, dErr,
+                                              IK_SOLVE_STEPS);
+            if (bHit) bReachable = true;
+            if (bHit && Accept(vq, adLadder[i], dErr, 0, stBest)) bHave = true;
+            else vqSeed = vq;               // stalled iterate seeds the next
+        }
+        if (!bHave)
+        {
+            nSolves++;
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            if (SolvePositionIK(vqSeed, avTarget, 0.0, NULL, vq, dErr,
+                                IK_SOLVE_STEPS))
+            {
+                bReachable = true;
+                if (Accept(vq, 0.0, dErr, 0, stBest)) { Polish(stBest); bHave = true; }
+            }
+        }
     }
 
-    // The solves all run inside the 1 kHz control cycle. Measure rather than
-    // guess: if this ever exceeds the budget the ladder has to be amortized
-    // one rung per cycle, the way the anchor coverage check already is.
-    const double dIkMs = (double)(read_timer() - tIkStart) / 1.0e6;
-    if (dIkMs > 0.8)
-        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms (settled at "
-                     "w=%.2f) — over the 1 kHz cycle budget, amortize the "
-                     "ladder", nSolves, dIkMs, dWUsed);
-    else
-        DBG_LOG_INFO("(SolveReadyIK) ladder settled at w=%.2f after %d solve(s), "
-                     "%.2f ms", dWUsed, nSolves, dIkMs);
-
-    if (!CheckLimitsPhysical(aqSol))    // validity on the PHYSICAL posture
+    // ---- Stage 1b: position-only, straight from q_ready ---------------------
+    // The warm start that makes Stage 1's attitudes good also drags the w=0
+    // rung along the chain, and on the E27 targets that chain ends in the
+    // flipped basin (gap 2.9 rad). Solving w=0 from q_ready UNWARMED lands in
+    // the near branch instead (gap 0.87) — a worse attitude, ~55 deg against
+    // 3, but inside the cone and on the right branch, so it is a real answer
+    // where Stage 1 had none. One solve, so it is tried before the seed fan-out.
+    if (!bHave)
     {
-        StampIkDiag(eIkLimits, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
-        DBG_LOG_WARN("(SolveReadyIK) solution violates joint limits — refused");
+        nSolves++;
+        RigidBodyDynamics::Math::VectorNd vq;
+        double dErr = 0.0;
+        if (SolvePositionIK(m_QReady, avTarget, 0.0, NULL, vq, dErr,
+                            IK_SOLVE_STEPS))
+        {
+            bReachable = true;
+            if (Accept(vq, 0.0, dErr, 0, stBest)) { Polish(stBest); bHave = true; }
+        }
+    }
+
+    // ---- Stage 2: multi-start ----------------------------------------------
+    // Stage 1 reached the point but could not use the answer — off the
+    // q_ready branch, or past the tilt cone. Relaxing the weight further
+    // cannot fix that, because the basin is what is wrong and the weight does
+    // not change basins. Re-solve from seeds planted in the OTHER branches and
+    // see whether one of them descends into a usable near-branch solution.
+    // These seeds are not there to USE a far branch — Accept() still refuses
+    // those — they are there to find a near one the first descent missed.
+    if (!bHave)
+    {
+        std::vector<RigidBodyDynamics::Math::VectorNd> vSeeds;
+        BuildBranchSeeds(m_QReady, vSeeds);
+        std::vector<Cand> vCands;
+        static const double adRoundW[] = { IK_ORI_WEIGHT, 0.0 };
+
+        for (int r = 0; r < 2 && vCands.empty(); r++)
+        {
+            const double dW = adRoundW[r];
+            for (size_t s = 1; s < vSeeds.size(); s++)   // 0 was Stage 1
+            {
+                nSolves++;
+                RigidBodyDynamics::Math::VectorNd vq;
+                double dErr = 0.0;
+                Cand   stC;
+                const bool bHit = SolvePositionIK(vSeeds[s], avTarget, dW,
+                                                  (dW > 0.0) ? &m_EReady : NULL,
+                                                  vq, dErr, IK_SEED_STEPS);
+                if (bHit) bReachable = true;
+                if (bHit && Accept(vq, dW, dErr, (int)s, stC))
+                    vCands.push_back(stC);
+            }
+        }
+
+        if (!vCands.empty())
+        {
+            // A TOTAL order, so the answer never depends on an iteration
+            // accident: stay on the q_ready branch first, then keep the tool
+            // attitude, then land accurately, and break exact ties by seed
+            // index (the seed list is fixed, so the call is reproducible).
+            size_t nBest = 0;
+            for (size_t i = 1; i < vCands.size(); i++)
+            {
+                const Cand& a = vCands[i];
+                const Cand& b = vCands[nBest];
+                bool bBetter;
+                if      (a.dGap    < b.dGap    - 1e-9)  bBetter = true;
+                else if (a.dGap    > b.dGap    + 1e-9)  bBetter = false;
+                else if (a.dTilt   < b.dTilt   - 1e-9)  bBetter = true;
+                else if (a.dTilt   > b.dTilt   + 1e-9)  bBetter = false;
+                else if (a.dPosErr < b.dPosErr - 1e-12) bBetter = true;
+                else if (a.dPosErr > b.dPosErr + 1e-12) bBetter = false;
+                else                                    bBetter = (a.nSeed < b.nSeed);
+                if (bBetter) nBest = i;
+            }
+            stBest = vCands[nBest];
+            Polish(stBest);
+            bHave  = true;
+            m_stIkDiag.nCandidates = (int)vCands.size();
+            DBG_LOG_INFO("(SolveReadyIK) multi-start rescued this target: "
+                         "%d candidate(s), seed %d wins", (int)vCands.size(),
+                         stBest.nSeed);
+        }
+    }
+
+    if (!bHave)
+    {
+        // Report the distinction the operator can act on: out of reach, versus
+        // reached but only by flipping the arm or tipping the tool over.
+        RigidBodyDynamics::Math::VectorNd vq;
+        double dErr = 0.0;
+        nSolves++;
+        const bool bHit = SolvePositionIK(m_QReady, avTarget, 0.0, NULL, vq,
+                                          dErr, IK_SOLVE_STEPS);
+        int nAxis = -1;
+        const double dGap  = ReadyBranchGap(vq, nAxis);
+        const double dTilt = AttitudeDevDeg(vq);
+        const eIkVerdict e = (!bHit && !bReachable) ? eIkNoSolution
+                           : (dGap > IK_DQ_MAX_RAD) ? eIkBranch : eIkTilt;
+        StampIkDiag(e, -1.0, nSolves, tIkStart, vq, dErr, -1, 0);
+        if (e == eIkNoSolution)
+            DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
+                         "position-only (genuinely out of reach)", dErr * 1e3);
+        else if (e == eIkBranch)
+            DBG_LOG_WARN("(SolveReadyIK) reachable only on a different arm "
+                         "branch (J%d %.2f rad from q_ready) and none of the "
+                         "%d seeds found a near-branch solution — refused",
+                         nAxis, dGap, IK_NUM_SEEDS);
+        else
+            DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool tilt "
+                         "(%.0f deg > %.0f) — refused; move the object closer",
+                         dTilt, APPROACH_RDEV_MAX_DEG);
         return FALSE;
     }
-    if (dWUsed < (double)IK_ORI_WEIGHT)     // any rung below nominal is relaxed
-    {
-        const double dDevDeg = AttitudeDevDeg(aqSol);
-        if (dDevDeg > APPROACH_RDEV_MAX_DEG)
-        {
-            StampIkDiag(eIkTilt, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
-            DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool "
-                         "tilt (%.0f deg > %.0f) — refused; move the object "
-                         "closer", dDevDeg, APPROACH_RDEV_MAX_DEG);
-            return FALSE;
-        }
-        DBG_LOG_INFO("(SolveReadyIK) far-reach: w relaxed to %.2f, tool tilts "
-                     "%.0f deg from the ready attitude", dWUsed, dDevDeg);
-    }
-    StampIkDiag(eIkPass, dWUsed, nSolves, tIkStart, aqSol, adPosErrM);
-    // Execution frame: fold to the lap nearest the LIVE counters so the
-    // commanded travel is the true physical delta (never extra turns).
-    FoldTowardRef(aqSol, m_Q, m_uDOF);
-    adDqMaxFromCur = 0.0;
-    anDqAxis      = -1;
-    for (unsigned int i = 0; i < m_uDOF; i++)
-    {
-        const double dDq = std::fabs(aqSol[i] - m_Q[i]);
-        if (dDq > adDqMaxFromCur) { adDqMaxFromCur = dDq; anDqAxis = (int)i; }
-    }
+
+    const int nCands = (m_stIkDiag.nCandidates > 0) ? m_stIkDiag.nCandidates : 1;
+    aqSol     = stBest.q;
+    adPosErrM = stBest.dPosErr;
+    StampIkDiag(eIkPass, stBest.dW, nSolves, tIkStart, aqSol, adPosErrM,
+                stBest.nSeed, nCands);
+    DBG_LOG_INFO("(SolveReadyIK) w=%.2f, seed %d, %d solve(s), gap %.2f rad "
+                 "on J%d, tilt %.0f deg, %.1f mm, %.2f ms",
+                 stBest.dW, stBest.nSeed, nSolves, stBest.dGap, stBest.nAxis,
+                 stBest.dTilt, stBest.dPosErr * 1e3, m_stIkDiag.dMs);
+    if (m_stIkDiag.dMs > 0.8)
+        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms — over the "
+                     "1 kHz cycle budget", nSolves, m_stIkDiag.dMs);
+
+    Finish(aqSol);
     return TRUE;
 }
 

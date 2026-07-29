@@ -214,9 +214,24 @@ CROS2PickBridge::ReadySeedPath()
     static char s_acPath[512] = {0};
     if (s_acPath[0] == '\0')
     {
-        const char* pcHome = getenv("HOME");
-        snprintf(s_acPath, sizeof(s_acPath), "%s/.indy7_ready_seed",
-                 (pcHome != NULL) ? pcHome : "/tmp");
+        // [kv260-merge] $INDY7_READY_SEED overrides the location so two builds
+        // can run on one machine without fighting over the anchor. Recording
+        // HOME WRITES this file, so an experimental build sharing the path
+        // would silently destroy the baseline's anchor the first time the
+        // operator records a posture. Default is unchanged.
+        const char* pcEnv = getenv("INDY7_READY_SEED");
+        if (pcEnv != NULL && pcEnv[0] != '\0')
+        {
+            snprintf(s_acPath, sizeof(s_acPath), "%s", pcEnv);
+            printf("[PickBridge] ready-seed path from $INDY7_READY_SEED: %s\n",
+                   s_acPath);
+        }
+        else
+        {
+            const char* pcHome = getenv("HOME");
+            snprintf(s_acPath, sizeof(s_acPath), "%s/.indy7_ready_seed",
+                     (pcHome != NULL) ? pcHome : "/tmp");
+        }
     }
     return s_acPath;
 }
