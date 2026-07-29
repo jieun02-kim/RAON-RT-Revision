@@ -141,8 +141,8 @@ def plot_one(rec, idx, out_png):
         span = GOOD_MM
     lim = max(span * 1.6, REFINE_TOL_MM * 1.3)
 
-    fig = plt.figure(figsize=(12.0, 6.4))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.35, 1.0],
+    fig = plt.figure(figsize=(13.6, 6.4))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.30, 0.42, 1.0],
                           height_ratios=[1.0, 1.0])
     fig.suptitle("Approach #%d  —  %s  |  miss %.1f mm"
                  % (idx, rec["cls"], rec["err_mm"]),
@@ -188,8 +188,43 @@ def plot_one(rec, idx, out_png):
     ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85,
               bbox_to_anchor=(-0.06, 1.0))
 
+    # -------------------------------------------- true-scale side elevation
+    # The object cannot go in the 3-D panel: it is 150 mm below the target and
+    # that panel is zoomed to ~15 mm, so it would either fall off the box or
+    # force a 10x zoom-out that hides the millimetres. This narrow panel is
+    # drawn at TRUE scale instead (equal aspect), which makes the honest point
+    # by itself -- next to the hover height the miss is a hair.
+    ax = fig.add_subplot(gs[:, 1])
+    hov = rec["zmargin"] * 1e3                      # [mm]
+    hmiss = math.hypot(err[0], err[1])              # horizontal miss [mm]
+    xr = max(22.0, hmiss * 2.6)
+
+    ax.plot([0, 0], [0, hov], "--", color="#bbbbbb", lw=1.0, zorder=1)
+    ax.annotate("", xy=(0, hov), xytext=(0, 0), zorder=2,
+                arrowprops=dict(arrowstyle="<->", color="#888888", lw=1.0))
+    ax.annotate("%.0f mm\nhover" % hov, (0, hov * 0.5), fontsize=8,
+                color="#666666", ha="left", va="center",
+                textcoords="offset points", xytext=(5, 0))
+
+    # object: a squat marker on the table line, drawn where the camera put it
+    ax.axhline(0, color="#cccccc", lw=1.0, zorder=0)
+    ax.plot(0, 0, marker="s", ms=11, color="#8c6d4f", zorder=4)
+    ax.annotate("object", (0, 0), fontsize=8, color="#8c6d4f", ha="center",
+                va="top", textcoords="offset points", xytext=(0, -10))
+    ax.plot(0, hov, marker="+", ms=13, mew=2.2, color="k", zorder=5)
+    ax.plot(hmiss, hov + err[2], "o", ms=9, color=col, zorder=6)
+
+    ax.set_xlim(-xr, xr)
+    ax.set_ylim(-0.16 * hov, hov * 1.30)
+    ax.set_aspect("equal")
+    ax.set_xlabel("horizontal\nmiss [mm]", fontsize=8)
+    ax.set_ylabel("height above object [mm]", fontsize=8)
+    ax.set_title("true scale\n(+ = target, dot = reached)", fontsize=9)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.15)
+
     # ------------------------------------------------------- per-axis bars
-    ax = fig.add_subplot(gs[0, 1])
+    ax = fig.add_subplot(gs[0, 2])
     x = np.arange(4)
     vals = [err[0], err[1], err[2], rec["err_mm"]]
     ax.bar(x, vals, 0.55, color=col)
@@ -208,7 +243,7 @@ def plot_one(rec, idx, out_png):
     ax.grid(axis="y", alpha=0.15)
 
     # ------------------------------------------------------------- numbers
-    ax = fig.add_subplot(gs[1, 1])
+    ax = fig.add_subplot(gs[1, 2])
     ax.axis("off")
     obj = rec["goal"].copy()
     obj[2] -= rec["zmargin"]           # what the camera actually saw
