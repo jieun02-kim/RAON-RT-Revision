@@ -177,8 +177,14 @@ def plot_one(rec, idx, out_png):
     ax.set_zlabel("\u0394Z [mm]", fontsize=9, labelpad=1)
     ax.tick_params(labelsize=7.5)
     ax.view_init(elev=20, azim=-58)
-    ax.set_title("target (+) vs reached  —  origin IS the target",
-                 fontsize=10, pad=0)
+    # Spell out that the origin is the HOVER point. Field feedback 2026-07-29:
+    # with "target" alone the reader expects the reached dot to sit ~150 mm
+    # high, because that is what the arm visibly does above the object. The
+    # margin is already inside the commanded goal, so it is NOT an error and
+    # must not look like one.
+    ax.set_title("target (+) vs reached  —  origin = HOVER point\n"
+                 "(%.0f mm above the object; the margin is already in the goal)"
+                 % (rec["zmargin"] * 1e3), fontsize=9.5, pad=0)
     ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85,
               bbox_to_anchor=(-0.06, 1.0))
 
@@ -204,10 +210,17 @@ def plot_one(rec, idx, out_png):
     # ------------------------------------------------------------- numbers
     ax = fig.add_subplot(gs[1, 1])
     ax.axis("off")
+    obj = rec["goal"].copy()
+    obj[2] -= rec["zmargin"]           # what the camera actually saw
     txt = [
         ("time",          rec["when"].replace("T", "  ")),
-        ("target  [m]",   "%.4f, %.4f, %.4f" % tuple(rec["goal"])),
+        ("object  [m]",   "%.4f, %.4f, %.4f" % tuple(obj)),
+        ("target  [m]",   "%.4f, %.4f, %.4f   (= object z +%.0f mm)"
+                          % (rec["goal"][0], rec["goal"][1], rec["goal"][2],
+                             rec["zmargin"] * 1e3)),
         ("reached [m]",   "%.4f, %.4f, %.4f" % tuple(rec["tcp"])),
+        ("",              "\u2192 %.0f mm above the object"
+                          % ((rec["tcp"][2] - obj[2]) * 1e3)),
         ("miss    [mm]",  "%.1f    (%+.1f, %+.1f, %+.1f)"
                           % (rec["err_mm"], err[0], err[1], err[2])),
         ("refine",        "%d pass(es)" % rec["refine"]),
@@ -220,8 +233,9 @@ def plot_one(rec, idx, out_png):
     for k, v in txt:
         ax.text(0.00, y, k, fontsize=8.5, va="top", color="#555555",
                 family="monospace")
-        ax.text(0.34, y, v, fontsize=8.5, va="top", family="monospace")
-        y -= 0.128
+        ax.text(0.30, y, v, fontsize=8.5, va="top", family="monospace",
+                color="#1a6faf" if k == "" else "black")
+        y -= 0.107
     ax.text(0.00, y - 0.03,
             "NOTE: miss = TCP vs COMMANDED target.\n"
             "Camera-to-base calibration bias is NOT in it.",
