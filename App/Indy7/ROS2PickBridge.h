@@ -52,6 +52,31 @@ public:
         int    nSamples;
     };
 
+    // [kv260-merge] Per-approach accuracy record (2026-07-29). One row per
+    // completed approach: what we ASKED for vs where the TCP actually ended
+    // up, plus the pre-refine position so the plot can show what refinement
+    // bought. Plain data on purpose — the RT producer must not touch
+    // std::string, FILE or the clock; the worker thread stamps the time and
+    // does the IO, exactly like the ready-seed mailbox below.
+    struct ApproachReport
+    {
+        char   szClass[32];
+        double dGoal[3];        // commanded base_link target [m] (incl. Z margin)
+        double dTcp[3];         // FK TCP once refinement settled [m]
+        double dTcpFirst[3];    // FK TCP after the FIRST trajectory (NaN = none)
+        double dStdMM[3];       // per-axis vision std at the 'v' gate
+        int    nSamples;        // frames behind that std
+        int    nRefineIter;     // refinement passes actually run
+        double dZMarginM;       // hover margin baked into dGoal[2]
+        double dTiltDeg;        // IK diag: tool attitude vs q_ready
+        double dGapRad;         //          branch distance from q_ready
+        double dIkMs;           //          solve wall time
+        double dIkPosErrM;      //          solver's own residual
+        int    nSeed;           //          winning seed (0 = q_ready)
+        int    nSolves;         //          RBDL calls
+        int    nGapAxis;        //          joint carrying dGapRad
+    };
+
     CROS2PickBridge();
     ~CROS2PickBridge();
 
@@ -76,10 +101,15 @@ public:
     void PersistReadySeed(const double* aqRad, int anDof);
     static const char* ReadySeedPath();   // $HOME/.indy7_ready_seed
 
+    // [RT] hand one finished approach to the worker thread (wait-free).
+    void LogApproach(const ApproachReport& astRep);
+    static const char* ApproachLogPath();  // approach_results/approach_log.csv
+
     /* ---- non-RT configuration (call before OP; defaults below) ---- */
     void SetWorkspaceBox(double adXMin, double adXMax, double adYMin,
                          double adYMax, double adZMin, double adZMax);
     void SetZMarginM(double adMargin)   { m_dZMarginM = adMargin; }
+    double GetZMarginM() const          { return m_dZMarginM; }
     void SetGate(int anSamples, double adStdGateM, double adTimeoutS);
 
     /* The measured box and its radius cap now live in WorkspaceBox.h so the
@@ -103,11 +133,17 @@ private:
     void TickCollect();
     void TickLockWatch();
     void TickSeedPersist();
+    void TickApproachLog();
     BOOL SetDesiredClass(const std::string& astrClass);
 
     // seed-persist mailbox (single producer = RT, single consumer = worker)
     double           m_adSeedMail[8] = {0};
     std::atomic<int> m_nSeedMailN{0};
+
+    // approach-report mailbox (same SPSC contract; approaches are seconds
+    // apart and the worker ticks at 50 ms, so one slot is plenty)
+    ApproachReport    m_stRepMail{};
+    std::atomic<bool> m_bRepReady{false};
 
     static constexpr double DEF_ZMARGIN  = 0.15;   // [m] hover above the object
     static constexpr int    DEF_SAMPLES  = 15;     // ≈1 s @15 Hz

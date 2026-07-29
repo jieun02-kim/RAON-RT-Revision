@@ -160,6 +160,16 @@ private:
 	BOOL TryReadyApproach(const CROS2PickBridge::Goal& astGoal, BOOL abAllowStage);
 	CROS2PickBridge::Goal  m_stStagedGoal{};
 	int                    m_nStageSettleCnt{0};
+
+	// [kv260-merge] Approach accuracy record (2026-07-29). The goal in flight
+	// (class + vision std travel with it, so the plot can tell a perception
+	// error from a control error) and the FK TCP measured after the FIRST
+	// trajectory — i.e. BEFORE refinement — so the report shows what the CTC
+	// droop was and how much refine actually recovered.
+	CROS2PickBridge::Goal  m_stActiveGoal{};
+	RigidBodyDynamics::Math::Vector3d m_vFirstTcp;
+	bool                   m_bFirstTcpSet{false};
+	void EmitApproachReport();
 	static constexpr double STAGE_VEL_EPS    = 0.05;  // [rad/s] Σ|qd| gate
 	static constexpr int    STAGE_SETTLE_CYC = 200;   // 0.2 s below eps
 

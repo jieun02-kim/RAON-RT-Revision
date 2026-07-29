@@ -9,6 +9,8 @@
 #include "CalibCapture.h"
 #include <unistd.h>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <sys/stat.h>
 
 CalibCapture s_calibCapture("/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260");
@@ -898,6 +900,54 @@ CRobotIndy7::StartRefine(const CControllerFullDynamicsRT::Pose& astDesired)
     m_bRefineActive = true;
 }
 
+// [kv260-merge] Hand one finished approach to the bridge for logging+plotting.
+// [RT] — fills a wait-free mailbox and returns; the worker thread does the IO.
+// Called exactly once per approach, at the eAPPROACH_MOVING → IDLE edge.
+void
+CRobotIndy7::EmitApproachReport()
+{
+    if (m_pPickBridge == nullptr || m_pController == nullptr)
+        return;
+
+    // strncpy, not snprintf: this runs on the 1 kHz thread and the printf
+    // family is a poor neighbour there (locale, potential allocation).
+    CROS2PickBridge::ApproachReport stRep{};
+    const char* pcCls = (m_stActiveGoal.szClass[0] != '\0')
+                            ? m_stActiveGoal.szClass : "unknown";
+    strncpy(stRep.szClass, pcCls, sizeof(stRep.szClass) - 1);
+    stRep.szClass[sizeof(stRep.szClass) - 1] = '\0';
+
+    // The commanded target is m_vRefineDesired, not the raw goal: both the
+    // direct and the staged leg set it from the goal, and it is what every
+    // refinement pass was measured against. Using it keeps the CSV honest if
+    // those paths ever diverge.
+    const RigidBodyDynamics::Math::Vector3d& vTcp =
+        m_pController->GetTcpPose().m_position;
+    for (int i = 0; i < 3; i++)
+    {
+        stRep.dGoal[i] = m_vRefineDesired[i];
+        stRep.dTcp[i]  = vTcp[i];
+        stRep.dTcpFirst[i] = m_bFirstTcpSet
+                                 ? m_vFirstTcp[i]
+                                 : std::numeric_limits<double>::quiet_NaN();
+        stRep.dStdMM[i] = m_stActiveGoal.dStdMM[i];
+    }
+    stRep.nSamples    = m_stActiveGoal.nSamples;
+    stRep.nRefineIter = m_nRefineIter;
+    stRep.dZMarginM   = m_pPickBridge->GetZMarginM();
+
+    const CControllerFullDynamicsRT::IkDiag& stD = m_pController->GetLastIkDiag();
+    stRep.dTiltDeg    = stD.dTiltDeg;
+    stRep.dGapRad     = stD.dBranchGap;
+    stRep.dIkMs       = stD.dMs;
+    stRep.dIkPosErrM  = stD.dPosErrM;
+    stRep.nSeed       = stD.nSeed;
+    stRep.nSolves     = stD.nSolves;
+    stRep.nGapAxis    = stD.nBranchAxis;
+
+    m_pPickBridge->LogApproach(stRep);
+}
+
 // [kv260-merge] One ready-seed approach attempt (rationale in the header).
 // Called from the main-control SM only. Returns TRUE when a motion started
 // (direct goal leg or the staging leg); FALSE means nothing moved.
@@ -906,6 +956,12 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
                               BOOL abAllowStage)
 {
     CControllerFullDynamicsRT* pC = m_pController;
+
+    // Accuracy report bookkeeping: remember what this attempt was asked to
+    // reach. Harmless on the paths that refuse below — nothing is emitted
+    // unless a motion actually completes.
+    m_stActiveGoal = astGoal;
+    m_bFirstTcpSet = false;
 
     CControllerFullDynamicsRT::Pose stTarget;
     pC->GetCurrentPose(stTarget);            // R rides along for refine/logs
@@ -1244,9 +1300,15 @@ void proc_main_control(void* apRobot)
                 if (pRTController->IsTrajectoryRefDone() && !pRobot->m_bRefineActive)
                 {
                     pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    // Refinement's last act was ComputeTcpFK() and the arm has
+                    // been stationary since, but the trajectory-done path can
+                    // also get here without refine ever measuring — refresh so
+                    // the logged TCP is never a stale pose.
+                    pRTController->ComputeTcpFK();
                     const auto& tcp = pRTController->GetTcpPose();
                     DBG_LOG_INFO("[APPROACH] done — holding at (%.3f, %.3f, %.3f); 'g'=grav-comp",
                                  tcp.m_position[0], tcp.m_position[1], tcp.m_position[2]);
+                    pRobot->EmitApproachReport();
                 }
             }
             else if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_STAGING)
@@ -1319,6 +1381,8 @@ void proc_main_control(void* apRobot)
                     else
                     {
                     // legacy live-posture seeding (ready seed unavailable)
+                    pRobot->m_stActiveGoal = stGoal;   // accuracy report
+                    pRobot->m_bFirstTcpSet = false;
                     pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
                     pRobot->m_pController->GetCurrentPose(pRobot->m_Pose);
                     CControllerFullDynamicsRT::Pose stTarget = pRobot->m_Pose;  // keep current R
@@ -1381,6 +1445,15 @@ void proc_main_control(void* apRobot)
             {
                 pRobot->m_nRefineSettleCnt = 0;
                 pRTController->ComputeTcpFK();
+                // First settle of this approach = the raw CTC result, before
+                // any refinement bias. The accuracy plot shows it next to the
+                // final position, which is the only way to see whether refine
+                // is earning its passes.
+                if (!pRobot->m_bFirstTcpSet)
+                {
+                    pRobot->m_vFirstTcp   = pRTController->GetTcpPose().m_position;
+                    pRobot->m_bFirstTcpSet = true;
+                }
                 const RigidBodyDynamics::Math::Vector3d vErr =
                     pRobot->m_vRefineDesired - pRTController->GetTcpPose().m_position;
                 const double dErrMM = vErr.norm() * 1e3;

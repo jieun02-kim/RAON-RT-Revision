@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <sys/stat.h>
 
 using namespace std::chrono_literals;
 
@@ -203,6 +205,7 @@ CROS2PickBridge::WorkerLoop()
         TickCollect();
         TickLockWatch();
         TickSeedPersist();
+        TickApproachLog();
     }
 }
 
@@ -265,6 +268,117 @@ CROS2PickBridge::TickSeedPersist()
     fclose(pFile);
     printf("[PickBridge] operator seed persisted → %s (next boot anchors here)\n",
            ReadySeedPath());
+}
+
+/* ------------------------------------------------- approach accuracy log -- */
+
+const char*
+CROS2PickBridge::ApproachLogPath()
+{
+    static char s_acPath[512] = {0};
+    if (s_acPath[0] == '\0')
+    {
+        const char* pcEnv = getenv("INDY7_APPROACH_LOG");
+        if (pcEnv != NULL && pcEnv[0] != '\0')
+        {
+            snprintf(s_acPath, sizeof(s_acPath), "%s", pcEnv);
+        }
+        else
+        {
+            // run.sh cd's into App/Indy7, so this lands beside rt_log_results.
+            mkdir("approach_results", 0775);   // EEXIST is the normal case
+            snprintf(s_acPath, sizeof(s_acPath),
+                     "approach_results/approach_log.csv");
+        }
+    }
+    return s_acPath;
+}
+
+void
+CROS2PickBridge::LogApproach(const ApproachReport& astRep)
+{
+    // Dropping a report is strictly better than blocking the 1 kHz loop: the
+    // previous one is still being written and the operator gets a warning.
+    if (m_bRepReady.load(std::memory_order_acquire))
+        return;
+    m_stRepMail = astRep;
+    m_bRepReady.store(true, std::memory_order_release);
+}
+
+void
+CROS2PickBridge::TickApproachLog()
+{
+    if (!m_bRepReady.load(std::memory_order_acquire))
+        return;
+    const ApproachReport stR = m_stRepMail;   // copy before releasing the slot
+    m_bRepReady.store(false, std::memory_order_release);
+
+    const char* pcPath = ApproachLogPath();
+    // Header only on a fresh file — the log accumulates across app runs so the
+    // history plot spans sessions.
+    bool bNew = true;
+    {
+        FILE* pProbe = fopen(pcPath, "r");
+        if (pProbe != NULL)
+        {
+            bNew = (fgetc(pProbe) == EOF);
+            fclose(pProbe);
+        }
+    }
+
+    FILE* pFile = fopen(pcPath, "a");
+    if (pFile == NULL)
+    {
+        printf("[PickBridge] WARN: cannot append %s\n", pcPath);
+        return;
+    }
+    if (bNew)
+        fprintf(pFile,
+                "iso_time,unix_s,class,"
+                "goal_x,goal_y,goal_z,tcp_x,tcp_y,tcp_z,first_x,first_y,first_z,"
+                "err_x_mm,err_y_mm,err_z_mm,err_mm,first_err_mm,"
+                "refine_iter,z_margin_m,"
+                "vis_std_x_mm,vis_std_y_mm,vis_std_z_mm,vis_n,"
+                "ik_seed,ik_solves,ik_ms,ik_tilt_deg,ik_gap_rad,ik_gap_axis,"
+                "ik_pos_err_mm\n");
+
+    const double dEx = (stR.dTcp[0] - stR.dGoal[0]) * 1e3;
+    const double dEy = (stR.dTcp[1] - stR.dGoal[1]) * 1e3;
+    const double dEz = (stR.dTcp[2] - stR.dGoal[2]) * 1e3;
+    const double dErrMM = sqrt(dEx * dEx + dEy * dEy + dEz * dEz);
+    const double dFx = (stR.dTcpFirst[0] - stR.dGoal[0]) * 1e3;
+    const double dFy = (stR.dTcpFirst[1] - stR.dGoal[1]) * 1e3;
+    const double dFz = (stR.dTcpFirst[2] - stR.dGoal[2]) * 1e3;
+    const double dFirstMM = sqrt(dFx * dFx + dFy * dFy + dFz * dFz);
+
+    const time_t tNow = time(NULL);
+    struct tm stTm;
+    localtime_r(&tNow, &stTm);
+    char acWhen[32];
+    strftime(acWhen, sizeof(acWhen), "%Y-%m-%dT%H:%M:%S", &stTm);
+
+    fprintf(pFile,
+            "%s,%ld,%s,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.2f,%.2f,%.2f,%.2f,%.2f,"
+            "%d,%.3f,"
+            "%.2f,%.2f,%.2f,%d,"
+            "%d,%d,%.3f,%.2f,%.4f,%d,"
+            "%.2f\n",
+            acWhen, (long)tNow, stR.szClass,
+            stR.dGoal[0], stR.dGoal[1], stR.dGoal[2],
+            stR.dTcp[0],  stR.dTcp[1],  stR.dTcp[2],
+            stR.dTcpFirst[0], stR.dTcpFirst[1], stR.dTcpFirst[2],
+            dEx, dEy, dEz, dErrMM, dFirstMM,
+            stR.nRefineIter, stR.dZMarginM,
+            stR.dStdMM[0], stR.dStdMM[1], stR.dStdMM[2], stR.nSamples,
+            stR.nSeed, stR.nSolves, stR.dIkMs, stR.dTiltDeg, stR.dGapRad,
+            stR.nGapAxis, stR.dIkPosErrM * 1e3);
+    fclose(pFile);
+
+    printf("[PickBridge] approach logged → %s  (%s: |err| %.1f mm, "
+           "dx/dy/dz %.1f/%.1f/%.1f mm, refine %d)\n",
+           pcPath, stR.szClass, dErrMM, dEx, dEy, dEz, stR.nRefineIter);
 }
 
 /* ----------------------------------------------------------- callbacks -- */
