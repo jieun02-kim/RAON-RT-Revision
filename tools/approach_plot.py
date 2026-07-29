@@ -6,9 +6,15 @@ Reads the CSV the app appends one row per completed approach
 (App/Indy7/approach_results/approach_log.csv, written by
 CROS2PickBridge::TickApproachLog) and renders, per approach:
 
-    approach_NNN_<class>.png   bullseye + side view + per-axis bars + metadata
+    approach_NNN_<class>.png   3-D target-vs-reached + per-axis bars + numbers
     approach_latest.png        a copy of the newest one (stable filename)
     approach_history.png       every approach so far, one chart
+
+The per-approach figure shows exactly two points — where the arm was told to
+go and where it ended up — inside 5 mm / 12 mm tolerance spheres.  It used to
+also draw the pre-refine position across two flat panels (X-Y and X-Z); that
+asked the reader to rebuild one 3-D fact from several 2-D pictures.  The
+droop history is still recorded in the CSV (first_* columns).
 
 Why a watcher instead of the app calling this itself: Indy7Ctrl runs
 mlockall'd RT threads at 1 kHz.  fork()/system() marks every writable page
@@ -107,151 +113,121 @@ def grade(err_mm):
     return "#d73027"
 
 
-def _rings(ax, lim):
-    """Tolerance rings + crosshair, target at the origin."""
-    for r, style in ((GOOD_MM, "-"), (REFINE_TOL_MM, "--"), (25.0, ":"), (50.0, ":")):
-        if r <= lim * 1.05:
-            ax.add_patch(plt.Circle((0, 0), r, fill=False, ls=style,
-                                    ec="#999999", lw=0.9, zorder=1))
-            ax.annotate("%g" % r, (r * 0.707, r * 0.707), color="#999999",
-                        fontsize=7, ha="left", va="bottom", zorder=1)
-    ax.axhline(0, color="#cccccc", lw=0.8, zorder=0)
-    ax.axvline(0, color="#cccccc", lw=0.8, zorder=0)
-    ax.plot(0, 0, marker="+", ms=13, mew=2.0, color="k", zorder=5)
+def _sphere(ax, r, color, label):
+    """Tolerance ball around the target, drawn as three great circles.
 
-
-def _scatter_panel(ax, a_h, a_v, b_h, b_v, lim, title, xlabel, ylabel, col):
-    """Bullseye zoomed on the FINAL error.  The pre-refine point is usually an
-    order of magnitude further out (CTC droop is centimetres, the residual is
-    millimetres); letting it set the scale would squash the one number the
-    operator actually came to read.  So it gets clamped to the frame with its
-    true magnitude printed next to it."""
-    _rings(ax, lim)
-    if np.isfinite(b_h) and np.isfinite(b_v):
-        r = math.hypot(b_h, b_v)
-        edge = r > lim * 0.94
-        if edge and r > 0:
-            k = lim * 0.94 / r
-            p_h, p_v = b_h * k, b_v * k
-        else:
-            p_h, p_v = b_h, b_v
-        ax.annotate("", xy=(a_h, a_v), xytext=(p_h, p_v), zorder=3,
-                    arrowprops=dict(arrowstyle="->", color="#7f7f7f",
-                                    lw=1.2, ls=":"))
-        ax.plot(p_h, p_v, "o", ms=7, mfc="none", mec="#7f7f7f", mew=1.6,
-                zorder=4,
-                label="before refine" + (" (off scale)" if edge else ""))
-        if edge:
-            ax.annotate("%.0f mm" % r, (p_h, p_v), fontsize=7.5,
-                        color="#7f7f7f", zorder=4,
-                        textcoords="offset points",
-                        xytext=(-6 if p_h > 0 else 6, -9 if p_v > 0 else 9),
-                        ha="right" if p_h > 0 else "left",
-                        va="top" if p_v > 0 else "bottom")
-    ax.plot(a_h, a_v, "o", ms=10, color=col, zorder=6, label="reached")
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
-    ax.set_aspect("equal")
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
-    ax.grid(alpha=0.15)
+    A full wireframe sphere was tried first and read as a ball of tangled
+    string — it hid the one dot the figure exists to show.  Three orthogonal
+    rings say "sphere of radius r" with six thin curves."""
+    t = np.linspace(0, 2 * np.pi, 100)
+    c, s, o = r * np.cos(t), r * np.sin(t), np.zeros_like(t)
+    for k, (xs, ys, zs) in enumerate(((c, s, o), (c, o, s), (o, c, s))):
+        ax.plot(xs, ys, zs, color=color, lw=1.1, alpha=0.55,
+                label=label if k == 0 else None)
 
 
 def plot_one(rec, idx, out_png):
-    err, first = rec["err"], rec["first"] - rec["goal"]
-    first_mm_axes = first * 1e3 if np.all(np.isfinite(first)) else np.full(3, np.nan)
-    have_first = np.all(np.isfinite(first_mm_axes))
+    """One approach: where it was told to go vs where it ended up.
+
+    Deliberately just those two points.  Earlier versions drew the pre-refine
+    position and split the view into X-Y and X-Z panels; both made the reader
+    reconstruct one 3-D fact from several 2-D pictures.  The droop history is
+    still in the CSV (first_* columns) for anyone who wants it."""
+    err = rec["err"]                       # mm, reached - target
     col = grade(rec["err_mm"])
 
     span = np.nanmax(np.abs(err))
     if not np.isfinite(span) or span <= 0:
         span = GOOD_MM
-    lim = max(span * 1.55, REFINE_TOL_MM * 1.35)
+    lim = max(span * 1.6, REFINE_TOL_MM * 1.3)
 
-    fig = plt.figure(figsize=(11.5, 8.2))
-    fig.suptitle("Approach #%d  —  %s  @ base (%.3f, %.3f, %.3f) m"
-                 % (idx, rec["cls"], rec["goal"][0], rec["goal"][1], rec["goal"][2]),
-                 fontsize=13, y=0.975)
+    fig = plt.figure(figsize=(12.0, 6.4))
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.35, 1.0],
+                          height_ratios=[1.0, 1.0])
+    fig.suptitle("Approach #%d  —  %s  |  miss %.1f mm"
+                 % (idx, rec["cls"], rec["err_mm"]),
+                 fontsize=14, y=0.97, color=col)
 
-    # --- top view: the bullseye.  Target at the crosshair, TCP where it landed
-    ax = fig.add_subplot(2, 2, 1)
-    _scatter_panel(ax, err[0], err[1],
-                   first_mm_axes[0] if have_first else np.nan,
-                   first_mm_axes[1] if have_first else np.nan,
-                   lim, "Top view (X–Y)", "ΔX [mm]", "ΔY [mm]", col)
-    ax.legend(loc="upper right", fontsize=7.5, framealpha=0.9)
+    # ---------------------------------------------------------------- 3-D
+    ax = fig.add_subplot(gs[:, 0], projection="3d")
+    _sphere(ax, GOOD_MM, "#1a9850", "grasp goal %g mm" % GOOD_MM)
+    _sphere(ax, REFINE_TOL_MM, "#e08214", "refine tol %g mm" % REFINE_TOL_MM)
 
-    # --- side view: same units, so height error is read on the same scale
-    ax = fig.add_subplot(2, 2, 2)
-    _scatter_panel(ax, err[0], err[2],
-                   first_mm_axes[0] if have_first else np.nan,
-                   first_mm_axes[2] if have_first else np.nan,
-                   lim, "Side view (X–Z)", "ΔX [mm]", "ΔZ [mm]", col)
+    # target at the origin
+    ax.scatter([0], [0], [0], marker="+", s=190, c="k", linewidths=2.4,
+               depthshade=False, label="target")
+    # reached, with the miss drawn as a stick so the direction is obvious
+    ax.plot([0, err[0]], [0, err[1]], [0, err[2]], "-", color=col, lw=1.8)
+    ax.scatter([err[0]], [err[1]], [err[2]], s=110, c=col, depthshade=False,
+               label="reached")
 
-    # --- per-axis bars, before/after
-    ax = fig.add_subplot(2, 2, 3)
-    labels = ["ΔX", "ΔY", "ΔZ", "|Δ|"]
-    after = [err[0], err[1], err[2], rec["err_mm"]]
+    # floor shadow + drop line: without them a 3-D scatter has no depth cue
+    ax.plot([0, err[0]], [0, err[1]], [-lim, -lim], "-", color="#cccccc", lw=1.0)
+    ax.scatter([err[0]], [err[1]], [-lim], s=45, c="#cccccc", depthshade=False)
+    ax.plot([err[0], err[0]], [err[1], err[1]], [-lim, err[2]], ":",
+            color="#bbbbbb", lw=0.9)
+
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
+    try:
+        ax.set_box_aspect((1, 1, 1))       # matplotlib >= 3.3
+    except AttributeError:
+        pass
+    ax.set_xlabel("\u0394X [mm]", fontsize=9, labelpad=1)
+    ax.set_ylabel("\u0394Y [mm]", fontsize=9, labelpad=1)
+    ax.set_zlabel("\u0394Z [mm]", fontsize=9, labelpad=1)
+    ax.tick_params(labelsize=7.5)
+    ax.view_init(elev=20, azim=-58)
+    ax.set_title("target (+) vs reached  —  origin IS the target",
+                 fontsize=10, pad=0)
+    ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85,
+              bbox_to_anchor=(-0.06, 1.0))
+
+    # ------------------------------------------------------- per-axis bars
+    ax = fig.add_subplot(gs[0, 1])
     x = np.arange(4)
-    if have_first:
-        before = [first_mm_axes[0], first_mm_axes[1], first_mm_axes[2],
-                  rec["first_mm"]]
-        ax.bar(x - 0.2, before, 0.38, color="#bbbbbb", label="before refine")
-        ax.bar(x + 0.2, after, 0.38, color=col, label="after refine")
-    else:
-        ax.bar(x, after, 0.5, color=col, label="reached")
-    for xi, v in zip(x + (0.2 if have_first else 0.0), after):
-        ax.annotate("%.1f" % v, (xi, v), fontsize=8, ha="center",
+    vals = [err[0], err[1], err[2], rec["err_mm"]]
+    ax.bar(x, vals, 0.55, color=col)
+    for xi, v in zip(x, vals):
+        ax.annotate("%.1f" % v, (xi, v), fontsize=8.5, ha="center",
                     va="bottom" if v >= 0 else "top")
     ax.axhline(0, color="k", lw=0.8)
-    for tol, c, lab in ((REFINE_TOL_MM, "#e08214", "refine tol %g mm" % REFINE_TOL_MM),
-                        (GOOD_MM, "#1a9850", "grasp goal %g mm" % GOOD_MM)):
+    for tol, c in ((REFINE_TOL_MM, "#e08214"), (GOOD_MM, "#1a9850")):
         ax.axhline(tol, color=c, ls="--", lw=0.9)
         ax.axhline(-tol, color=c, ls="--", lw=0.9)
-        ax.annotate(lab, (-0.55, -tol), color=c, fontsize=7, ha="left",
-                    va="top")
-    ax.set_xlim(-0.62, 3.62)
+    ax.set_xlim(-0.6, 3.6)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("error [mm]  (reached − target)", fontsize=9)
-    ax.set_title("Per-axis error", fontsize=10)
-    ax.legend(loc="upper left", fontsize=7.5)
+    ax.set_xticklabels(["\u0394X", "\u0394Y", "\u0394Z", "|\u0394|"])
+    ax.set_ylabel("mm", fontsize=9)
+    ax.set_title("per axis  (reached \u2212 target)", fontsize=10)
     ax.grid(axis="y", alpha=0.15)
 
-    # --- the numbers, so the PNG stands alone without the CSV
-    ax = fig.add_subplot(2, 2, 4)
+    # ------------------------------------------------------------- numbers
+    ax = fig.add_subplot(gs[1, 1])
     ax.axis("off")
-    refine_line = ("%.1f → %.1f mm in %d pass(es)"
-                   % (rec["first_mm"], rec["err_mm"], rec["refine"])
-                   if have_first else "not measured")
     txt = [
-        ("time",            rec["when"]),
-        ("target  [m]",     "%.4f, %.4f, %.4f" % tuple(rec["goal"])),
-        ("reached [m]",     "%.4f, %.4f, %.4f" % tuple(rec["tcp"])),
-        ("error   [mm]",    "%+.1f, %+.1f, %+.1f" % tuple(rec["err"])),
-        ("|error| [mm]",    "%.1f" % rec["err_mm"]),
-        ("refinement",      refine_line),
-        ("hover margin",    "%.0f mm above the object" % (rec["zmargin"] * 1e3)),
-        ("vision std [mm]", "%.1f / %.1f / %.1f  (n=%d)"
-                            % (rec["std"][0], rec["std"][1], rec["std"][2], rec["n"])),
-        ("IK",              "seed %d, %d solve(s), %.1f ms"
-                            % (rec["seed"], rec["solves"], rec["ik_ms"])),
-        ("IK tool tilt",    "%.1f deg from q_ready" % rec["tilt"]),
-        ("IK branch gap",   "%.2f rad (J%d)" % (rec["gap"], rec["gap_ax"])),
+        ("time",          rec["when"].replace("T", "  ")),
+        ("target  [m]",   "%.4f, %.4f, %.4f" % tuple(rec["goal"])),
+        ("reached [m]",   "%.4f, %.4f, %.4f" % tuple(rec["tcp"])),
+        ("miss    [mm]",  "%.1f    (%+.1f, %+.1f, %+.1f)"
+                          % (rec["err_mm"], err[0], err[1], err[2])),
+        ("refine",        "%d pass(es)" % rec["refine"]),
+        ("vision std",    "%.1f / %.1f / %.1f mm  (n=%d)"
+                          % (rec["std"][0], rec["std"][1], rec["std"][2], rec["n"])),
+        ("IK",            "seed %d, %d solve(s), %.1f ms, tilt %.0f\u00b0"
+                          % (rec["seed"], rec["solves"], rec["ik_ms"], rec["tilt"])),
     ]
-    y = 0.97
+    y = 1.0
     for k, v in txt:
-        ax.text(0.00, y, k, fontsize=9, va="top", color="#555555",
+        ax.text(0.00, y, k, fontsize=8.5, va="top", color="#555555",
                 family="monospace")
-        ax.text(0.42, y, v, fontsize=9, va="top", family="monospace")
-        y -= 0.088
-    ax.text(0.00, y - 0.02,
-            "NOTE: |error| is TCP-vs-commanded-target only.\n"
-            "Perception bias (camera-to-base calibration) is NOT in it.",
-            fontsize=8, va="top", color="#a05000")
+        ax.text(0.34, y, v, fontsize=8.5, va="top", family="monospace")
+        y -= 0.128
+    ax.text(0.00, y - 0.03,
+            "NOTE: miss = TCP vs COMMANDED target.\n"
+            "Camera-to-base calibration bias is NOT in it.",
+            fontsize=7.5, va="top", color="#a05000")
 
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out_png, dpi=140)
     plt.close(fig)
     return out_png
@@ -261,32 +237,27 @@ def plot_history(rows, out_png):
     n = len(rows)
     idx = np.arange(1, n + 1)
     err = np.array([r["err_mm"] for r in rows])
-    first = np.array([r["first_mm"] for r in rows])
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(8.0, 0.55 * n + 4), 7.6),
                                    sharex=True)
     fig.suptitle("Approach accuracy history — %d approach(es)" % n,
                  fontsize=13)
 
-    ok = np.isfinite(first)
-    if ok.any():
-        ax1.bar(idx[ok], first[ok], 0.62, color="#dddddd", label="before refine",
-                zorder=1)
-    ax1.bar(idx, err, 0.42, color=[grade(e) for e in err], zorder=2,
-            label="final |error|")
+    ax1.bar(idx, err, 0.55, color=[grade(e) for e in err], zorder=2)
     ax1.axhline(REFINE_TOL_MM, color="#e08214", ls="--", lw=1.0)
     ax1.axhline(GOOD_MM, color="#1a9850", ls="--", lw=1.0)
-    ax1.annotate("refine tol %g mm" % REFINE_TOL_MM, (0.52, REFINE_TOL_MM),
-                 color="#e08214", fontsize=8, ha="left", va="bottom")
-    ax1.annotate("grasp goal %g mm" % GOOD_MM, (0.52, GOOD_MM),
-                 color="#1a9850", fontsize=8, ha="left", va="bottom")
+    # y-data / x-axes coords: pins the labels inside the right edge whatever
+    # the bar count is (plain data coords got clipped at low n).
+    for tol, c, lab in ((REFINE_TOL_MM, "#e08214", "refine tol %g mm" % REFINE_TOL_MM),
+                        (GOOD_MM, "#1a9850", "grasp goal %g mm" % GOOD_MM)):
+        ax1.text(0.995, tol, lab, color=c, fontsize=8, ha="right", va="bottom",
+                 transform=ax1.get_yaxis_transform())
     for i, r in zip(idx, rows):
         ax1.annotate("%.1f" % r["err_mm"], (i, r["err_mm"]), fontsize=7,
                      ha="center", va="bottom")
-    ax1.set_ylabel("|error| [mm]")
+    ax1.set_ylabel("miss [mm]")
     ax1.set_title("green ≤ %g mm, orange ≤ %g mm, red above"
                   % (GOOD_MM, REFINE_TOL_MM), fontsize=9)
-    ax1.legend(loc="upper left", fontsize=8)
     ax1.grid(axis="y", alpha=0.15)
 
     for k, (lab, mk) in enumerate((("ΔX", "o"), ("ΔY", "s"), ("ΔZ", "^"))):
