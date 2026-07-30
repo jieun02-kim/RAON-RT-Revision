@@ -32,4 +32,26 @@ if [ -z "$INDY7_NO_PLOT" ] && python3 -c "import matplotlib" 2>/dev/null; then
     echo "[run.sh] approach plotter watching -> approach_results/plots/"
 fi
 
+# [kv260-merge] E34: the IgH master thread (EtherCAT-OP) respawns SCHED_NORMAL
+# on every master request and its lock has no priority inheritance — under
+# board load the 1 kHz ioctls stall behind it (up to 66% cycle loss). Wait for
+# the thread to appear after app start, then lift it to SCHED_FIFO 40 via the
+# fixed-command sudo wrapper (one-time install: sudo bash
+# ../../tools/install_ecat_op_fifo.sh). Warns on the app console if missing.
+(
+    for _ in $(seq 1 180); do
+        if pgrep -x EtherCAT-OP >/dev/null 2>&1; then
+            if sudo -n /usr/local/sbin/ecat-op-fifo 2>/dev/null; then
+                echo "[run.sh] EtherCAT-OP -> SCHED_FIFO 40 (E34 auto)"
+            else
+                echo "[run.sh] WARN: E34 wrapper missing — run once:" \
+                     "sudo bash tools/install_ecat_op_fifo.sh," \
+                     "this session: sudo chrt -f -p 40 \$(pgrep -x EtherCAT-OP)"
+            fi
+            break
+        fi
+        sleep 0.5
+    done
+) &
+
 exec ./bin/Indy7Ctrl.out -f INDY7.cfg "$@"
