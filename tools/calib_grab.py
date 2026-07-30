@@ -11,6 +11,14 @@ is in grav-comp ('h'). Per pose the operator:
      CalibCapture counter and this one must stay in lockstep, which is why
      the image is confirmed FIRST)
 
+⚠ ARM THE APP FIRST: press 'w' in the app once before starting. Since
+2026-07-29 's' is print-only by default and writes nothing — the guard exists
+because a stray 's' rewrites pose_rPe_N while leaving image000N/pose_cPo_N
+alone, de-pairing the set silently. If you forget, every 's' prints
+"(print only)" and you finish with images but no poses (recoverable: nothing
+is corrupted, just re-run). The app's 'w' banner shows the next N, which is
+the number this script must agree with.
+
 camera_info is saved once (camera_info.yaml) — factory intrinsics, the same
 model the pipeline's 3D uses (D12).
 
@@ -117,6 +125,8 @@ def main():
         cv2.imwrite(path, img)
         print(f'   ✓ SAVED image{n:04d}.png ({detail})')
         print(f'   → 이제 앱에서 \'s\' 누르세요 (pose_rPe_{n}.yaml 이 되어야 함)')
+        print(f'      앱이 "*** CAPTURED ***"를 찍어야 정상. "(print only)"가 '
+              f'나오면 \'w\'로 캡처 모드를 먼저 켜세요.')
 
     print(f'\n[grab] 총 {n}쌍 캡처. 앱 pose_rPe 카운트와 일치하는지 확인하세요.')
     rclpy.shutdown()

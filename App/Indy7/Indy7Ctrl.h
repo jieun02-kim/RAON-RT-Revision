@@ -140,6 +140,11 @@ private:
 	void SaveISOHWResults();
 	void SaveRobotPose();
 	int  m_nPoseCapture{0};
+	// [kv260-merge] 'z' arms the hand-eye capture; 's' is print-only otherwise.
+	// Defaults OFF every run: the dataset under App/CalibUtils/kv260/ is the
+	// input to the rMc that the whole pipeline's base_to_camera_tf comes from,
+	// and a stray 's' de-pairs it without any error (see the 'z' handler).
+	bool m_bCalibMode{false};
 
 	// [kv260-merge] Gate 2b — perception pipeline bridge ('p'/digit/'v').
 	// Bridge threads are non-RT; the RT loop only uses its wait-free API.

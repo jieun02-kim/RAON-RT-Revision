@@ -701,12 +701,53 @@ CRobotIndy7::DoInput()
             DBG_LOG_INFO(">>> Log Distance Error");
             m_pController->LogDistanceError(m_Pose);
             break;
+        case 'w':
+        case 'W':
+            // [kv260-merge] Calibration-capture arming (2026-07-29). 's' used to
+            // write the hand-eye dataset unconditionally while LOOKING like a
+            // read-only pose print, and the first press of every run TRUNCATES
+            // robot_poses.csv. Worse than losing the files: only the robot side
+            // (pose_rPe_N) is rewritten, so the set silently DE-PAIRS from
+            // image000N/pose_cPo_N and the solve still succeeds — with a wrong
+            // rMc that every object coordinate then inherits.
+            // DoInput() runs on the 1 kHz RT thread, so the banner is ONE
+            // printf rather than seven: one write() instead of seven, each of
+            // which could block on a slow terminal. (The pose print below has
+            // always done this from here; file IO on this thread is likewise
+            // pre-existing — and now only happens when armed.)
+            m_bCalibMode = !m_bCalibMode;
+            if (m_bCalibMode)
+                printf("\n================= CALIB CAPTURE: ON =================\n"
+                       " 's' now WRITES App/CalibUtils/kv260/ :\n"
+                       "   robot_poses.csv     (capture #1 TRUNCATES it)\n"
+                       "   pose_rPe_<N>.yaml   next N = %d\n"
+                       " 'w' again to disarm.\n"
+                       " Undo: git checkout -- App/CalibUtils/kv260/\n"
+                       "=====================================================\n\n",
+                       s_calibCapture.GetCount());
+            else
+                printf("[CALIB] capture DISARMED — 's' only prints the pose\n");
+            break;
+            // ⚠ 'w' was the ONLY free letter. Before adding any new key, check
+            // proc_keyboard_control FIRST: it consumes 'q' (StopTasks) and
+            // 'z'/'Z' (ISO cube IK validation) and `continue`s WITHOUT setting
+            // m_cKeyPress, so a case for either here is unreachable — the
+            // 'q' case below is exactly that, dead since the thread claimed it.
         case 's':
         case 'S':
             m_pController->GetCurrentPose(m_Pose);
-            SaveRobotPose();
-            s_calibCapture.Capture(m_Pose);
-            printf("[TCP Pose]\n");
+            // Guarded: these are the ONLY two writers of the calibration
+            // dataset in the app (verified 2026-07-29), so one gate covers it.
+            if (m_bCalibMode)
+            {
+                SaveRobotPose();
+                s_calibCapture.Capture(m_Pose);
+            }
+            // "%s" and not the ternary directly as the format: a non-literal
+            // format string is a smell even when both branches are %-free.
+            printf("%s", m_bCalibMode
+                             ? "[TCP Pose] *** CAPTURED ***\n"
+                             : "[TCP Pose] (print only — 'w' arms capture)\n");
             printf("  t = [%.6f, %.6f, %.6f]\n",
                    m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
             printf("  R = [%.6f, %.6f, %.6f]\n"
