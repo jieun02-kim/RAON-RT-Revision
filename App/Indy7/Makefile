@@ -178,6 +178,14 @@ reachmap: $(REACHMAP_OBJS)
 		$(PROJ_ROOT_DIR)/tools/reachmap.cpp $(REACHMAP_OBJS) $(LDFLAGS)
 	@echo "reach map tool: $(OUTPUT_DIR)/reachmap.out"
 
+# Offline joint-log -> task-space converter for the per-approach trajectory
+# plots. Same link-the-real-controller principle as reachmap.
+fk_replay: $(REACHMAP_OBJS)
+	@ mkdir -p $(OUTPUT_DIR); pwd > /dev/null
+	$(CC) $(CFLAGS) -I$(CURR_DIR) -o $(OUTPUT_DIR)/fk_replay.out \
+		$(PROJ_ROOT_DIR)/tools/fk_replay.cpp $(REACHMAP_OBJS) $(LDFLAGS)
+	@echo "fk replay tool: $(OUTPUT_DIR)/fk_replay.out"
+
 clean:
 	@echo -n "CLEANING..."
 	@if [ -d $(OBJECT_DIR) ]; then rm -rf $(OBJECT_DIR); fi

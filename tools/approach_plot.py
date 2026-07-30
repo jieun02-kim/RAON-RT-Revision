@@ -35,9 +35,12 @@ and missing glyphs render as boxes.
 
 import argparse
 import csv
+import glob
 import math
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -81,6 +84,7 @@ def load(path):
                 continue        # torn last line — it will be complete next tick
             rows.append({
                 "when":  raw.get("iso_time", "?"),
+                "unix":  _f(raw, "unix_s"),
                 "cls":   raw.get("class", "?"),
                 "goal":  np.array([_f(raw, "goal_x"), _f(raw, "goal_y"), _f(raw, "goal_z")]),
                 "tcp":   np.array([_f(raw, "tcp_x"), _f(raw, "tcp_y"), _f(raw, "tcp_z")]),
@@ -329,6 +333,190 @@ def plot_history(rows, out_png):
     return out_png
 
 
+# ------------------------------------------------------------- trajectories
+# Per-approach 3-D trajectory + three-way task-space comparison:
+#   goal_*   what IK was asked to reach (incl. the refine bias steps)
+#   ref_*    FK of the per-cycle joint REFERENCE (fk_replay output)
+#   tcp_*    FK of the ACTUAL joints, computed by the RT loop itself
+# The app arms its DataLog logger for exactly one approach (m_bLogUntilDone),
+# so one DataLog file = one approach; pairing to approach_log rows is by
+# wall-clock proximity (both stamps land within ~2 s of the done edge).
+# FK happens OFFLINE via fk_replay.out, which links the robot's own
+# FullDynControllerRT.o — the plots and the robot share one kinematics.
+
+_fk_hint_shown = [False]
+
+
+def tool_paths():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return (os.path.join(root, "App", "Indy7", "bin", "fk_replay.out"),
+            os.path.join(root, "App", "Indy7", "indy7.urdf"))
+
+
+def datalog_stamp(path):
+    m = re.search(r"DataLog_(\d{8}_\d{6})\.csv$", os.path.basename(path))
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%Y%m%d_%H%M%S"))
+    except ValueError:
+        return None
+
+
+def pair_datalogs(rows, rtlog_dir, tol_s=15.0):
+    """row index -> DataLog path, nearest-stamp within tol, each file once.
+    Manual 'l'/'a' logs have no matching row and stay unpaired; rows from
+    before this feature have no file and stay unpaired — both are normal."""
+    files = []
+    for p in sorted(glob.glob(os.path.join(rtlog_dir, "DataLog_*.csv"))):
+        if p.endswith("_fk.csv"):
+            continue
+        s = datalog_stamp(p)
+        if s is not None:
+            files.append([s, p, False])
+    out = {}
+    for i, r in enumerate(rows):
+        if not np.isfinite(r["unix"]):
+            continue
+        best = None
+        for f in files:
+            if f[2]:
+                continue
+            d = abs(f[0] - r["unix"])
+            if d <= tol_s and (best is None or d < best[0]):
+                best = (d, f)
+        if best:
+            best[1][2] = True
+            out[i] = best[1][1]
+    return out
+
+
+def ensure_fk(datalog, fk_bin, urdf):
+    """Run fk_replay once per DataLog (cached by mtime). Returns aug path."""
+    aug = datalog[:-4] + "_fk.csv"
+    if (os.path.exists(aug) and
+            os.path.getmtime(aug) >= os.path.getmtime(datalog)):
+        return aug
+    if not os.path.exists(fk_bin):
+        if not _fk_hint_shown[0]:
+            _fk_hint_shown[0] = True
+            print("[approach-plot] fk_replay.out missing — trajectory plots "
+                  "skipped. Build it: cd App/Indy7 && make fk_replay")
+        return None
+    r = subprocess.run([fk_bin, urdf, datalog, aug],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0 or not os.path.exists(aug):
+        print("[approach-plot] WARN: fk_replay failed on %s" % datalog)
+        return None
+    return aug
+
+
+def load_traj(aug_path):
+    cols = ("timestamp_ns", "tcp_x", "tcp_y", "tcp_z", "goal_x", "goal_y",
+            "goal_z", "ref_x", "ref_y", "ref_z", "act_fk_x", "act_fk_y",
+            "act_fk_z")
+    data = {k: [] for k in cols}
+    with open(aug_path, newline="") as fh:
+        for raw in csv.DictReader(fh):
+            try:
+                vals = [float(raw[k]) for k in cols]
+            except (KeyError, TypeError, ValueError):
+                continue
+            for k, v in zip(cols, vals):
+                data[k].append(v)
+    if len(data["timestamp_ns"]) < 10:
+        return None
+    a = {k: np.array(v) for k, v in data.items()}
+    a["t"] = (a["timestamp_ns"] - a["timestamp_ns"][0]) * 1e-9
+    return a
+
+
+def plot_traj(rec, idx, a, out_png):
+    t = a["t"]
+    n = len(t)
+    col = grade(rec["err_mm"])
+    goal = np.stack([a["goal_x"], a["goal_y"], a["goal_z"]])
+    ref = np.stack([a["ref_x"], a["ref_y"], a["ref_z"]])
+    act = np.stack([a["tcp_x"], a["tcp_y"], a["tcp_z"]])
+
+    # The free cross-check: the logged tcp came from the RT loop's FK, the
+    # act_fk columns from the offline tool. Anything above numerical noise
+    # means the plot pipeline no longer shares the robot's kinematics.
+    fk = np.stack([a["act_fk_x"], a["act_fk_y"], a["act_fk_z"]])
+    xchk_mm = float(np.max(np.linalg.norm(act - fk, axis=0))) * 1e3
+
+    # refine pass boundaries = the moments the commanded goal moved
+    steps = np.where(np.linalg.norm(np.diff(goal, axis=1), axis=0) > 1e-9)[0]
+
+    fig = plt.figure(figsize=(13.2, 7.0))
+    gs = fig.add_gridspec(4, 2, width_ratios=[1.25, 1.0], hspace=0.45)
+    fig.suptitle("Approach #%d — %s trajectory  |  final miss %.1f mm, "
+                 "refine %d pass(es)"
+                 % (idx, rec["cls"], rec["err_mm"], rec["refine"]),
+                 fontsize=13, y=0.985, color=col)
+
+    # --- 3-D path (질문 2)
+    ax = fig.add_subplot(gs[:, 0], projection="3d")
+    d3 = max(1, n // 2500)
+    ax.plot(act[0, ::d3], act[1, ::d3], act[2, ::d3], "-", color=col,
+            lw=1.6, label="actual  FK(q_act)")
+    ax.plot(ref[0, ::d3], ref[1, ::d3], ref[2, ::d3], "--", color="#666666",
+            lw=1.0, label="reference  FK(q_ref)")
+    ax.scatter([goal[0, -1]], [goal[1, -1]], [goal[2, -1]], marker="+",
+               s=160, c="k", linewidths=2.2, depthshade=False, label="goal")
+    ax.scatter([act[0, 0]], [act[1, 0]], [act[2, 0]], s=45, c="#1a9850",
+               depthshade=False, label="start")
+    ax.set_xlabel("X [m]", fontsize=8, labelpad=1)
+    ax.set_ylabel("Y [m]", fontsize=8, labelpad=1)
+    ax.set_zlabel("Z [m]", fontsize=8, labelpad=1)
+    ax.tick_params(labelsize=7)
+    ax.view_init(elev=22, azim=-55)
+    ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85)
+
+    # --- per-axis vs time (질문 3: goal vs FK(ref) vs FK(act))
+    for k, name in enumerate(("X", "Y", "Z")):
+        axk = fig.add_subplot(gs[k, 1])
+        axk.plot(t, goal[k], color="#111111", lw=1.0, drawstyle="steps-post",
+                 label="IK target (goal+bias)")
+        axk.plot(t, ref[k], "--", color="#666666", lw=0.9,
+                 label="reference FK(q_ref)")
+        axk.plot(t, act[k], color=col, lw=1.4, label="actual FK(q_act)")
+        for s in steps:
+            axk.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
+        axk.set_ylabel("%s [m]" % name, fontsize=8)
+        axk.tick_params(labelsize=7)
+        axk.grid(alpha=0.15)
+        if k == 0:
+            axk.legend(loc="best", fontsize=6.5, ncol=3, framealpha=0.85)
+
+    # --- distance to the CURRENT goal (the refine story in one panel)
+    axe = fig.add_subplot(gs[3, 1])
+    de_act = np.linalg.norm(act - goal, axis=0) * 1e3
+    de_ref = np.linalg.norm(ref - goal, axis=0) * 1e3
+    axe.plot(t, de_act, color=col, lw=1.4, label="|goal − actual|")
+    axe.plot(t, de_ref, "--", color="#666666", lw=0.9, label="|goal − ref|")
+    axe.axhline(REFINE_TOL_MM, color="#e08214", ls="--", lw=0.8)
+    axe.axhline(GOOD_MM, color="#1a9850", ls="--", lw=0.8)
+    for s in steps:
+        axe.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
+    axe.set_ylim(0, min(max(de_act.max(), de_ref.max()) * 1.1, 200.0))
+    axe.set_ylabel("dist to goal [mm]", fontsize=8)
+    axe.set_xlabel("t [s]   (dotted verticals = refine re-targets)",
+                   fontsize=8)
+    axe.tick_params(labelsize=7)
+    axe.legend(loc="upper right", fontsize=6.5)
+    axe.grid(alpha=0.15)
+
+    fig.text(0.995, 0.005,
+             "RT-FK vs offline-FK max Δ %.3f mm%s" %
+             (xchk_mm, "" if xchk_mm < 1.0 else "  ⚠ MODEL MISMATCH"),
+             fontsize=7, ha="right",
+             color="#888888" if xchk_mm < 1.0 else "#d73027")
+    fig.savefig(out_png, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def render(csv_path, out_dir, redo_all, seen):
     rows = load(csv_path)
     if not rows:
@@ -351,6 +539,39 @@ def render(csv_path, out_dir, redo_all, seen):
             shutil.copyfile(latest, os.path.join(out_dir, "approach_latest.png"))
         plot_history(rows, os.path.join(out_dir, "approach_history.png"))
         print("  saved %s" % os.path.join(out_dir, "approach_history.png"))
+
+    # trajectory pass — needs the paired DataLog, which lands a moment after
+    # the row does; unpaired rows are retried on the next tick (the watcher
+    # signature includes the rt_log_results dir for exactly this reason)
+    rtlog_dir = os.path.abspath(os.path.join(os.path.dirname(csv_path), "..",
+                                             "rt_log_results"))
+    if os.environ.get("INDY7_RTLOG_DIR"):
+        rtlog_dir = os.environ["INDY7_RTLOG_DIR"]
+    if os.path.isdir(rtlog_dir):
+        fk_bin, urdf = tool_paths()
+        pairs = pair_datalogs(rows, rtlog_dir)
+        latest_traj = None
+        for i, r in enumerate(rows, 1):
+            if (i - 1) not in pairs:
+                continue
+            safe = "".join(ch if ch.isalnum() else "_" for ch in r["cls"])[:24]
+            png = os.path.join(out_dir,
+                               "approach_%03d_%s_traj.png" % (i, safe))
+            latest_traj = png
+            if not redo_all and os.path.exists(png):
+                continue
+            aug = ensure_fk(pairs[i - 1], fk_bin, urdf)
+            if aug is None:
+                continue
+            arrs = load_traj(aug)
+            if arrs is None:
+                continue
+            plot_traj(r, i, arrs, png)
+            made += 1
+            print("  saved %s" % png)
+        if latest_traj and os.path.exists(latest_traj):
+            shutil.copyfile(latest_traj,
+                            os.path.join(out_dir, "approach_latest_traj.png"))
     return made
 
 
@@ -391,6 +612,15 @@ def main():
             sig = (st.st_mtime, st.st_size)
         except OSError:
             sig = None
+        # The paired DataLog lands ~1-2 s AFTER the row (the logger task has
+        # to notice the falling edge and write the file). Folding that dir
+        # into the signature retries the trajectory pass when it appears.
+        rtlog = os.environ.get("INDY7_RTLOG_DIR") or os.path.abspath(
+            os.path.join(os.path.dirname(csv_path), "..", "rt_log_results"))
+        try:
+            sig = (sig, os.stat(rtlog).st_mtime)
+        except OSError:
+            pass
         if sig is not None and sig != last_sig:
             last_sig = sig
             try:

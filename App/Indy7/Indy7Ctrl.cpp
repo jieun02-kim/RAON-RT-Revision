@@ -1044,6 +1044,19 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
         // 'd' (LogDistanceError) reads goal_tcpPose — the joint-trajectory
         // path never filled it, so 'd' showed a bogus 0,0,0 target (E23).
         pC->goal_tcpPose = stTarget;
+        // Per-approach trajectory log: arm the EXISTING logging block (the
+        // one 'l'/'a'/RECT use — proven on the robot at 1 kHz) and tell the
+        // logger to close the file at the approach-done edge instead of the
+        // 24 s timer. Order matters: mode flag before trigger (the trigger's
+        // release store publishes it). Guarded on the trigger being idle:
+        // the logger consumed m_bLogUntilDone with exchange() when the window
+        // opened, so re-setting it here (staged leg 2 re-enters this path)
+        // would leak a stale 'true' into the NEXT, possibly manual, log.
+        if (!m_bLogTrigger.load(std::memory_order_relaxed))
+        {
+            m_bLogUntilDone = true;
+            m_bLogTrigger   = TRUE;
+        }
         DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  "
                      "[ready-seed direct, dq %.2f rad J%d]  "
                      "[std mm %.1f/%.1f/%.1f n=%d]",
@@ -1088,6 +1101,11 @@ CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
     pC->StartJointTrajectory(vqReady, dT);
     SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
     m_eApproachState = eAPPROACH_STAGING;
+    if (!m_bLogTrigger.load(std::memory_order_relaxed))
+    {
+        m_bLogUntilDone = true;   // per-approach trajectory log (staged
+        m_bLogTrigger   = TRUE;   // journey included — leg 1 starts here)
+    }
     DBG_LOG_INFO("[APPROACH] %s: solution %.2f rad away (J%d) — staging via "
                  "q_ready first (T=%.1f s), goal leg follows",
                  astGoal.szClass, dDqMax, nAxis, dT);
@@ -1350,6 +1368,13 @@ void proc_main_control(void* apRobot)
                     DBG_LOG_INFO("[APPROACH] done — holding at (%.3f, %.3f, %.3f); 'g'=grav-comp",
                                  tcp.m_position[0], tcp.m_position[1], tcp.m_position[2]);
                     pRobot->EmitApproachReport();
+                    // Falling edge for the per-approach trajectory log: the
+                    // logger task (prio 30) sees the trigger drop and writes
+                    // one DataLog file spanning exactly this approach. Its
+                    // wall-clock stamp lands within ~1 s of the approach_log
+                    // row's — that proximity IS the pairing key the plot
+                    // watcher uses.
+                    pRobot->m_bLogTrigger = FALSE;
                 }
             }
             else if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_STAGING)
@@ -1365,6 +1390,7 @@ void proc_main_control(void* apRobot)
                         CControllerFullDynamicsRT::eInverseKinematics_6dof || !bServoAll)
                 {
                     pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    pRobot->m_bLogTrigger    = FALSE;   // close the traj log
                     DBG_LOG_WARN("[APPROACH] staging cancelled (mode change / "
                                  "servo off) — goal dropped");
                 }
@@ -1389,8 +1415,11 @@ void proc_main_control(void* apRobot)
                     pRobot->m_nStageSettleCnt = 0;
                     pRobot->m_eApproachState  = CRobotIndy7::eAPPROACH_IDLE;
                     if (!pRobot->TryReadyApproach(pRobot->m_stStagedGoal, FALSE))
+                    {
+                        pRobot->m_bLogTrigger = FALSE;   // close the traj log
                         DBG_LOG_WARN("[APPROACH] staged goal leg did not start"
                                      " — holding at q_ready; 'g'=grav-comp");
+                    }
                 }
             }
             else if (!pRobot->m_bIsoHWTrigger.load() && !pRobot->m_bRectTrigger.load() &&
@@ -1439,6 +1468,11 @@ void proc_main_control(void* apRobot)
                         pRobot->SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                         pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_MOVING;
                         pRobot->StartRefine(stTarget);
+                        if (!pRobot->m_bLogTrigger.load(std::memory_order_relaxed))
+                        {
+                            pRobot->m_bLogUntilDone = true;  // per-approach traj log
+                            pRobot->m_bLogTrigger   = TRUE;
+                        }
                         DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  [std mm %.1f/%.1f/%.1f n=%d]",
                                      stGoal.szClass, stGoal.dX, stGoal.dY, stGoal.dZ,
                                      pRTController->GetTrajT(),
@@ -1787,11 +1821,29 @@ proc_logger(void* apRobot)
 
         nCount = 0;
 
-        DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");
+        // [kv260-merge] Window mode. exchange() — not load() — so that a NEXT
+        // approach armed while this file is still being written keeps its own
+        // flag intact. Cap 55 s: the ring holds 65.5 s at 1 kHz; staged
+        // worst case is ~31 s (10 s leg + settle + 10 s leg + 6 refine
+        // passes), so the cap only fires if the done edge never comes.
+        const bool bUntilDone = pRobot->m_bLogUntilDone.exchange(false);
+
+        DBG_LOG_INFO("(proc_logger) Trigger received (%s). Flushing old buffer...",
+                     bUntilDone ? "per-approach" : "fixed 24 s");
         while (pRobot->m_logBuffer.pop(entry)) {}
 
-        DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
-        sleep(24);
+        if (bUntilDone)
+        {
+            const time_t tWinStart = time(nullptr);
+            while (pRobot->m_bLogTrigger.load(std::memory_order_acquire) &&
+                   (time(nullptr) - tWinStart) < 55)
+                usleep(50000);
+        }
+        else
+        {
+            DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
+            sleep(24);
+        }
 
         pRobot->m_bLogTrigger.store(false, std::memory_order_release);
 

@@ -361,6 +361,14 @@ public:
     // the arm happened to be parked in when the goal was accepted.
     RigidBodyDynamics::Math::Matrix3d ToolRotAt(
         const RigidBodyDynamics::Math::VectorNd& aq);
+    // Tool POSITION at an arbitrary joint vector (same model, same
+    // tcp_local_point the robot runs). For the offline fk_replay tool that
+    // turns per-approach joint logs into task-space plots — the reach-map
+    // lesson applies: kinematics reimplemented next to the robot drifts, so
+    // plots must go through this one implementation. Not for the RT loop
+    // (allocates a temporary via RBDL).
+    RigidBodyDynamics::Math::Vector3d ToolPosAt(
+        const RigidBodyDynamics::Math::VectorNd& aq);
     BOOL SetTargetPose_Jacobian();           // visual servoing용 (매 사이클 목표 추종)
     BOOL LogDistanceError(Pose astTargetPose);
 

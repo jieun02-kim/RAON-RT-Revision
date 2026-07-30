@@ -117,6 +117,16 @@ private:
 	// TCP Trajectory Logging
 	LogRingBuffer            m_logBuffer;
 	std::atomic<bool>        m_bLogTrigger{false};
+	// [kv260-merge] Per-approach auto trajectory log (2026-07-30). Vision
+	// approaches raise m_bLogTrigger themselves and ALSO set this flag, which
+	// switches proc_logger from its fixed 24 s window to "collect until the
+	// RT loop drops the trigger" — and the RT loop drops it at the same edge
+	// that emits the approach report. One DataLog file = one approach.
+	// Field data forced this: approaches run ~15 s apart, so the fixed
+	// window would have merged two approaches into one file. The logger
+	// consumes the flag with exchange(false) at cycle start, so a next
+	// approach armed while a file is still being written keeps its own mode.
+	std::atomic<bool>        m_bLogUntilDone{false};
 
 	// ISO Hardware Test
 	std::atomic<bool>               m_bIsoHWTrigger{false};

@@ -622,6 +622,15 @@ CControllerFullDynamicsRT::ToolRotAt(const RigidBodyDynamics::Math::VectorNd& aq
                                                        m_body_id).transpose();
 }
 
+RigidBodyDynamics::Math::Vector3d
+CControllerFullDynamicsRT::ToolPosAt(const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    // Offline use only (fk_replay) — see the header note.
+    return RigidBodyDynamics::CalcBodyToBaseCoordinates(m_rbdlModel, aq,
+                                                        m_body_id,
+                                                        tcp_local_point);
+}
+
 BOOL
 CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
                                                      double adOriWeight,
