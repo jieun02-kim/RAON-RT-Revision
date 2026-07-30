@@ -449,7 +449,7 @@ def plot_traj(rec, idx, a, out_png):
     steps = np.where(np.linalg.norm(np.diff(goal, axis=1), axis=0) > 1e-9)[0]
 
     fig = plt.figure(figsize=(13.2, 7.0))
-    gs = fig.add_gridspec(4, 2, width_ratios=[1.25, 1.0], hspace=0.45)
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.25, 1.0], hspace=0.3)
     fig.suptitle("Approach #%d — %s trajectory  |  final miss %.1f mm, "
                  "refine %d pass(es)"
                  % (idx, rec["cls"], rec["err_mm"], rec["refine"]),
@@ -473,24 +473,30 @@ def plot_traj(rec, idx, a, out_png):
     ax.view_init(elev=22, azim=-55)
     ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85)
 
-    # --- per-axis vs time (질문 3: goal vs FK(ref) vs FK(act))
-    for k, name in enumerate(("X", "Y", "Z")):
-        axk = fig.add_subplot(gs[k, 1])
-        axk.plot(t, goal[k], color="#111111", lw=1.0, drawstyle="steps-post",
-                 label="IK target (goal+bias)")
-        axk.plot(t, ref[k], "--", color="#666666", lw=0.9,
-                 label="reference FK(q_ref)")
-        axk.plot(t, act[k], color=col, lw=1.4, label="actual FK(q_act)")
-        for s in steps:
-            axk.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
-        axk.set_ylabel("%s [m]" % name, fontsize=8)
-        axk.tick_params(labelsize=7)
-        axk.grid(alpha=0.15)
-        if k == 0:
-            axk.legend(loc="best", fontsize=6.5, ncol=3, framealpha=0.85)
+    # --- displacement from start (질문 3's three series in ONE panel).
+    # |P(t) − P(0)| collapses direction, so equal displacement does NOT mean
+    # "arrived" (a lateral miss is invisible here) — the dist-to-goal panel
+    # below stays the honest miss meter. Which-axis detail (where the droop
+    # and the refine bias point) lives in the 3-D path and the DataLog CSV.
+    axd = fig.add_subplot(gs[0, 1])
+    p0 = act[:, :1]
+    ds_act = np.linalg.norm(act - p0, axis=0) * 1e3
+    ds_ref = np.linalg.norm(ref - p0, axis=0) * 1e3
+    ds_goal = np.linalg.norm(goal - p0, axis=0) * 1e3
+    axd.plot(t, ds_goal, color="#111111", lw=1.0, drawstyle="steps-post",
+             label="IK target (goal+bias)")
+    axd.plot(t, ds_ref, "--", color="#666666", lw=0.9,
+             label="reference FK(q_ref)")
+    axd.plot(t, ds_act, color=col, lw=1.4, label="actual FK(q_act)")
+    for s in steps:
+        axd.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
+    axd.set_ylabel("displacement from start [mm]", fontsize=8)
+    axd.tick_params(labelsize=7)
+    axd.grid(alpha=0.15)
+    axd.legend(loc="lower right", fontsize=6.5, framealpha=0.85)
 
     # --- distance to the CURRENT goal (the refine story in one panel)
-    axe = fig.add_subplot(gs[3, 1])
+    axe = fig.add_subplot(gs[1, 1])
     de_act = np.linalg.norm(act - goal, axis=0) * 1e3
     de_ref = np.linalg.norm(ref - goal, axis=0) * 1e3
     axe.plot(t, de_act, color=col, lw=1.4, label="|goal − actual|")
