@@ -187,26 +187,22 @@
       <inertia ixx="0.00078982" ixy="-3.4e-07" ixz="8.3e-07" iyy="0.00079764" iyz="-5.08e-06" izz="0.00058319"/>
     </inertial>
   </link>
-  <!-- [kv260-merge 2026-07-27] End-of-arm payload, measured on the real robot:
-       RFT76-HA01 F/T sensor (D76 x 17 mm, 200 g) bolted straight to the
-       flange + metal tag plate (D90 x 5 mm, ~85 g Al estimate), stack 18.5 mm
-       proud of the flange face. This mass was missing entirely, which is what
-       made grav-comp sink and CTC droop grow when the arm extends.
-       AXIS WARNING: in this machine-converted URDF the tcp frame's TOOL AXIS
-       is -X, NOT +Z (proven two ways: with the tag facing up the calibration
-       poses show tcp x within 7 deg of straight DOWN, and the hand-eye eMo
-       puts the tag at x=-29.4 mm = flange face -10.9 mm + 18.5 mm stack).
-       A first attempt at z=-0.060 hung the mass 6 cm SIDEWAYS and made
-       grav-comp actively tilt the wrist near vertical. Composite CoM
-       (200 g at face+8.5 mm, 85 g at face+16 mm) -> 21 mm outboard = x=-0.021.
-       Inertia = solid cylinder about the tool (x) axis, r~0.04 m. -->
+  <!-- [kv260-merge 2026-07-30] A/B TEST: end-of-arm payload REMOVED (back to
+       the pre-merge zero-mass tcp). The 285 g F/T stack modeled in
+       fdc3f8f/9dc5ae3 rested on a GUESSED tag-plate mass and a CoM placed on
+       the -X tool-axis reading that the 07-29 field check contradicted (+Z)
+       — suspected of overdriving grav-comp at the wrist: first landings come
+       in HIGH (banana #23 first miss +36 mm, wrist-pitch 10 deg short at the
+       0.15 rad settle leash). Kinematics untouched, so the hand-eye calib
+       and the reach map stay valid. Restore with:
+       git checkout 9dc5ae3 - - App/Indy7/indy7.urdf  (drop the space) -->
   <link name="tcp">
     <inertial>
-      <mass value="0.285"/>
-      <origin rpy="0 0 0" xyz="-0.021 0 0"/>
-      <inertia ixx="0.00025" ixy="0" ixz="0"
-              iyy="0.00015" iyz="0"
-              izz="0.00015"/>
+      <mass value="0.0"/>
+      <origin rpy="0 0 0" xyz="0 0 0.03"/>
+      <inertia ixx="0.001" ixy="0" ixz="0"
+              iyy="0.001" iyz="0"
+              izz="0.001"/>
     </inertial>
   </link>
   <joint name="global" type="fixed">
