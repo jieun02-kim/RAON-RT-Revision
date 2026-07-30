@@ -1575,7 +1575,8 @@ void proc_main_control(void* apRobot)
                     for (int k = 0; k < nRefineW && !bStarted; k++)
                         bStarted = pRTController->SetTargetPosePositionOnly(
                                        pRobot->m_stRefineCmd, adRefineW[k],
-                                       (k < nRefineW - 1) ? TRUE : FALSE);
+                                       (k < nRefineW - 1) ? TRUE : FALSE,
+                                       0.0 /* no friction FF on mini-moves */);
                     if (bStarted)
                     {
                         pRobot->m_nRefineIter++;

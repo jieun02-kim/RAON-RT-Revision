@@ -390,11 +390,14 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // in smoothly (no torque step at motion start/end) and is exactly zero
     // whenever qd_ref is zero - so it cannot buzz at rest and cannot hunt
     // like an integrator. Kf defaults to 0 (cfg KF_n absent = term off).
+    // m_dKfScale: per-trajectory gate — 1 for gross transport, 0 for the
+    // refine mini-moves (the leash-released joint overruns a slow short
+    // reference; see SetTargetPosePositionOnly's adKfScale note).
     for (unsigned int i = 0; i < m_uDOF; ++i) {
-        if (m_Kf[i] > 0.0) {
+        if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
             double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
-            m_tau_total[i] += m_Kf[i] * dS;
+            m_tau_total[i] += m_Kf[i] * m_dKfScale * dS;
         }
     }
 
@@ -622,6 +625,7 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
 
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = vjointspace;
+    m_dKfScale       = 1.0;
     m_traj.T         = m_traj_duration;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
@@ -652,7 +656,8 @@ CControllerFullDynamicsRT::ToolPosAt(const RigidBodyDynamics::Math::VectorNd& aq
 BOOL
 CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
                                                      double adOriWeight,
-                                                     BOOL abQuiet)
+                                                     BOOL abQuiet,
+                                                     double adKfScale)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
@@ -742,6 +747,8 @@ CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
 
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = vjointspace;
+    m_dKfScale       = (adKfScale < 0.0) ? 0.0
+                     : (adKfScale > 1.0) ? 1.0 : adKfScale;
     m_traj.T         = dT;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
@@ -759,6 +766,7 @@ CControllerFullDynamicsRT::StartJointTrajectory(
 {
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = q_goal;
+    m_dKfScale       = 1.0;
     m_traj.T         = T;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;

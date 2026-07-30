@@ -358,9 +358,17 @@ public:
     // rejects it (2026-07-27 regression). The dq gate still applies.
     // abQuiet: suppress the refusal logs. Used by the E26 refine ladder, where
     // a rung failing is normal — only the last rung's failure is real news.
+    // adKfScale: friction-FF scale for THIS trajectory (0..1). Default 1 =
+    // FF on. The refine ladder passes 0: with the joint parked on the 0.15
+    // rad settle leash, a full-FF mini-move breaks static friction and the
+    // freed joint overruns the slow short reference to the OPPOSITE leash
+    // (field #34/38/39: j3 moved cmd+0.30 rad every pass, goal_dy
+    // alternating sign, refine maxed out 60-73 mm off). Gross transport
+    // keeps FF; fine positioning stays in the proven PD+refine regime.
     BOOL SetTargetPosePositionOnly(Pose astTargetPose,
                                    double adOriWeight = IK_ORI_WEIGHT,
-                                   BOOL abQuiet = FALSE);
+                                   BOOL abQuiet = FALSE,
+                                   double adKfScale = 1.0);
     // Tool attitude (body->base, the Pose::m_rotation convention) at an
     // arbitrary joint vector. E26: lets the caller anchor refine on the
     // attitude the approach SOLUTION reaches instead of on whatever attitude
@@ -469,6 +477,7 @@ private:
     std::vector<double> m_Kp;                           // Position gains
     std::vector<double> m_Kd;                           // Velocity gains
     std::vector<double> m_Kf;                           // Friction FF [Nm], 0 = off
+    double m_dKfScale{1.0};                             // per-trajectory FF scale (refine passes 0)
 
     // sticky-float anchor (grav-comp only; reset on mode change)
     RigidBodyDynamics::Math::VectorNd m_Q_hold;
