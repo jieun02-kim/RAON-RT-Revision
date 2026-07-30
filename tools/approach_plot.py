@@ -456,11 +456,16 @@ def plot_traj(rec, idx, a, out_png):
     # goal step small enough to be a refine bias (0.65×miss ≈ ≤55 mm in the
     # field); staged leg-2 re-targets jump farther and are skipped, so a
     # staged plan counts whole as one shot.
+    # orig = the goal as first commanded (bias 0) — the object's hover point.
+    # In real data the one-shot endpoint sits ≤2 mm from it (IK Accept gate),
+    # while the final aim drifts away by the accumulated bias.
+    orig = goal[:, -1]
     ideal = ref
     for s in steps:
         if np.linalg.norm(goal[:, s + 1] - goal[:, s]) < 0.08:
             ideal = ref.copy()
             ideal[:, s + 1:] = ref[:, s:s + 1]
+            orig = goal[:, s]
             break
 
     fig = plt.figure(figsize=(13.2, 7.0))
@@ -483,8 +488,12 @@ def plot_traj(rec, idx, a, out_png):
             color="#4575b4", lw=1.1, label="one-shot plan")
     ax.scatter([ideal[0, -1]], [ideal[1, -1]], [ideal[2, -1]], marker="x",
                s=70, c="#4575b4", linewidths=1.8, depthshade=False)
+    ax.scatter([orig[0]], [orig[1]], [orig[2]], marker="o", s=90,
+               facecolors="none", edgecolors="k", linewidths=1.4,
+               depthshade=False, label="original goal (hover pt)")
     ax.scatter([goal[0, -1]], [goal[1, -1]], [goal[2, -1]], marker="+",
-               s=160, c="k", linewidths=2.2, depthshade=False, label="goal")
+               s=160, c="k", linewidths=2.2, depthshade=False,
+               label="final aim (goal+bias)")
     ax.scatter([act[0, 0]], [act[1, 0]], [act[2, 0]], s=45, c="#1a9850",
                depthshade=False, label="start")
     ax.set_xlabel("X [m]", fontsize=8, labelpad=1)
@@ -521,18 +530,24 @@ def plot_traj(rec, idx, a, out_png):
     axd.grid(alpha=0.15)
     axd.legend(loc="lower right", fontsize=6.5, framealpha=0.85)
 
-    # --- distance to the CURRENT goal (the refine story in one panel)
+    # --- distance to the ORIGINAL goal — the number the refine gate judges,
+    # so the final plateau equals the title's final miss and the 12/5 mm
+    # lines apply literally. (Measured against the moving biased goal, the
+    # last plateau read ~|bias−miss| and contradicted the title.) The gray
+    # curve dips to ~0 at pass-1 end, then parks at the bias distance —
+    # the deliberate overshoot, visible instead of hidden.
     axe = fig.add_subplot(gs[1, 1])
-    de_act = np.linalg.norm(act - goal, axis=0) * 1e3
-    de_ref = np.linalg.norm(ref - goal, axis=0) * 1e3
-    axe.plot(t, de_act, color=col, lw=1.4, label="|goal − actual|")
-    axe.plot(t, de_ref, "--", color="#666666", lw=0.9, label="|goal − ref|")
+    de_act = np.linalg.norm(act - orig[:, None], axis=0) * 1e3
+    de_ref = np.linalg.norm(ref - orig[:, None], axis=0) * 1e3
+    axe.plot(t, de_act, color=col, lw=1.4, label="|orig goal − actual|")
+    axe.plot(t, de_ref, "--", color="#666666", lw=0.9,
+             label="|orig goal − ref|")
     axe.axhline(REFINE_TOL_MM, color="#e08214", ls="--", lw=0.8)
     axe.axhline(GOOD_MM, color="#1a9850", ls="--", lw=0.8)
     for s in steps:
         axe.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
     axe.set_ylim(0, min(max(de_act.max(), de_ref.max()) * 1.1, 200.0))
-    axe.set_ylabel("dist to goal [mm]", fontsize=8)
+    axe.set_ylabel("dist to original goal [mm]", fontsize=8)
     axe.set_xlabel("t [s]   (dotted verticals = refine re-targets)",
                    fontsize=8)
     axe.tick_params(labelsize=7)
