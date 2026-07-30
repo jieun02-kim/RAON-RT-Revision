@@ -481,19 +481,16 @@ def plot_traj(rec, idx, a, out_png):
     ax.plot(act[0, ::d3], act[1, ::d3], act[2, ::d3], "-", color=col,
             lw=1.6, label="actual  FK(q_act)")
     # user spec (07-30): the 3-D shows exactly two trajectories — the
-    # one-shot plan and the actual path. The refine re-plans stay visible
-    # through the actual path itself and the re-target verticals on the
-    # right. The plan's held tail is degenerate; an X marks its endpoint.
+    # one-shot plan and the actual path — plus the goal and start markers,
+    # nothing else. The plan ends ON the original-goal circle (within the
+    # 2 mm IK residual), so its endpoint needs no marker of its own; the
+    # refine re-plans stay visible through the actual path itself and the
+    # re-target verticals on the right.
     ax.plot(ideal[0, ::d3], ideal[1, ::d3], ideal[2, ::d3], "-",
             color="#4575b4", lw=1.1, label="one-shot plan")
-    ax.scatter([ideal[0, -1]], [ideal[1, -1]], [ideal[2, -1]], marker="x",
-               s=70, c="#4575b4", linewidths=1.8, depthshade=False)
     ax.scatter([orig[0]], [orig[1]], [orig[2]], marker="o", s=90,
                facecolors="none", edgecolors="k", linewidths=1.4,
                depthshade=False, label="original goal (hover pt)")
-    ax.scatter([goal[0, -1]], [goal[1, -1]], [goal[2, -1]], marker="+",
-               s=160, c="k", linewidths=2.2, depthshade=False,
-               label="final aim (goal+bias)")
     ax.scatter([act[0, 0]], [act[1, 0]], [act[2, 0]], s=45, c="#1a9850",
                depthshade=False, label="start")
     ax.set_xlabel("X [m]", fontsize=8, labelpad=1)

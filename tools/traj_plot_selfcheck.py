@@ -13,9 +13,9 @@ that borrowed input with data that follows the real refine mechanics:
     IK residual <2 mm at every plan endpoint.
 
 Expected reading of the output PNG:
-  * 3-D: the blue one-shot plan ends (X) ON the original-goal circle; the
-    final aim '+' sits apart by the bias; actual ends a few mm from the
-    circle.
+  * 3-D: the blue one-shot plan ends ON the original-goal circle (its
+    endpoint differs from the circle only by the <2 mm IK residual, so it
+    carries no marker of its own); actual ends a few mm from the circle.
   * displacement: actual converges to the flat IK-input line after the
     re-target vertical.
 
@@ -71,7 +71,6 @@ rec = {"cls": "selfcheck", "err_mm": float(np.linalg.norm(P2 - G) * 1e3),
 out = sys.argv[1] if len(sys.argv) > 1 else "traj_selfcheck.png"
 ap.plot_traj(rec, 0, a, out)
 print("saved %s" % out)
-print("expect: X-circle gap %.1f mm (overlapping), aim offset %.1f mm, "
+print("expect: plan endpoint %.1f mm from the circle (overlapping), "
       "final miss %.1f mm"
-      % (np.linalg.norm(Gik1 - G) * 1e3, np.linalg.norm(aim2 - G) * 1e3,
-         rec["err_mm"]))
+      % (np.linalg.norm(Gik1 - G) * 1e3, rec["err_mm"]))
