@@ -393,11 +393,22 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // m_dKfScale: per-trajectory gate — 1 for gross transport, 0 for the
     // refine mini-moves (the leash-released joint overruns a slow short
     // reference; see SetTargetPosePositionOnly's adKfScale note).
+    // [2026-07-31] E35 lag gate: FF only while the joint TRAILS the reference
+    // in the commanded direction. On mustard's small j3 leg (0.28 rad) the
+    // ungated FF rode through the decel phase, overran the final ref by
+    // 0.13 rad, and settle stiction held it there (qd_ref=0 -> FF=0 -> no
+    // push-back): +36 mm y-miss with the SIGN FLIPPED vs every pre-FF log.
+    // Trailing is the only state where friction is the enemy; caught-up or
+    // ahead, friction braking is what we want. 0.002 rad ramp keeps the term
+    // continuous (real mid-move lag is 0.01-0.13 rad, solidly gate=1).
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
             double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
-            m_tau_total[i] += m_Kf[i] * m_dKfScale * dS;
+            double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+            double dG = dLag / 0.002;
+            if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
+            m_tau_total[i] += m_Kf[i] * m_dKfScale * dS * dG;
         }
     }
 
