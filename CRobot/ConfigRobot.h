@@ -234,6 +234,7 @@ typedef struct stConfigSystem
 	INT32	nRobotAxis; // Number of robot axes
 	std::vector<double> vKp; // Kp gains for each axis
 	std::vector<double> vKd; // Kd gains for each axis
+	std::vector<double> vKf; // Coulomb friction feedforward [Nm], 0 = off
 
 	ST_CONFIG_EXT_IFACE stExternalIface;
 
@@ -249,7 +250,8 @@ typedef struct stConfigSystem
 		bEnableControllerAtStartup = TRUE;
 		nDefaultControllerMode = 0; //
 		vKp.resize(6, 0.0); // Default 6 DOF
-		vKd.resize(6, 0.0); // Default 6 DOF  
+		vKd.resize(6, 0.0); // Default 6 DOF
+		vKf.resize(6, 0.0);
 	};
 
 }ST_CONFIG_SYSTEM;

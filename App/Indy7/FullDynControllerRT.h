@@ -45,6 +45,12 @@ public:
                                const RigidBodyDynamics::Math::VectorNd& avQdd_ref);
     
     void SetControlGains(const std::vector<double>& avKp, const std::vector<double>& avKd);
+    // Coulomb friction feedforward, [Nm] per joint. Applied as
+    // Kf*sat(qd_ref/0.01) OUTSIDE the M(q) product — friction is a joint
+    // torque, not an acceleration. Gated by the REFERENCE velocity so it is
+    // exactly zero at rest (no buzz, no integral-style hunting) and immune
+    // to measured-velocity sign noise. Values clamped to [0, 12] Nm.
+    void SetFrictionFF(const std::vector<double>& avKf);
     void SetGravity(const RigidBodyDynamics::Math::Vector3d& avGravity);
     void EnableRTMode(BOOL abEnable) { m_bRTMode = abEnable; }
     BOOL SetReferencePos(UINT auAxis, double adPos);
@@ -462,6 +468,7 @@ private:
     // Control gains
     std::vector<double> m_Kp;                           // Position gains
     std::vector<double> m_Kd;                           // Velocity gains
+    std::vector<double> m_Kf;                           // Friction FF [Nm], 0 = off
 
     // sticky-float anchor (grav-comp only; reset on mode change)
     RigidBodyDynamics::Math::VectorNd m_Q_hold;

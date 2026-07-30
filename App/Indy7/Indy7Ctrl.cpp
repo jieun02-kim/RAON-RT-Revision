@@ -279,7 +279,18 @@ CRobotIndy7::InitController(const TSTRING& astrURDFPath)
         }
     }
     m_pController->SetControlGains(Kp, Kd);
-    
+
+    // Coulomb friction feedforward from cfg (KF_n, [Nm]); absent keys parse
+    // to 0.0 = term off. Only the 6-DOF cfg path carries real values.
+    {
+        std::vector<double> Kf(dof, 0.0);
+        const std::vector<double>& vKfCfg = m_pcConfigRobot->GetSystemConf().vKf;
+        if (dof == 6 && vKfCfg.size() >= dof)
+            for (unsigned int i = 0; i < dof; i++)
+                Kf[i] = vKfCfg[i];
+        m_pController->SetFrictionFF(Kf);
+    }
+
     // Pre-allocate RT control vectors
     m_vCurrentPos.resize(dof, 0.0);
     m_vCurrentVel.resize(dof, 0.0);

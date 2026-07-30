@@ -105,6 +105,7 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     // Initialize control gains
     m_Kp.resize(auDOF, 100.0);  // Default position gains
     m_Kd.resize(auDOF, 10.0);   // Default velocity gains
+    m_Kf.resize(auDOF, 0.0);    // Friction FF off unless the cfg says so
 
     // Initialize trajectory state
     m_traj_duration    = 3.0;
@@ -379,7 +380,24 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // Computed torque: τ = M(q) * q̈_desired + h(q,q̇)
     m_tau_M = m_M * m_Qdd;
     m_tau_total = m_tau_M + m_h;
-    
+
+    // [kv260-merge 2026-07-31] Coulomb friction feedforward. The rigid-body
+    // terms above contain no friction, so on the harmonic-drive wrists the
+    // whole breakaway torque (j3 ~7-10 Nm measured) lands on the PD - whose
+    // authority is M_jj-scaled and loses by an order of magnitude (E-series
+    // field logs: j4 parked 0.15 rad short every approach). Add the expected
+    // friction torque while a move is COMMANDED: Kf*sat(qd_ref/0.01). Ramps
+    // in smoothly (no torque step at motion start/end) and is exactly zero
+    // whenever qd_ref is zero - so it cannot buzz at rest and cannot hunt
+    // like an integrator. Kf defaults to 0 (cfg KF_n absent = term off).
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        if (m_Kf[i] > 0.0) {
+            double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
+            if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
+            m_tau_total[i] += m_Kf[i] * dS;
+        }
+    }
+
     // Copy result to output
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         avOutputTorque[i] = m_tau_total[i];
@@ -1678,6 +1696,29 @@ CControllerFullDynamicsRT::SetControlGains(const std::vector<double>& avKp, cons
         m_Kp = avKp;
         m_Kd = avKd;
     }
+}
+
+void
+CControllerFullDynamicsRT::SetFrictionFF(const std::vector<double>& avKf)
+{
+    if (avKf.size() != m_uDOF)
+        return;
+    // Clamp to [0, 12] Nm: a cfg typo must not become a torque source. 12 is
+    // above the largest measured breakaway (j3 ~10.6 Nm) yet well under the
+    // wrist axes' 21 Nm rated limit.
+    bool bClamped = false;
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        double d = avKf[i];
+        if (d < 0.0 || d > 12.0) { d = (d < 0.0) ? 0.0 : 12.0; bClamped = true; }
+        m_Kf[i] = d;
+    }
+    if (bClamped)
+        DBG_LOG_WARN("(%s) Friction FF value out of [0,12] Nm - clamped",
+                     "CControllerFullDynamicsRT");
+    if (m_uDOF == 6)
+        DBG_LOG_INFO("(%s) Friction FF [Nm]: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
+                     "CControllerFullDynamicsRT",
+                     m_Kf[0], m_Kf[1], m_Kf[2], m_Kf[3], m_Kf[4], m_Kf[5]);
 }
 
 void 
