@@ -483,8 +483,27 @@ def plot_traj(rec, idx, a, out_png):
     ds_act = np.linalg.norm(act - p0, axis=0) * 1e3
     ds_ref = np.linalg.norm(ref - p0, axis=0) * 1e3
     ds_goal = np.linalg.norm(goal - p0, axis=0) * 1e3
+
+    # The one-shot plan — what we WANTED: pass-1's reference held at its
+    # endpoint. Not recomputed; each IK pass already plans straight to its
+    # goal, so pass 1 of the log IS the one-shot trajectory. ideal and ref
+    # coincide until the first refine re-target, then ref chases biased
+    # goals while ideal keeps the original promise. Pass-1 boundary = first
+    # goal step small enough to be a refine bias (0.65×miss ≈ ≤55 mm in the
+    # field); staged leg-2 re-targets jump farther and are skipped, so a
+    # staged plan counts whole as one shot.
+    ideal = ref
+    for s in steps:
+        if np.linalg.norm(goal[:, s + 1] - goal[:, s]) < 0.08:
+            ideal = ref.copy()
+            ideal[:, s + 1:] = ref[:, s:s + 1]
+            break
+    ds_ideal = np.linalg.norm(ideal - p0, axis=0) * 1e3
+
     axd.plot(t, ds_goal, color="#111111", lw=1.0, drawstyle="steps-post",
              label="IK target (goal+bias)")
+    axd.plot(t, ds_ideal, color="#4575b4", lw=1.1,
+             label="one-shot plan (pass-1 held)")
     axd.plot(t, ds_ref, "--", color="#666666", lw=0.9,
              label="reference FK(q_ref)")
     axd.plot(t, ds_act, color=col, lw=1.4, label="actual FK(q_act)")
