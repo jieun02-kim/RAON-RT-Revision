@@ -468,8 +468,8 @@ def plot_traj(rec, idx, a, out_png):
             orig = goal[:, s]
             break
 
-    fig = plt.figure(figsize=(13.2, 7.0))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.25, 1.0], hspace=0.3)
+    fig = plt.figure(figsize=(13.2, 6.4))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.25, 1.0])
     fig.suptitle("Approach #%d — %s trajectory  |  final miss %.1f mm, "
                  "refine %d pass(es)"
                  % (idx, rec["cls"], rec["err_mm"], rec["refine"]),
@@ -480,10 +480,10 @@ def plot_traj(rec, idx, a, out_png):
     d3 = max(1, n // 2500)
     ax.plot(act[0, ::d3], act[1, ::d3], act[2, ::d3], "-", color=col,
             lw=1.6, label="actual  FK(q_act)")
-    ax.plot(ref[0, ::d3], ref[1, ::d3], ref[2, ::d3], "--", color="#666666",
-            lw=1.0, label="reference  FK(q_ref)")
-    # pass-1 segment overlaps ref (same path — blue under the gray dashes);
-    # the held tail is degenerate, so mark the plan's endpoint with an X
+    # user spec (07-30): the 3-D shows exactly two trajectories — the
+    # one-shot plan and the actual path. The refine re-plans stay visible
+    # through the actual path itself and the re-target verticals on the
+    # right. The plan's held tail is degenerate; an X marks its endpoint.
     ax.plot(ideal[0, ::d3], ideal[1, ::d3], ideal[2, ::d3], "-",
             color="#4575b4", lw=1.1, label="one-shot plan")
     ax.scatter([ideal[0, -1]], [ideal[1, -1]], [ideal[2, -1]], marker="x",
@@ -503,56 +503,30 @@ def plot_traj(rec, idx, a, out_png):
     ax.view_init(elev=22, azim=-55)
     ax.legend(loc="upper left", fontsize=7.5, framealpha=0.85)
 
-    # --- displacement from start (질문 3's three series in ONE panel).
-    # |P(t) − P(0)| collapses direction, so equal displacement does NOT mean
-    # "arrived" (a lateral miss is invisible here) — the dist-to-goal panel
-    # below stays the honest miss meter. Which-axis detail (where the droop
-    # and the refine bias point) lives in the 3-D path and the DataLog CSV.
+    # --- displacement from start: the three series of the user's spec in
+    # ONE plot — the vision-given IK input (flat line: it is a point, not a
+    # path), the planned FK(q_ref) and the measured FK(q_act). |P(t) − P(0)|
+    # collapses direction, so equal displacement does NOT mean "arrived" (a
+    # lateral miss is invisible here) — the title's final miss stays the
+    # true meter, and which-axis detail lives in the 3-D path and the CSV.
     axd = fig.add_subplot(gs[0, 1])
     p0 = act[:, :1]
     ds_act = np.linalg.norm(act - p0, axis=0) * 1e3
     ds_ref = np.linalg.norm(ref - p0, axis=0) * 1e3
-    ds_goal = np.linalg.norm(goal - p0, axis=0) * 1e3
-
-    ds_ideal = np.linalg.norm(ideal - p0, axis=0) * 1e3
-
-    axd.plot(t, ds_goal, color="#111111", lw=1.0, drawstyle="steps-post",
-             label="IK target (goal+bias)")
-    axd.plot(t, ds_ideal, color="#4575b4", lw=1.1,
-             label="one-shot plan (pass-1 held)")
+    ds_orig = float(np.linalg.norm(orig - act[:, 0])) * 1e3
+    axd.axhline(ds_orig, color="#111111", lw=1.0,
+                label="IK input (object hover pt)")
     axd.plot(t, ds_ref, "--", color="#666666", lw=0.9,
              label="reference FK(q_ref)")
     axd.plot(t, ds_act, color=col, lw=1.4, label="actual FK(q_act)")
     for s in steps:
         axd.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
     axd.set_ylabel("displacement from start [mm]", fontsize=8)
+    axd.set_xlabel("t [s]   (dotted verticals = refine re-targets)",
+                   fontsize=8)
     axd.tick_params(labelsize=7)
     axd.grid(alpha=0.15)
     axd.legend(loc="lower right", fontsize=6.5, framealpha=0.85)
-
-    # --- distance to the ORIGINAL goal — the number the refine gate judges,
-    # so the final plateau equals the title's final miss and the 12/5 mm
-    # lines apply literally. (Measured against the moving biased goal, the
-    # last plateau read ~|bias−miss| and contradicted the title.) The gray
-    # curve dips to ~0 at pass-1 end, then parks at the bias distance —
-    # the deliberate overshoot, visible instead of hidden.
-    axe = fig.add_subplot(gs[1, 1])
-    de_act = np.linalg.norm(act - orig[:, None], axis=0) * 1e3
-    de_ref = np.linalg.norm(ref - orig[:, None], axis=0) * 1e3
-    axe.plot(t, de_act, color=col, lw=1.4, label="|orig goal − actual|")
-    axe.plot(t, de_ref, "--", color="#666666", lw=0.9,
-             label="|orig goal − ref|")
-    axe.axhline(REFINE_TOL_MM, color="#e08214", ls="--", lw=0.8)
-    axe.axhline(GOOD_MM, color="#1a9850", ls="--", lw=0.8)
-    for s in steps:
-        axe.axvline(t[s], color="#bbbbbb", lw=0.7, ls=":")
-    axe.set_ylim(0, min(max(de_act.max(), de_ref.max()) * 1.1, 200.0))
-    axe.set_ylabel("dist to original goal [mm]", fontsize=8)
-    axe.set_xlabel("t [s]   (dotted verticals = refine re-targets)",
-                   fontsize=8)
-    axe.tick_params(labelsize=7)
-    axe.legend(loc="upper right", fontsize=6.5)
-    axe.grid(alpha=0.15)
 
     fig.text(0.995, 0.005,
              "RT-FK vs offline-FK max Δ %.3f mm%s" %
