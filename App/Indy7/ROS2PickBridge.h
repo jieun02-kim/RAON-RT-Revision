@@ -228,10 +228,9 @@ private:
     // Even seq = consistent; the writer holds it odd across the slot copy.
     TrackSample           m_stTrackSlot{};
     std::atomic<uint32_t> m_uTrackSeq{0};
-    // callback-thread-only filter/gate state
+    // callback-thread-only filter state
     double   m_dTrackAlpha{0.4};
     double   m_adTrackEma[3]{};
-    double   m_adTrackRaw[3]{};     // last ACCEPTED raw (jump-gate reference)
     bool     m_bTrackSeeded{false};
     SteadyTP m_tTrackAccept{};      // last accept time (gap → reseed)
     static constexpr double TRACK_GAP_RESEED_S = 1.0;

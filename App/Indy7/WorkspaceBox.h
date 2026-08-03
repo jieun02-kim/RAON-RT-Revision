@@ -39,13 +39,6 @@ static constexpr double WS_RMAX_XY = 0.92;   // [m] from base axis
  * gap exactly when a hand is under the tool. */
 static constexpr double TRACK_ZMARGIN_M = 0.20;
 
-/* Per-sample teleport gate. Legit motion at 0.3 m/s and 15 Hz is ~2 cm per
- * frame; a pick_logic instance switch (second object of the same class,
- * occlusion flicker) jumps tens of cm. Rejected — NOT rate-limited: a rate
- * limiter would turn the teleport into a slow sweep through the space
- * between the two objects, which is where the person stands. */
-static constexpr double TRACK_JUMP_M = 0.10;
-
 } // namespace kv260
 
 #endif // __KV260_WORKSPACE_BOX__

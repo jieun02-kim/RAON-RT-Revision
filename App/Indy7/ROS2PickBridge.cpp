@@ -427,10 +427,15 @@ CROS2PickBridge::OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMs
     }
 
     // ---- tracking sample pipe ('o') — see TrackSample in the header ----
-    // Admission: valid → goal-equivalent in-box(+eps) → jump gate → EMA.
-    // Rejected samples do NOT bump the sequence, so the RT side sees them
-    // as silence and its staleness counter runs — out-of-box and teleport
-    // both degrade to "target lost", never to a commanded sweep.
+    // Admission: valid → goal-equivalent in-box(+eps) → EMA. Every
+    // admissible sample publishes — the TCP speed cap (m_dMaxLinVel) is the
+    // real safety envelope, so a goal step just makes the arm glide there at
+    // the cap. Out-of-box samples don't bump the sequence: the RT side sees
+    // silence and freezes in place.
+    // [2026-08-03 v2] The 0.10 m jump gate was removed by field verdict: one
+    // rejected glitch left its reference stale, and a MOVING object then
+    // chain-rejected every later sample until the loss latch killed tracking
+    // ("more often not following than following").
     if (apMsg->target_valid && apMsg->depth_valid)
     {
         const double dGz = apMsg->z + kv260::TRACK_ZMARGIN_M;
@@ -448,43 +453,32 @@ CROS2PickBridge::OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMs
             const double dGapS = !m_bTrackSeeded ? 1e9 :
                 std::chrono::duration<double>(m_stLatest.tStamp -
                                               m_tTrackAccept).count();
-            const bool bReseed = !m_bTrackSeeded || dGapS > TRACK_GAP_RESEED_S;
-            const double dJump = bReseed ? 0.0 : std::sqrt(
-                (apMsg->x - m_adTrackRaw[0]) * (apMsg->x - m_adTrackRaw[0]) +
-                (apMsg->y - m_adTrackRaw[1]) * (apMsg->y - m_adTrackRaw[1]) +
-                (apMsg->z - m_adTrackRaw[2]) * (apMsg->z - m_adTrackRaw[2]));
-            if (dJump <= kv260::TRACK_JUMP_M)
+            if (!m_bTrackSeeded || dGapS > TRACK_GAP_RESEED_S)
             {
-                m_adTrackRaw[0] = apMsg->x;
-                m_adTrackRaw[1] = apMsg->y;
-                m_adTrackRaw[2] = apMsg->z;
-                if (bReseed)
-                {
-                    // reseed, don't drag the filter across the gap — the
-                    // pre-gap EMA state would sweep the goal from wherever
-                    // the object USED to be (VisualServo's never-reset
-                    // static filterInit is the anti-pattern here)
-                    m_adTrackEma[0] = apMsg->x;
-                    m_adTrackEma[1] = apMsg->y;
-                    m_adTrackEma[2] = apMsg->z;
-                }
-                else
-                {
-                    m_adTrackEma[0] += m_dTrackAlpha * (apMsg->x - m_adTrackEma[0]);
-                    m_adTrackEma[1] += m_dTrackAlpha * (apMsg->y - m_adTrackEma[1]);
-                    m_adTrackEma[2] += m_dTrackAlpha * (apMsg->z - m_adTrackEma[2]);
-                }
-                m_bTrackSeeded = true;
-                m_tTrackAccept = m_stLatest.tStamp;
-                const bool bMatch = m_strSelected.empty() ||
-                                    m_stLatest.strClass == m_strSelected;
-                m_uTrackSeq.fetch_add(1, std::memory_order_acq_rel);  // odd
-                m_stTrackSlot.dX = m_adTrackEma[0];
-                m_stTrackSlot.dY = m_adTrackEma[1];
-                m_stTrackSlot.dZ = m_adTrackEma[2];
-                m_stTrackSlot.bClassMatch = bMatch;
-                m_uTrackSeq.fetch_add(1, std::memory_order_release);  // even
+                // reseed, don't drag the filter across the gap — the
+                // pre-gap EMA state would lag the goal behind wherever the
+                // object USED to be (VisualServo's never-reset static
+                // filterInit is the anti-pattern here)
+                m_adTrackEma[0] = apMsg->x;
+                m_adTrackEma[1] = apMsg->y;
+                m_adTrackEma[2] = apMsg->z;
             }
+            else
+            {
+                m_adTrackEma[0] += m_dTrackAlpha * (apMsg->x - m_adTrackEma[0]);
+                m_adTrackEma[1] += m_dTrackAlpha * (apMsg->y - m_adTrackEma[1]);
+                m_adTrackEma[2] += m_dTrackAlpha * (apMsg->z - m_adTrackEma[2]);
+            }
+            m_bTrackSeeded = true;
+            m_tTrackAccept = m_stLatest.tStamp;
+            const bool bMatch = m_strSelected.empty() ||
+                                m_stLatest.strClass == m_strSelected;
+            m_uTrackSeq.fetch_add(1, std::memory_order_acq_rel);  // odd
+            m_stTrackSlot.dX = m_adTrackEma[0];
+            m_stTrackSlot.dY = m_adTrackEma[1];
+            m_stTrackSlot.dZ = m_adTrackEma[2];
+            m_stTrackSlot.bClassMatch = bMatch;
+            m_uTrackSeq.fetch_add(1, std::memory_order_release);  // even
         }
     }
 }
