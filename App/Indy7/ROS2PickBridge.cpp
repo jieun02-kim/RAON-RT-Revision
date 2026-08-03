@@ -169,6 +169,22 @@ CROS2PickBridge::PopGoal(Goal& astOut)
     return TRUE;
 }
 
+BOOL
+CROS2PickBridge::PeekTrack(TrackSample& astOut, uint32_t& auSeq) const
+{
+    // single-attempt seqlock read: a torn read against the 15 Hz writer just
+    // means "no new sample this cycle" — never retry on the RT thread
+    const uint32_t uS1 = m_uTrackSeq.load(std::memory_order_acquire);
+    if (uS1 & 1u)
+        return FALSE;
+    astOut = m_stTrackSlot;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (m_uTrackSeq.load(std::memory_order_relaxed) != uS1)
+        return FALSE;
+    auSeq = uS1;
+    return TRUE;
+}
+
 /* ------------------------------------------------------------- threads -- */
 
 void
@@ -408,6 +424,68 @@ CROS2PickBridge::OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMs
         (int)m_vCollect.size() < m_nGateSamples)
     {
         m_vCollect.push_back(m_stLatest);
+    }
+
+    // ---- tracking sample pipe ('o') — see TrackSample in the header ----
+    // Admission: valid → goal-equivalent in-box(+eps) → jump gate → EMA.
+    // Rejected samples do NOT bump the sequence, so the RT side sees them
+    // as silence and its staleness counter runs — out-of-box and teleport
+    // both degrade to "target lost", never to a commanded sweep.
+    if (apMsg->target_valid && apMsg->depth_valid)
+    {
+        const double dGz = apMsg->z + kv260::TRACK_ZMARGIN_M;
+        const bool bInBox =
+            apMsg->x > m_dBox[0] - TRACK_BOX_EPS_M &&
+            apMsg->x < m_dBox[1] + TRACK_BOX_EPS_M &&
+            apMsg->y > m_dBox[2] - TRACK_BOX_EPS_M &&
+            apMsg->y < m_dBox[3] + TRACK_BOX_EPS_M &&
+            dGz      > m_dBox[4] - TRACK_BOX_EPS_M &&
+            dGz      < m_dBox[5] + TRACK_BOX_EPS_M &&
+            std::sqrt(apMsg->x * apMsg->x + apMsg->y * apMsg->y) <
+                DEF_RMAX_XY + TRACK_BOX_EPS_M;
+        if (bInBox)
+        {
+            const double dGapS = !m_bTrackSeeded ? 1e9 :
+                std::chrono::duration<double>(m_stLatest.tStamp -
+                                              m_tTrackAccept).count();
+            const bool bReseed = !m_bTrackSeeded || dGapS > TRACK_GAP_RESEED_S;
+            const double dJump = bReseed ? 0.0 : std::sqrt(
+                (apMsg->x - m_adTrackRaw[0]) * (apMsg->x - m_adTrackRaw[0]) +
+                (apMsg->y - m_adTrackRaw[1]) * (apMsg->y - m_adTrackRaw[1]) +
+                (apMsg->z - m_adTrackRaw[2]) * (apMsg->z - m_adTrackRaw[2]));
+            if (dJump <= kv260::TRACK_JUMP_M)
+            {
+                m_adTrackRaw[0] = apMsg->x;
+                m_adTrackRaw[1] = apMsg->y;
+                m_adTrackRaw[2] = apMsg->z;
+                if (bReseed)
+                {
+                    // reseed, don't drag the filter across the gap — the
+                    // pre-gap EMA state would sweep the goal from wherever
+                    // the object USED to be (VisualServo's never-reset
+                    // static filterInit is the anti-pattern here)
+                    m_adTrackEma[0] = apMsg->x;
+                    m_adTrackEma[1] = apMsg->y;
+                    m_adTrackEma[2] = apMsg->z;
+                }
+                else
+                {
+                    m_adTrackEma[0] += m_dTrackAlpha * (apMsg->x - m_adTrackEma[0]);
+                    m_adTrackEma[1] += m_dTrackAlpha * (apMsg->y - m_adTrackEma[1]);
+                    m_adTrackEma[2] += m_dTrackAlpha * (apMsg->z - m_adTrackEma[2]);
+                }
+                m_bTrackSeeded = true;
+                m_tTrackAccept = m_stLatest.tStamp;
+                const bool bMatch = m_strSelected.empty() ||
+                                    m_stLatest.strClass == m_strSelected;
+                m_uTrackSeq.fetch_add(1, std::memory_order_acq_rel);  // odd
+                m_stTrackSlot.dX = m_adTrackEma[0];
+                m_stTrackSlot.dY = m_adTrackEma[1];
+                m_stTrackSlot.dZ = m_adTrackEma[2];
+                m_stTrackSlot.bClassMatch = bMatch;
+                m_uTrackSeq.fetch_add(1, std::memory_order_release);  // even
+            }
+        }
     }
 }
 

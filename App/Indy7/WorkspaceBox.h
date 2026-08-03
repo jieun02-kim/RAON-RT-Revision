@@ -30,6 +30,22 @@ static constexpr double WS_BOX[6] = {0.30, 0.94, -0.37, 0.63, 0.10, 0.50};
  * (2026-07-27 field) — genuine reach is the IK solver's verdict. */
 static constexpr double WS_RMAX_XY = 0.92;   // [m] from base axis
 
+/* Tracking ('o') constants shared by the bridge (sample admission) and the
+ * app (goal construction) — one source of truth, ROS-free. */
+
+/* Hover margin while TRACKING a hand-held object. Larger than the 0.15
+ * approach margin: at 0.3 m/s object speed the EMA + pipeline lag leaves
+ * the commanded z ~7 cm behind a rising object, eating into the TCP-object
+ * gap exactly when a hand is under the tool. */
+static constexpr double TRACK_ZMARGIN_M = 0.20;
+
+/* Per-sample teleport gate. Legit motion at 0.3 m/s and 15 Hz is ~2 cm per
+ * frame; a pick_logic instance switch (second object of the same class,
+ * occlusion flicker) jumps tens of cm. Rejected — NOT rate-limited: a rate
+ * limiter would turn the teleport into a slow sweep through the space
+ * between the two objects, which is where the person stands. */
+static constexpr double TRACK_JUMP_M = 0.10;
+
 } // namespace kv260
 
 #endif // __KV260_WORKSPACE_BOX__

@@ -155,6 +155,7 @@ CRobotIndy7::Init(BOOL abSim)
     // [kv260-merge] Gate 2b — perception-pipeline bridge. Non-fatal: the
     // robot must stay usable standalone (no ROS2 pipeline running).
     m_pPickBridge = new CROS2PickBridge();
+    m_pPickBridge->SetTrackAlpha(m_pcConfigRobot->GetSystemConf().dTrackEmaAlpha);
     if (FALSE == m_pPickBridge->Init())
     {
         DBG_LOG_WARN("(%s) ROS2 pick bridge unavailable — running without pipeline link", "CRobotIndy7");
@@ -299,6 +300,19 @@ CRobotIndy7::InitController(const TSTRING& astrURDFPath)
                 Kf[i] = vKfCfg[i];
         m_pController->SetFrictionFF(Kf);
     }
+
+    // [kv260-merge 2026-08-03] tracking knobs (setters clamp the ranges)
+    m_pController->SetMaxLinVel(m_pcConfigRobot->GetSystemConf().dTrackVmaxMps);
+    {
+        INT32 nLostMs = m_pcConfigRobot->GetSystemConf().nTrackLostMs;
+        if (nLostMs < 100)  nLostMs = 100;
+        if (nLostMs > 1900) nLostMs = 1900;   // must fire before TRACK_EXIT_CYC
+        m_nTrackLostCyc = nLostMs;
+    }
+    DBG_LOG_INFO("(%s) Tracking: vmax %.2f m/s, EMA a=%.2f, lost %d ms",
+                 "CRobotIndy7", m_pController->m_dMaxLinVel,
+                 m_pcConfigRobot->GetSystemConf().dTrackEmaAlpha,
+                 m_nTrackLostCyc);
 
     // Pre-allocate RT control vectors
     m_vCurrentPos.resize(dof, 0.0);
@@ -514,9 +528,47 @@ CRobotIndy7::InitEtherCAT()
 	return TRUE;
 }
 
+// [kv260-merge 2026-08-03] Final backstop on a tracking goal — the bridge's
+// admission gates are the primary defence (out-of-box samples never publish);
+// this only bounds what a torn read or a boundary-eps sample could command.
+static void ClampTrackGoal(double& adX, double& adY, double& adZ)
+{
+    const double dR = std::sqrt(adX * adX + adY * adY);
+    if (dR > kv260::WS_RMAX_XY)
+    {
+        adX *= kv260::WS_RMAX_XY / dR;
+        adY *= kv260::WS_RMAX_XY / dR;
+    }
+    if (adX < kv260::WS_BOX[0]) adX = kv260::WS_BOX[0];
+    if (adX > kv260::WS_BOX[1]) adX = kv260::WS_BOX[1];
+    if (adY < kv260::WS_BOX[2]) adY = kv260::WS_BOX[2];
+    if (adY > kv260::WS_BOX[3]) adY = kv260::WS_BOX[3];
+    if (adZ < kv260::WS_BOX[4]) adZ = kv260::WS_BOX[4];
+    if (adZ > kv260::WS_BOX[5]) adZ = kv260::WS_BOX[5];
+}
+
 void
 CRobotIndy7::DoInput()
 {
+    // [2026-08-03] While tracking, only stop/safety keys act — everything
+    // else is swallowed. 'v' is a DELAYED action (its goal pops ~1 s later,
+    // mid-track), 'i' sits one key from 'o' (legacy servo, no singularity
+    // threshold), 'Q' starts the 10-min ISO run, 'b'/'m'/'a'/'n' launch
+    // large trajectories next to the person.
+    if (m_eTrackState != eTRACK_OFF && m_cKeyPress != ' ')
+    {
+        switch (m_cKeyPress)
+        {
+            case 'o': case 'O': case 'j': case 'J': case 'e': case 'E':
+            case 'x': case 'X': case 'g': case 'G':
+                break;
+            default:
+                printf("[TRACK] key '%c' ignored while tracking — "
+                       "'o' stop-hold, 'g' float, 'j' servo off\n", m_cKeyPress);
+                m_cKeyPress = ' ';
+                return;
+        }
+    }
 
     switch (m_cKeyPress)
     {
@@ -867,6 +919,111 @@ CRobotIndy7::DoInput()
             DBG_LOG_INFO("[HOME] returning%s, T=%.1f s (dq_max %.2f rad)",
                          bUseReady ? " to computed q_ready (no user HOME)" : "",
                          dT, dDqMax);
+            break;
+        }
+        case 'o':
+        case 'O':
+        {
+            // [kv260-merge 2026-08-03] tracking toggle — see Indy7Ctrl.h.
+            if (m_eTrackState != eTRACK_OFF)
+            {
+                m_eTrackState = eTRACK_OFF;
+                m_pController->StopTrackingServo();
+                DBG_LOG_INFO("[TRACK] stop — holding here; 'g'=grav-comp");
+                break;
+            }
+            // Entry gates, each with its own refusal (E17 discipline). The
+            // mode gate IS the "'v' approach first" flow: the only way to be
+            // holding in IK6dof near the live target is a completed approach.
+            if (m_pPickBridge == nullptr)
+            {
+                printf("[TRACK] refused — pick bridge unavailable\n");
+                break;
+            }
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+            {
+                printf("[TRACK] refused — controller not enabled ('r' first)\n");
+                break;
+            }
+            {
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < GetTotalAxis(); i++)
+                    if (!m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (!bServoAll)
+                {
+                    printf("[TRACK] refused — servo OFF ('h' first)\n");
+                    break;
+                }
+            }
+            if (m_pController->GetControlMode() !=
+                    CControllerFullDynamicsRT::eInverseKinematics_6dof ||
+                !m_pController->IsTrajectoryRefDone())
+            {
+                printf("[TRACK] refused — finish a 'v' approach first\n");
+                break;
+            }
+            if (m_bRefineActive)
+            {
+                printf("[TRACK] refused — wait for refine to finish\n");
+                break;
+            }
+            if (m_eApproachState != eAPPROACH_IDLE ||
+                m_bIsoHWTrigger.load() || m_bRectTrigger.load())
+            {
+                printf("[TRACK] refused — approach/ISO/RECT busy\n");
+                break;
+            }
+            {
+                // arm settled — entering the non-accumulating servo reference
+                // mid-motion releases the trajectory hold torque (S5)
+                double dVelSq = 0.0;
+                for (size_t i = 0; i < m_vCurrentVel.size(); i++)
+                    dVelSq += m_vCurrentVel[i] * m_vCurrentVel[i];
+                if (dVelSq > STAGE_VEL_EPS * STAGE_VEL_EPS)
+                {
+                    printf("[TRACK] refused — arm still moving\n");
+                    break;
+                }
+            }
+            if (!m_pPickBridge->HasLockedTarget())
+            {
+                printf("[TRACK] refused — no fresh target lock ('p' menu)\n");
+                break;
+            }
+            CROS2PickBridge::TrackSample stS;
+            uint32_t uSeq = 0;
+            if (!m_pPickBridge->PeekTrack(stS, uSeq) || !stS.bClassMatch)
+            {
+                printf("[TRACK] refused — no matching tracking sample\n");
+                break;
+            }
+            double dGx = stS.dX, dGy = stS.dY,
+                   dGz = stS.dZ + kv260::TRACK_ZMARGIN_M;
+            ClampTrackGoal(dGx, dGy, dGz);
+            m_pController->ComputeTcpFK();
+            const RigidBodyDynamics::Math::Vector3d& vTcp =
+                m_pController->GetTcpPose().m_position;
+            const double dDist = std::sqrt(
+                (dGx - vTcp[0]) * (dGx - vTcp[0]) +
+                (dGy - vTcp[1]) * (dGy - vTcp[1]) +
+                (dGz - vTcp[2]) * (dGz - vTcp[2]));
+            if (dDist > TRACK_ENTRY_M)
+            {
+                printf("[TRACK] refused — target %.0f mm away (max %.0f); "
+                       "'v' approach first\n", dDist * 1e3, TRACK_ENTRY_M * 1e3);
+                break;
+            }
+            m_vTrackTarget =
+                RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+            m_uLastTrackSeq     = uSeq;
+            m_nTrackNoSampleCyc = 0;
+            m_pController->StartTrackingServo();
+            m_eTrackState = eTRACK_ON;
+            DBG_LOG_WARN("[TRACK] ON — hover +%.0f mm, vmax %.2f m/s; "
+                         "'o'=stop-hold, 'g'=float, 'j'=servo off",
+                         kv260::TRACK_ZMARGIN_M * 1e3,
+                         m_pController->m_dMaxLinVel);
             break;
         }
         case '0': case '1': case '2': case '3': case '4':
@@ -1392,7 +1549,15 @@ void proc_main_control(void* apRobot)
                     bool bServo = true;
                     for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
                         if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bServo = false; break; }
-                    if (!bServo)
+                    if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF)
+                    {
+                        // delayed 'v': a collection armed BEFORE 'o' pops its
+                        // goal mid-track — discarding is the j→v lesson (a
+                        // deferred goal would fire surprise motion later)
+                        DBG_LOG_ERROR("[APPROACH] goal discarded — tracking "
+                                      "active ('o' stop first, then 'v').");
+                    }
+                    else if (!bServo)
                     {
                         DBG_LOG_ERROR("[APPROACH] goal discarded — servo OFF. "
                                       "Press 'h' (servo on) first, then 'v' again.");
@@ -1535,6 +1700,95 @@ void proc_main_control(void* apRobot)
                         DBG_LOG_ERROR("[REFINE] IK failed on bias target — stop");
                     }
                 }
+            }
+        }
+        //======================================================================
+        // [kv260-merge 2026-08-03] Tracking SM ('o') — consumes the bridge's
+        // seqlock sample pipe at the vision rate and retargets the servo goal
+        // every cycle. Cancel-on-any-change like the staging leg: mode or
+        // servo not exactly as tracking left them → OFF within one cycle.
+        if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF)
+        {
+            bool bTrkServo = true;
+            for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bTrkServo = false; break; }
+            if (!bCtrlOn || !bTrkServo ||
+                pRTController->GetControlMode() !=
+                    CControllerFullDynamicsRT::eTrackingServo)
+            {
+                pRobot->m_eTrackState = CRobotIndy7::eTRACK_OFF;
+                DBG_LOG_WARN("[TRACK] cancelled (mode change / servo off)");
+            }
+            else
+            {
+                CROS2PickBridge::TrackSample stS;
+                uint32_t uSeq = 0;
+                if (pRobot->m_pPickBridge != nullptr &&
+                    pRobot->m_pPickBridge->PeekTrack(stS, uSeq) &&
+                    uSeq != pRobot->m_uLastTrackSeq)
+                {
+                    pRobot->m_uLastTrackSeq = uSeq;
+                    if (stS.bClassMatch)
+                    {
+                        double dGx = stS.dX, dGy = stS.dY,
+                               dGz = stS.dZ + kv260::TRACK_ZMARGIN_M;
+                        ClampTrackGoal(dGx, dGy, dGz);
+                        if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON)
+                        {
+                            // sample-to-sample motion is bounded by the
+                            // bridge jump gate — accept
+                            pRobot->m_vTrackTarget =
+                                RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+                            pRobot->m_nTrackNoSampleCyc = 0;
+                        }
+                        else
+                        {
+                            // LOST → reacquire only NEAR THE TCP; a far
+                            // reappearance (object carried elsewhere,
+                            // pipeline restart) must not command a sweep
+                            const RigidBodyDynamics::Math::Vector3d& vTcp =
+                                pRTController->GetTcpPose().m_position;
+                            const double dD = std::sqrt(
+                                (dGx - vTcp[0]) * (dGx - vTcp[0]) +
+                                (dGy - vTcp[1]) * (dGy - vTcp[1]) +
+                                (dGz - vTcp[2]) * (dGz - vTcp[2]));
+                            if (dD <= CRobotIndy7::TRACK_ENTRY_M)
+                            {
+                                pRobot->m_vTrackTarget =
+                                    RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+                                pRobot->m_nTrackNoSampleCyc = 0;
+                                pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                                DBG_LOG_INFO("[TRACK] reacquired");
+                            }
+                        }
+                    }
+                }
+                if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON &&
+                    ++pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+                {
+                    pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
+                    pRobot->m_nTrackNoSampleCyc = 0;
+                    // hold at the TCP, NOT the last goal: at the speed cap
+                    // the goal leads the TCP by up to ~10 cm — holding the
+                    // goal would keep translating blind after the object
+                    // vanished ("그 자리 정지"의 정확한 구현)
+                    pRobot->m_vTrackTarget =
+                        pRTController->GetTcpPose().m_position;
+                    DBG_LOG_WARN("[TRACK] target lost — holding in place");
+                }
+                else if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_LOST &&
+                         ++pRobot->m_nTrackNoSampleCyc >
+                             CRobotIndy7::TRACK_EXIT_CYC)
+                {
+                    pRobot->m_eTrackState = CRobotIndy7::eTRACK_OFF;
+                    pRTController->StopTrackingServo();
+                    DBG_LOG_WARN("[TRACK] lost %.0f s — tracking OFF "
+                                 "('o' to rearm)",
+                                 CRobotIndy7::TRACK_EXIT_CYC / 1000.0);
+                }
+                if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF)
+                    pRTController->goal_tcpPose.m_position =
+                        pRobot->m_vTrackTarget;
             }
         }
         //======================================================================

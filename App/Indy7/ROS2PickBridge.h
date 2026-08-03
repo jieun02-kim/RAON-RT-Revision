@@ -105,12 +105,33 @@ public:
     void LogApproach(const ApproachReport& astRep);
     static const char* ApproachLogPath();  // approach_results/approach_log.csv
 
+    // [kv260-merge 2026-08-03] Tracking sample pipe ('o'). The ROS callback
+    // publishes every sample that survives finite → in-box → jump gating,
+    // EMA-filtered, into a single seqlock slot. Publication implies
+    // target_valid && depth_valid; the RT side detects staleness by counting
+    // cycles since the sequence number last changed — no clock on the RT
+    // thread. Coordinates are RAW base_link metres (no z margin).
+    struct TrackSample
+    {
+        double dX, dY, dZ;
+        bool   bClassMatch;   // == desired_class ("" selected = matches any)
+    };
+    // [RT] single-attempt seqlock read; FALSE = writer mid-update or torn —
+    // just keep the last accepted target, a fresh sample lands within 66 ms.
+    // auSeq: same even value as last time means "no new sample".
+    BOOL PeekTrack(TrackSample& astOut, uint32_t& auSeq) const;
+
     /* ---- non-RT configuration (call before OP; defaults below) ---- */
     void SetWorkspaceBox(double adXMin, double adXMax, double adYMin,
                          double adYMax, double adZMin, double adZMax);
     void SetZMarginM(double adMargin)   { m_dZMarginM = adMargin; }
     double GetZMarginM() const          { return m_dZMarginM; }
     void SetGate(int anSamples, double adStdGateM, double adTimeoutS);
+    // EMA alpha per 15 Hz vision frame (clamped 0.05..1.0; 1.0 = filter off).
+    void SetTrackAlpha(double adA)
+    {
+        m_dTrackAlpha = adA < 0.05 ? 0.05 : (adA > 1.0 ? 1.0 : adA);
+    }
 
     /* The measured box and its radius cap now live in WorkspaceBox.h so the
      * ROS-free consumers (the app's IK probes, the offline reach-map tool)
@@ -202,6 +223,19 @@ private:
     Goal              m_stGoal;
     std::atomic<bool> m_bGoalReady{false};
     std::atomic<bool> m_bHomeRecordReq{false};  // menu → RT: snapshot joints
+
+    // tracking slot: seqlock (writer = ROS callback, reader = RT PeekTrack).
+    // Even seq = consistent; the writer holds it odd across the slot copy.
+    TrackSample           m_stTrackSlot{};
+    std::atomic<uint32_t> m_uTrackSeq{0};
+    // callback-thread-only filter/gate state
+    double   m_dTrackAlpha{0.4};
+    double   m_adTrackEma[3]{};
+    double   m_adTrackRaw[3]{};     // last ACCEPTED raw (jump-gate reference)
+    bool     m_bTrackSeeded{false};
+    SteadyTP m_tTrackAccept{};      // last accept time (gap → reseed)
+    static constexpr double TRACK_GAP_RESEED_S = 1.0;
+    static constexpr double TRACK_BOX_EPS_M    = 0.02;
 
     /* gate configuration (written before OP only) */
     double m_dBox[6];

@@ -255,7 +255,10 @@ public:
         eComputedTorque,
         eAdaptiveControl,
         eInverseKinematics,       // 'i' : Jacobian-based IK
-        eInverseKinematics_6dof   // 'm' : RBDL IK (position + orientation) + CTC
+        eInverseKinematics_6dof,  // 'm' : RBDL IK (position + orientation) + CTC
+        eTrackingServo            // 'o' : 15 Hz vision goal, per-cycle Jacobian
+                                  //       servo (APPEND ONLY — DataLog stores
+                                  //       ctrl_mode as a raw byte)
     };
     
     void SetControlMode(eControlMode aeMode)
@@ -355,8 +358,21 @@ public:
     RigidBodyDynamics::Math::MatrixNd m_JJt;     // 6 x 6
     RigidBodyDynamics::Math::MatrixNd m_J_pinv;  // DOF x 6
     RigidBodyDynamics::Math::VectorNd m_e_task;  // 6D Cartesian error [angular; linear]
+    // NOTE: Kp_task_pos is load-bearing for STABILITY, not accuracy — raising
+    // it to close the stiction parking offset (~10-15 mm) converts the offset
+    // into a breakaway-overshoot limit cycle. Accuracy is not this knob.
     double m_Kp_task_pos = 1.0;                  // task-space position gain
     double m_Kp_task_rot = 0.2;                  // task-space orientation gain (작게 → flip 방지)
+    // [2026-08-03] tracking-servo state (SetTargetPose_Jacobian / 'o')
+    double m_dMaxLinVel = 0.20;                  // [m/s] Cartesian speed cap
+    // clamped so no cfg value can ever disable the cap
+    void SetMaxLinVel(double adV)
+    { m_dMaxLinVel = adV < 0.05 ? 0.05 : (adV > 0.50 ? 0.50 : adV); }
+    bool m_bNearSingular = false;                // λ hysteresis state
+    bool m_bZAlignOn     = false;                // z-align gate hysteresis state
+    // Enter/exit the per-cycle servo mode. RT thread only (DoInput / SM).
+    void StartTrackingServo();
+    void StopTrackingServo();
     static constexpr double m_dt = 0.001;        // 1kHz → 1ms
     static constexpr double m_lambda = 0.01;     // DLS damping factor
     

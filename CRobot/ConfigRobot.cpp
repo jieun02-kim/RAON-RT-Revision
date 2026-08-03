@@ -438,6 +438,20 @@ CConfigRobot::ReadSystemConfig()
 			m_stSystem.vKf[nCnt] = atof(str);
 		}
 
+		// [kv260-merge 2026-08-03] tracking knobs — absent keys keep the
+		// code defaults, so an unedited operator cfg still runs.
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_VMAX_MPS", "0.20", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.dTrackVmaxMps = atof(str);
+
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_EMA_ALPHA", "0.4", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.dTrackEmaAlpha = atof(str);
+
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_LOST_MS", "500", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.nTrackLostMs = atoi(str);
+
 		ZeroMemory(str);
 		GetPrivateProfileString(strKey.c_str(), "ENABLE_CONTROLLER_AT_STARTUP", "0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
 		m_stSystem.bEnableControllerAtStartup = (BOOL)atoi(str);

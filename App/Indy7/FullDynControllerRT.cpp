@@ -248,6 +248,13 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
             UpdateTrajectory();
             result = ComputeComputedTorque(avOutputTorque);
             break;
+        case eTrackingServo:
+            // per-cycle servo needs a FRESH tcpPose (SetTargetPose_Jacobian
+            // reads it but does not compute it), then the torque law
+            ComputeTcpFK();
+            SetTargetPose_Jacobian();
+            result = ComputeComputedTorque(avOutputTorque);
+            break;
 
         default:
             result = ComputeGravityCompensation(avOutputTorque);
@@ -1507,11 +1514,16 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
 
     // 자세 오차: TCP z축 방향 정렬만 수행 (roll 무시)
     // e_rot = curZ × goalZ — z축을 goalZ로 회전시키는 각속도 방향, magnitude = sin(θ)
+    // [2026-08-03] hysteresis (on 0.06 / off 0.10): a MOVING goal crosses a
+    // single threshold repeatedly, and each crossing was a 0.3 rad/s
+    // rot-velocity step softened only by the accel clamp.
     {
         double pos_err_raw = sqrt(m_e_task[3]*m_e_task[3] +
                                   m_e_task[4]*m_e_task[4] +
                                   m_e_task[5]*m_e_task[5]);
-        if (pos_err_raw < 0.08) {
+        if (m_bZAlignOn) { if (pos_err_raw > 0.10) m_bZAlignOn = false; }
+        else             { if (pos_err_raw < 0.06) m_bZAlignOn = true;  }
+        if (m_bZAlignOn) {
             RigidBodyDynamics::Math::Vector3d curZ  = tcpPose.m_rotation.col(2);
             RigidBodyDynamics::Math::Vector3d goalZ = goal_tcpPose.m_rotation.col(2);
             RigidBodyDynamics::Math::Vector3d e_rot = curZ.cross(goalZ);
@@ -1543,24 +1555,32 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
         }
     }
 
-    // 선속도 클램핑 제거 — 관절 속도 한계(MAX_JOINT_VEL)로만 제한
-
-    // 6. q_ref 적분용 위치 오차 계산 (gain 적용 전 raw 오차)
-    double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
-                              m_e_task[4]*m_e_task[4] +
-                              m_e_task[5]*m_e_task[5]) / m_Kp_task_pos;
+    // [2026-08-03] Cartesian speed hard cap — a person stands next to the arm
+    // during tracking (E17). Kp_task_pos = 1.0 makes e_task[3..5] the
+    // commanded velocity in m/s, so scaling the error vector IS the limit.
+    {
+        double dLin = sqrt(m_e_task[3]*m_e_task[3] +
+                           m_e_task[4]*m_e_task[4] +
+                           m_e_task[5]*m_e_task[5]);
+        if (dLin > m_dMaxLinVel) {
+            const double dS = m_dMaxLinVel / dLin;
+            m_e_task[3] *= dS;
+            m_e_task[4] *= dS;
+            m_e_task[5] *= dS;
+        }
+    }
 
     // 4. DLS pseudo-inverse: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
     // manipulability 기반 adaptive damping
+    // [2026-08-03] two-state with hysteresis (was a 3-way ladder): the raw
+    // w threshold flipped λ by 100x cycle-to-cycle at the boundary, and the
+    // near-goal λ=0.0005 high-gain regime bought nothing — accuracy is
+    // stiction-bound (~10-15 mm) — while keeping near-singular amplification.
     m_JJt.noalias() = m_J * m_J.transpose();
     double w = std::sqrt(std::max(0.0, m_JJt.determinant()));
-    const double w_threshold   = 0.01;
-    const double lambda_high   = 0.05;
-    const double lambda_low    = 0.0005;
-    double lambda;
-    if      (w < w_threshold)    lambda = lambda_high;
-    else if (pos_err_now < 0.01) lambda = lambda_low;
-    else                         lambda = m_lambda;
+    if (m_bNearSingular) { if (w > 0.012) m_bNearSingular = false; }
+    else                 { if (w < 0.008) m_bNearSingular = true;  }
+    const double lambda = m_bNearSingular ? 0.05 : m_lambda;
     m_JJt.diagonal().array() += lambda * lambda;
     m_J_pinv.noalias() = m_J.transpose() * m_JJt.inverse();
 
@@ -1596,6 +1616,15 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
 
+    // [2026-08-03] joint soft limits — the servo path has no IK acceptance
+    // gate (CheckLimitsPhysical never runs here); kill outward velocity
+    // within 0.1 rad of a hard stop instead of leaning on it indefinitely.
+    for (unsigned int i = 0; i < m_uDOF && i < 6; ++i)
+    {
+        if (m_Q[i] > s_adJointHi[i] - 0.1 && m_Qd_ref[i] > 0.0) m_Qd_ref[i] = 0.0;
+        if (m_Q[i] < s_adJointLo[i] + 0.1 && m_Qd_ref[i] < 0.0) m_Qd_ref[i] = 0.0;
+    }
+
     m_Qd_ref_prev = m_Qd_ref;
 
     // 적분 제거: 매 주기 m_Q 기준으로 Q_ref 재계산 (드리프트 없음)
@@ -1615,6 +1644,42 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_Qdd_ref = m_zero_vector;
 
     return TRUE;
+}
+
+// [2026-08-03] Tracking-servo entry/exit. RT thread only — DoInput and the
+// tracking SM both run inside proc_main_control, so nothing interleaves;
+// mode is still set LAST as hygiene (references primed before dispatch).
+void
+CControllerFullDynamicsRT::StartTrackingServo()
+{
+    ComputeTcpFK();
+    goal_tcpPose = tcpPose;      // zero initial error; R FROZEN here — the
+                                 // z-align term now HOLDS this attitude
+    m_Q_ref   = m_Q;
+    m_Qd_ref.setZero();
+    m_Qdd_ref.setZero();
+    m_Qd_ref_prev.setZero();     // stale from a past session = first-cycle
+                                 // lurch through the accel clamp (S5)
+    m_dKfScale = 0.0;            // friction FF hard-off: servo-mode lag is
+                                 // |qd_ref|·1ms ≤ 0.3 of the E35 gate ramp —
+                                 // an untuned regime; stiction costs ~10-15 mm
+                                 // under a 200 mm hover margin
+    m_bNearSingular = false;
+    m_bZAlignOn     = false;
+    m_traj.active   = false;     // no quintic fighting per-cycle references
+    m_eControlMode  = eTrackingServo;
+}
+
+void
+CControllerFullDynamicsRT::StopTrackingServo()
+{
+    // freeze-and-hold, the post-approach idiom: with m_traj inactive,
+    // UpdateTrajectory no-ops and CTC holds the parked reference
+    m_Q_ref   = m_Q;
+    m_Qd_ref.setZero();
+    m_Qdd_ref.setZero();
+    m_traj.active  = false;
+    m_eControlMode = eInverseKinematics_6dof;
 }
 
 

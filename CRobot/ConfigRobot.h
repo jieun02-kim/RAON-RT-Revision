@@ -235,6 +235,10 @@ typedef struct stConfigSystem
 	std::vector<double> vKp; // Kp gains for each axis
 	std::vector<double> vKd; // Kd gains for each axis
 	std::vector<double> vKf; // Coulomb friction feedforward [Nm], 0 = off
+	// [kv260-merge 2026-08-03] tracking ('o') knobs; absent keys = defaults
+	double dTrackVmaxMps;    // Cartesian speed cap (consumer clamps 0.05-0.50)
+	double dTrackEmaAlpha;   // EMA per vision frame (consumer clamps 0.05-1.0)
+	INT32  nTrackLostMs;     // staleness -> LOST hold [ms == 1 kHz cycles]
 
 	ST_CONFIG_EXT_IFACE stExternalIface;
 
@@ -252,6 +256,9 @@ typedef struct stConfigSystem
 		vKp.resize(6, 0.0); // Default 6 DOF
 		vKd.resize(6, 0.0); // Default 6 DOF
 		vKf.resize(6, 0.0);
+		dTrackVmaxMps  = 0.20;
+		dTrackEmaAlpha = 0.4;
+		nTrackLostMs   = 500;
 	};
 
 }ST_CONFIG_SYSTEM;

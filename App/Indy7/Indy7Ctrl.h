@@ -186,6 +186,22 @@ private:
 	static constexpr double REFINE_VEL_EPS    = 0.02;   // [rad/s] |qd| gate
 	static constexpr int    REFINE_SETTLE_CYC = 300;    // 0.3 s below eps
 
+	// [kv260-merge 2026-08-03] Real-time tracking ('o'): TCP follows the
+	// hover point of a hand-held object at the vision rate via the
+	// eTrackingServo mode. Entry only from a completed 'v' approach hold
+	// (TCP within TRACK_ENTRY_M of the live target); loss freezes the goal
+	// AT THE TCP (the last vision goal can lead it by ~10 cm at the speed
+	// cap — holding that would translate blind); loss > TRACK_EXIT_CYC
+	// latches tracking OFF so a pipeline restart can never resume motion.
+	enum eTrackState { eTRACK_OFF=0, eTRACK_ON, eTRACK_LOST };
+	eTrackState m_eTrackState{eTRACK_OFF};
+	uint32_t    m_uLastTrackSeq{0};
+	int         m_nTrackNoSampleCyc{0};
+	int         m_nTrackLostCyc{500};      // cfg TRACK_LOST_MS (1 cyc = 1 ms)
+	RigidBodyDynamics::Math::Vector3d m_vTrackTarget;  // accepted goal (margin+clamp)
+	static constexpr double TRACK_ENTRY_M  = 0.15;  // entry/reacquire proximity
+	static constexpr int    TRACK_EXIT_CYC = 2000;  // 2 s in LOST → latch off
+
 	//=====================================================
 
 public:
