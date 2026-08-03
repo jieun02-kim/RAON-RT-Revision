@@ -1619,10 +1619,18 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     // [2026-08-03] joint soft limits — the servo path has no IK acceptance
     // gate (CheckLimitsPhysical never runs here); kill outward velocity
     // within 0.1 rad of a hard stop instead of leaning on it indefinitely.
+    // [E36 fix, same day] judge in the PHYSICAL frame: m_Q is the ENCODER
+    // COUNTER frame, wound by 2π·k laps (E20 — live session showed J1 −5.8,
+    // J4 −12.6). Comparing raw counters blocked J1's negative velocity
+    // permanently → TCP followed +y but never −y. Fold toward zero first,
+    // exactly like CheckLimitsPhysical. (J6's ±3.75 range exceeds the fold
+    // window so the gate is inert there — roll, no position effect.)
     for (unsigned int i = 0; i < m_uDOF && i < 6; ++i)
     {
-        if (m_Q[i] > s_adJointHi[i] - 0.1 && m_Qd_ref[i] > 0.0) m_Qd_ref[i] = 0.0;
-        if (m_Q[i] < s_adJointLo[i] + 0.1 && m_Qd_ref[i] < 0.0) m_Qd_ref[i] = 0.0;
+        const double dQph = m_Q[i] - 2.0 * M_PI *
+                            std::round(m_Q[i] / (2.0 * M_PI));
+        if (dQph > s_adJointHi[i] - 0.1 && m_Qd_ref[i] > 0.0) m_Qd_ref[i] = 0.0;
+        if (dQph < s_adJointLo[i] + 0.1 && m_Qd_ref[i] < 0.0) m_Qd_ref[i] = 0.0;
     }
 
     m_Qd_ref_prev = m_Qd_ref;
