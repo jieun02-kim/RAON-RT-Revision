@@ -358,10 +358,12 @@ public:
     RigidBodyDynamics::Math::MatrixNd m_JJt;     // 6 x 6
     RigidBodyDynamics::Math::MatrixNd m_J_pinv;  // DOF x 6
     RigidBodyDynamics::Math::VectorNd m_e_task;  // 6D Cartesian error [angular; linear]
-    // NOTE: Kp_task_pos is load-bearing for STABILITY, not accuracy — raising
-    // it to close the stiction parking offset (~10-15 mm) converts the offset
-    // into a breakaway-overshoot limit cycle. Accuracy is not this knob.
-    double m_Kp_task_pos = 1.0;                  // task-space position gain
+    // NOTE: Kp_task_pos sets the approach TIME CONSTANT (τ = 1/Kp), not the
+    // final accuracy — near-zero behavior is governed by the rest deadband,
+    // and the vmax cap + accel clamp bound everything above it. 2.0 = 0.5 s
+    // time constant (1.0 crawled the last 5 cm at 4 cm/s, field verdict:
+    // too slow). Do NOT raise it to chase the stiction parking offset.
+    double m_Kp_task_pos = 2.0;                  // task-space position gain
     double m_Kp_task_rot = 0.2;                  // task-space orientation gain (작게 → flip 방지)
     // [2026-08-03] tracking-servo state (SetTargetPose_Jacobian / 'o')
     double m_dMaxLinVel = 0.20;                  // [m/s] Cartesian speed cap
@@ -369,7 +371,6 @@ public:
     void SetMaxLinVel(double adV)
     { m_dMaxLinVel = adV < 0.05 ? 0.05 : (adV > 0.50 ? 0.50 : adV); }
     bool m_bNearSingular = false;                // λ hysteresis state
-    bool m_bZAlignOn     = false;                // z-align gate hysteresis state
     // Enter/exit the per-cycle servo mode. RT thread only (DoInput / SM).
     void StartTrackingServo();
     void StopTrackingServo();

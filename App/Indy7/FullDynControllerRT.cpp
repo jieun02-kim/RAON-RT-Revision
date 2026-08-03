@@ -1535,30 +1535,15 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_e_task[4] = goal_tcpPose.m_position[1] - tcpPose.m_position[1];
     m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
 
-    // 자세 오차: TCP z축 방향 정렬만 수행 (roll 무시)
-    // e_rot = curZ × goalZ — z축을 goalZ로 회전시키는 각속도 방향, magnitude = sin(θ)
-    // [2026-08-03] hysteresis (on 0.06 / off 0.10): a MOVING goal crosses a
-    // single threshold repeatedly, and each crossing was a 0.3 rad/s
-    // rot-velocity step softened only by the accel clamp.
-    {
-        double pos_err_raw = sqrt(m_e_task[3]*m_e_task[3] +
-                                  m_e_task[4]*m_e_task[4] +
-                                  m_e_task[5]*m_e_task[5]);
-        if (m_bZAlignOn) { if (pos_err_raw > 0.10) m_bZAlignOn = false; }
-        else             { if (pos_err_raw < 0.06) m_bZAlignOn = true;  }
-        if (m_bZAlignOn) {
-            RigidBodyDynamics::Math::Vector3d curZ  = tcpPose.m_rotation.col(2);
-            RigidBodyDynamics::Math::Vector3d goalZ = goal_tcpPose.m_rotation.col(2);
-            RigidBodyDynamics::Math::Vector3d e_rot = curZ.cross(goalZ);
-            m_e_task[0] = m_Kp_task_rot * e_rot[0];
-            m_e_task[1] = m_Kp_task_rot * e_rot[1];
-            m_e_task[2] = m_Kp_task_rot * e_rot[2];
-        } else {
-            m_e_task[0] = 0.0;
-            m_e_task[1] = 0.0;
-            m_e_task[2] = 0.0;
-        }
-    }
+    // 자세: 능동 정렬 없음 — 각속도 명령 0. [2026-08-03] 이전의 z-정렬 항
+    // (동결 자세로의 능동 복원)은 회전 명령이 TCP 위치를 밀고 위치 루프가
+    // 되돌리는 시소를 만들어 J3/J4가 도달 후에도 끝없이 미세 구동했고
+    // (데드밴드 안에서도 회전 명령은 살아 있음), 그 명령이 FF까지 깨워
+    // stick-slip 크립을 유발했다. 각속도 0 명령만으로 DLS 최소노름 해가
+    // 자세를 소프트하게 유지한 채 병진한다 — 능동 복원은 불필요한 일이었다.
+    m_e_task[0] = 0.0;
+    m_e_task[1] = 0.0;
+    m_e_task[2] = 0.0;
 
     // [E37] rest deadband: ±3 mm vision noise at 15 Hz must not stick-slip
     // the wrist around the center. Shaped (err − db), not a hard cut, so the
@@ -1580,20 +1565,6 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_e_task[3] *= m_Kp_task_pos;
     m_e_task[4] *= m_Kp_task_pos;
     m_e_task[5] *= m_Kp_task_pos;
-
-    // 각속도 클램핑 (rad/s)
-    {
-        double rot_mag = sqrt(m_e_task[0]*m_e_task[0] +
-                              m_e_task[1]*m_e_task[1] +
-                              m_e_task[2]*m_e_task[2]);
-        const double MAX_ROT_VEL = 0.30; // rad/s
-        if (rot_mag > MAX_ROT_VEL) {
-            double s = MAX_ROT_VEL / rot_mag;
-            m_e_task[0] *= s;
-            m_e_task[1] *= s;
-            m_e_task[2] *= s;
-        }
-    }
 
     // [2026-08-03] Cartesian speed hard cap — a person stands next to the arm
     // during tracking (E17). Kp_task_pos = 1.0 makes e_task[3..5] the
@@ -1715,7 +1686,6 @@ CControllerFullDynamicsRT::StartTrackingServo()
                                  // center in the field. The FF block bypasses
                                  // the E35 lag gate in this mode (see there).
     m_bNearSingular = false;
-    m_bZAlignOn     = false;
     m_traj.active   = false;     // no quintic fighting per-cycle references
     m_eControlMode  = eTrackingServo;
 }
