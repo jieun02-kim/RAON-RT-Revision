@@ -253,7 +253,31 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
             result = ComputeGravityCompensation(avOutputTorque);
             break;
     }
-    
+
+    // Torque backstop: nothing downstream saturates (SaturateOutput is never
+    // wired and MoveTorque writes drive current unchecked). URDF effort
+    // limits per joint; any non-finite value means the dynamics are poisoned
+    // — zero ALL joints and fail the cycle (the app's FALSE path already
+    // writes zero torque) rather than emit full-scale current.
+    {
+        static constexpr double s_adTauMax[6] =
+            {431.97, 431.97, 197.23, 79.79, 79.79, 79.79};
+        for (unsigned int i = 0; i < m_uDOF; ++i) {
+            if (!std::isfinite(avOutputTorque[i])) {
+                std::fill(avOutputTorque.begin(), avOutputTorque.end(), 0.0);
+                static uint32_t s_uNanCnt = 0;
+                if ((s_uNanCnt++ % 1000) == 0)
+                    DBG_LOG_ERROR("(FullDynRT) non-finite torque on J%u — "
+                                  "output zeroed (x%u)", i, s_uNanCnt);
+                result = FALSE;
+                break;
+            }
+            const double dMax = (i < 6) ? s_adTauMax[i] : 79.79;
+            if (avOutputTorque[i] >  dMax) avOutputTorque[i] =  dMax;
+            if (avOutputTorque[i] < -dMax) avOutputTorque[i] = -dMax;
+        }
+    }
+
     // RT performance monitoring
     uint64_t t_end = read_timer();
     uint64_t computation_time = t_end - t_start;

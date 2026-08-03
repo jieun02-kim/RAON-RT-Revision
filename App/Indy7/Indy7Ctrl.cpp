@@ -425,7 +425,7 @@ CRobotIndy7::InitEtherCAT()
             m_pEcatAxis[nCnt]->SetAccelerationLimits(stSlaveInfo.dAccLimitL, stSlaveInfo.dAccLimitU);
             m_pEcatAxis[nCnt]->SetDecelerationLimits(stSlaveInfo.dDecLimitL, stSlaveInfo.dDecLimitU);
             m_pEcatAxis[nCnt]->SetJerkLimits(stSlaveInfo.dJerkLimitL, stSlaveInfo.dJerkLimitU);
-            m_pEcatAxis[nCnt]->SetTorqueLimits(stSlaveInfo.dTorLimitL, stSlaveInfo.dJerkLimitU);
+            m_pEcatAxis[nCnt]->SetTorqueLimits(stSlaveInfo.dTorLimitL, stSlaveInfo.dTorLimitU);
             m_pEcatAxis[nCnt]->SetPositionLimits(stSlaveInfo.dPosLimitL, stSlaveInfo.dPosLimitU);
             m_pEcatAxis[nCnt]->SetAutoServoOn(stSlaveInfo.bAutoServoOn);
             

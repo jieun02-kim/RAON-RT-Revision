@@ -258,7 +258,19 @@ public:
         eInverseKinematics_6dof   // 'm' : RBDL IK (position + orientation) + CTC
     };
     
-    void SetControlMode(eControlMode aeMode) { m_eControlMode = aeMode; }
+    void SetControlMode(eControlMode aeMode)
+    {
+        // eComputedTorque consumes m_Q_ref verbatim with no leash: entering
+        // it with a stale reference (arm hand-guided away in grav-comp, old
+        // goal left behind) commands M·Kp·e at the full error. Snap the
+        // reference to the live posture so 'c' always starts at zero error.
+        if (aeMode == eComputedTorque && m_eControlMode != eComputedTorque) {
+            m_Q_ref = m_Q;
+            m_Qd_ref.setZero();
+            m_Qdd_ref.setZero();
+        }
+        m_eControlMode = aeMode;
+    }
     eControlMode GetControlMode() const { return m_eControlMode; }
     
     // Performance monitoring

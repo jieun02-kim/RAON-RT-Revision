@@ -386,6 +386,12 @@ CROS2PickBridge::TickApproachLog()
 void
 CROS2PickBridge::OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMsg)
 {
+    // A non-finite coordinate would poison every mean/EMA it enters and pass
+    // straight through comparison-based box checks (NaN compares false).
+    if (!std::isfinite(apMsg->x) || !std::isfinite(apMsg->y) ||
+        !std::isfinite(apMsg->z))
+        return;
+
     std::lock_guard<std::mutex> cLock(m_Mtx);
     m_stLatest.dX       = apMsg->x;
     m_stLatest.dY       = apMsg->y;
