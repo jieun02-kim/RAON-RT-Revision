@@ -432,13 +432,25 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // Trailing is the only state where friction is the enemy; caught-up or
     // ahead, friction braking is what we want. 0.002 rad ramp keeps the term
     // continuous (real mid-move lag is 0.01-0.13 rad, solidly gate=1).
+    // [2026-08-03] eTrackingServo: the lag gate does NOT transfer. The servo
+    // reference is non-accumulating (q_ref = m_Q + qd_ref·dt), so lag is
+    // qd_ref·0.001 ≈ 1e-4 rad by construction — 5 % of the 0.002 ramp,
+    // neutering FF exactly where stiction parks J3/J4 short of center
+    // (field: TCP visibly off-center, wrist frozen). The E35 overrun the
+    // gate protects against needs an open-loop ref marching on the settle
+    // leash; the servo's qd_ref is CLOSED-LOOP on the remaining error, so
+    // sat(qd_ref/0.01) itself decays FF continuously to zero at the goal
+    // and flips it with the command — that ramp is the anti-overrun device.
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
             double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
-            double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
-            double dG = dLag / 0.002;
-            if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
+            double dG = 1.0;
+            if (m_eControlMode != eTrackingServo) {
+                double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+                dG = dLag / 0.002;
+                if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
+            }
             m_tau_total[i] += m_Kf[i] * m_dKfScale * dS * dG;
         }
     }
@@ -1668,10 +1680,12 @@ CControllerFullDynamicsRT::StartTrackingServo()
     m_Qdd_ref.setZero();
     m_Qd_ref_prev.setZero();     // stale from a past session = first-cycle
                                  // lurch through the accel clamp (S5)
-    m_dKfScale = 0.0;            // friction FF hard-off: servo-mode lag is
-                                 // |qd_ref|·1ms ≤ 0.3 of the E35 gate ramp —
-                                 // an untuned regime; stiction costs ~10-15 mm
-                                 // under a 200 mm hover margin
+    m_dKfScale = 1.0;            // friction FF ON (2026-08-03 v2): without it
+                                 // the near-goal drive is only M·Kd·qd_ref
+                                 // (~1-2 Nm at cm-scale error) vs the 7-10 Nm
+                                 // J3 breakaway — the wrist froze short of
+                                 // center in the field. The FF block bypasses
+                                 // the E35 lag gate in this mode (see there).
     m_bNearSingular = false;
     m_bZAlignOn     = false;
     m_traj.active   = false;     // no quintic fighting per-cycle references
