@@ -39,6 +39,15 @@ static constexpr double WS_RMAX_XY = 0.92;   // [m] from base axis
  * gap exactly when a hand is under the tool. */
 static constexpr double TRACK_ZMARGIN_M = 0.20;
 
+/* Hard floor for a TRACKING goal z (TCP command, base frame). The box's
+ * z_min 0.10 IS the table surface — a depth glitch (bbox center sampling
+ * past the object) can legally read the object below the table and command
+ * the TCP into it. 0.25 keeps the tool tip (~5 cm stack) ≥ ~10 cm above
+ * the table; real hover goals (object top ≥ ~0.13 + 0.20 margin) never
+ * touch this floor. Below-floor samples are REJECTED at admission (the
+ * glitched x/y would be wrong too), the clamp is only the backstop. */
+static constexpr double TRACK_GOAL_ZMIN_M = 0.25;
+
 } // namespace kv260
 
 #endif // __KV260_WORKSPACE_BOX__

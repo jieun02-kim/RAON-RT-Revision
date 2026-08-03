@@ -543,7 +543,8 @@ static void ClampTrackGoal(double& adX, double& adY, double& adZ)
     if (adX > kv260::WS_BOX[1]) adX = kv260::WS_BOX[1];
     if (adY < kv260::WS_BOX[2]) adY = kv260::WS_BOX[2];
     if (adY > kv260::WS_BOX[3]) adY = kv260::WS_BOX[3];
-    if (adZ < kv260::WS_BOX[4]) adZ = kv260::WS_BOX[4];
+    // z floor = tracking minimum, NOT the box z_min (= the table surface)
+    if (adZ < kv260::TRACK_GOAL_ZMIN_M) adZ = kv260::TRACK_GOAL_ZMIN_M;
     if (adZ > kv260::WS_BOX[5]) adZ = kv260::WS_BOX[5];
 }
 

@@ -432,25 +432,36 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // Trailing is the only state where friction is the enemy; caught-up or
     // ahead, friction braking is what we want. 0.002 rad ramp keeps the term
     // continuous (real mid-move lag is 0.01-0.13 rad, solidly gate=1).
-    // [2026-08-03] eTrackingServo: the lag gate does NOT transfer. The servo
-    // reference is non-accumulating (q_ref = m_Q + qd_ref·dt), so lag is
-    // qd_ref·0.001 ≈ 1e-4 rad by construction — 5 % of the 0.002 ramp,
-    // neutering FF exactly where stiction parks J3/J4 short of center
-    // (field: TCP visibly off-center, wrist frozen). The E35 overrun the
-    // gate protects against needs an open-loop ref marching on the settle
-    // leash; the servo's qd_ref is CLOSED-LOOP on the remaining error, so
-    // sat(qd_ref/0.01) itself decays FF continuously to zero at the goal
-    // and flips it with the command — that ramp is the anti-overrun device.
+    // [2026-08-03] eTrackingServo: the POSITION lag gate does not transfer —
+    // the non-accumulating reference makes lag ≈ qd_ref·dt ≈ 1e-4 rad, 5 %
+    // of the 0.002 ramp, so FF was neutered where stiction parks the wrist.
+    // [E37, same day] The first fix (bypass the gate, dG=1) recreated E33 in
+    // continuous form: sat(qd_ref/0.01) saturates at a mm-scale error, so FF
+    // was bang-bang ±KF around zero error (stick-slip twitching), and during
+    // a sustained descent a broken-away joint running on LOW KINETIC friction
+    // kept receiving full FF — the Cartesian cap limits only the COMMANDED
+    // velocity, damping alone couldn't hold 6 Nm, and the arm dove for the
+    // table. The gate's principle (assist only while TRAILING, brake when
+    // ahead) was the load-bearing part; only its measurement space was wrong
+    // for this mode. Servo regime → measure trailing in VELOCITY:
+    //   dG = clamp((qd_ref − qd)·sign(qd_ref) / 0.01, 0, 1)
+    // Stalled joint: dG=1, full breakaway assist. At commanded speed: dG→0,
+    // FF self-balances to ≈ kinetic friction. Ahead/faster than commanded:
+    // dG=0 — runaway channel closed, exactly E35's "caught-up or ahead,
+    // friction braking is what we want".
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
             double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
-            double dG = 1.0;
-            if (m_eControlMode != eTrackingServo) {
+            double dG;
+            if (m_eControlMode == eTrackingServo) {
+                double dVLag = (m_Qd_ref[i] - m_Qd[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+                dG = dVLag / 0.01;
+            } else {
                 double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
                 dG = dLag / 0.002;
-                if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
             }
+            if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
             m_tau_total[i] += m_Kf[i] * m_dKfScale * dS * dG;
         }
     }
@@ -1546,6 +1557,23 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
             m_e_task[0] = 0.0;
             m_e_task[1] = 0.0;
             m_e_task[2] = 0.0;
+        }
+    }
+
+    // [E37] rest deadband: ±3 mm vision noise at 15 Hz must not stick-slip
+    // the wrist around the center. Shaped (err − db), not a hard cut, so the
+    // command grows continuously from zero at the band edge — a hard edge
+    // would bang the FF on/off right where stiction lives.
+    {
+        const double TRACK_DEADBAND_M = 0.010;
+        const double dErr = sqrt(m_e_task[3]*m_e_task[3] +
+                                 m_e_task[4]*m_e_task[4] +
+                                 m_e_task[5]*m_e_task[5]);
+        if (dErr <= TRACK_DEADBAND_M) {
+            m_e_task[3] = 0.0; m_e_task[4] = 0.0; m_e_task[5] = 0.0;
+        } else {
+            const double dSh = (dErr - TRACK_DEADBAND_M) / dErr;
+            m_e_task[3] *= dSh; m_e_task[4] *= dSh; m_e_task[5] *= dSh;
         }
     }
 

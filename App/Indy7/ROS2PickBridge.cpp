@@ -439,12 +439,15 @@ CROS2PickBridge::OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMs
     if (apMsg->target_valid && apMsg->depth_valid)
     {
         const double dGz = apMsg->z + kv260::TRACK_ZMARGIN_M;
+        // z floor = TRACK_GOAL_ZMIN_M, not the box (whose z_min IS the
+        // table): a depth glitch that reads the object below the table gets
+        // rejected outright — its x/y would be glitched too (E37).
         const bool bInBox =
             apMsg->x > m_dBox[0] - TRACK_BOX_EPS_M &&
             apMsg->x < m_dBox[1] + TRACK_BOX_EPS_M &&
             apMsg->y > m_dBox[2] - TRACK_BOX_EPS_M &&
             apMsg->y < m_dBox[3] + TRACK_BOX_EPS_M &&
-            dGz      > m_dBox[4] - TRACK_BOX_EPS_M &&
+            dGz      > kv260::TRACK_GOAL_ZMIN_M - TRACK_BOX_EPS_M &&
             dGz      < m_dBox[5] + TRACK_BOX_EPS_M &&
             std::sqrt(apMsg->x * apMsg->x + apMsg->y * apMsg->y) <
                 DEF_RMAX_XY + TRACK_BOX_EPS_M;
