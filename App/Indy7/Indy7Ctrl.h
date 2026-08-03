@@ -26,28 +26,6 @@
 #include "ROS2PickBridge.h"
 
 
-typedef std::vector<double> VECDOUBLE;
-typedef std::list<UINT64>   LISTULONG;
-typedef std::list<INT32>	LISTINT;
-
-
-typedef struct stDataLog
-{
-	LISTULONG	vecTimestamp;
-	LISTINT		vecTarPos;
-	LISTINT		vecActPos;
-	LISTINT		vecActTor;
-
-	stDataLog()
-	{
-		vecTimestamp.clear();
-		vecTarPos.clear();
-		vecActPos.clear();
-		vecActTor.clear();
-	}
-
-}ST_DATALOG;
-
 class CRobotIndy7 : public CRobot
 {
 public:
@@ -57,10 +35,8 @@ public:
 public:
 	virtual BOOL	Init					(BOOL abSim);
 	virtual BOOL	DeInit					(	);
-	void	WriteDataLog					(	);
 
 	enum eISOHWState { eISO_HW_IDLE=0, eISO_HW_TO_TARGET, eISO_HW_TO_CLEARANCE, eISO_HW_DONE };
-	enum eRectState  { eRECT_IDLE=0, eRECT_TO_CORNER };
 	enum eApproachState { eAPPROACH_IDLE=0, eAPPROACH_MOVING, eAPPROACH_STAGING };
 	
 	/* Controller */
@@ -71,14 +47,8 @@ public:
     BOOL SetControllerGains(const std::vector<double>& avKp, const std::vector<double>& avKd);
 	BOOL IsMoving();
 
-private:
-	TSTRING		m_strDataLog;
-	ST_DATALOG	m_stDataLog[32];
-
 protected:
 	virtual BOOL	InitEtherCAT			(	);
-	virtual BOOL	InitConfig				(	);
-	virtual void	DoAgingTest				(	);
 
 	CAxisNRMKCore**			m_pEcatAxis;
 	CSensorNRMKEndTool**	m_pEcatSensor;
@@ -86,7 +56,6 @@ protected:
 	/* TEMPORARY */
 	char	m_cKeyPress;
 	void	DoInput						(	);
-	void	DoHoming() {};
 
 protected:
 	friend void	proc_main_control(void*);
@@ -98,8 +67,6 @@ protected:
 
 private:
 	BOOL m_bEcatOP;
-	UINT32	m_nEcatCycle;
-	BOOL m_bEnableTriangleControl{false};
 
 	/* Controller */
 	CControllerFullDynamicsRT*	m_pController;
@@ -140,7 +107,6 @@ private:
 
 	// Rectangle (Square) Motion — 'n' key
 	std::atomic<bool>               m_bRectTrigger{false};
-	eRectState                      m_eRectState{eRECT_IDLE};
 	int                             m_nRectCornerIdx{0};
 	int                             m_nRectWaitCount{0};
 	CControllerFullDynamicsRT::Pose m_rectCorners[4];

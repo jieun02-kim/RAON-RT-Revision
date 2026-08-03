@@ -87,8 +87,6 @@ int main(int argc, char **argv)
         usleep(1000);
     }
 
-    // lagacy code..maybe..
-    // g_cRobot->WriteDataLog();
 
     DBG_LOG_INFO("=======================ROBOT APPLICATION ENDED!=======================");
     return RET_SUCC;

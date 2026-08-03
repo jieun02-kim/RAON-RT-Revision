@@ -34,8 +34,6 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     m_pEcatAxis = NULL;
     m_pEcatSensor = NULL;
     m_bStopTask = FALSE;
-    m_strDataLog = "DataLog_";
-    m_nEcatCycle = 0;
     m_bEcatOP = FALSE;
  
     // Initialize RT Controller
@@ -57,13 +55,24 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     /* Set Robot Name */
     m_strName = m_pcConfigRobot->GetSystemConf().strName;
 
-    /* todo: 1. check return values, 2. include fucnction pointers in the loop without using void vectors */
-    /* this is temporary */
-    AddTaskFunction(&proc_main_control);
-    AddTaskFunction(&proc_ethercat_control);
-    AddTaskFunction(&proc_keyboard_control);
-    AddTaskFunction(&proc_terminal_output);
-    AddTaskFunction(&proc_logger);
+    static PTASKFCN apTaskFunctions[] =
+    {
+        &proc_main_control,
+        &proc_ethercat_control,
+        &proc_keyboard_control,
+        &proc_terminal_output,
+        &proc_logger
+    };
+
+    for (UINT32 uCnt = 0; uCnt < sizeof(apTaskFunctions) / sizeof(apTaskFunctions[0]); uCnt++)
+    {
+        if (FALSE == AddTaskFunction(apTaskFunctions[uCnt]))
+        {
+            DBG_LOG_ERROR("(%s) Cannot add task function No. %u", "CRobotIndy7", uCnt);
+            m_bStopTask = TRUE;
+            break;
+        }
+    }
 }
 
 CRobotIndy7::~CRobotIndy7()
@@ -496,7 +505,6 @@ CRobotIndy7::InitEtherCAT()
 	}
     
     ST_CONFIG_ECAT_MASTER stEcatMaster = m_pcConfigRobot->GetEcatMasterConf();
-    m_nEcatCycle = stEcatMaster.nCycleTime;
     /* todo: parameterize EtherCAT cycle time (task period) */
     if (FALSE == m_pcEcatMaster->Init(stEcatMaster.nCycleTime, stEcatMaster.bDCEnabled))
     {
@@ -506,36 +514,12 @@ CRobotIndy7::InitEtherCAT()
 	return TRUE;
 }
 
-BOOL
-CRobotIndy7::InitConfig()
-{
-    return TRUE;
-}
-
-void
-CRobotIndy7::DoAgingTest()
-{
-   
-}
-
 void
 CRobotIndy7::DoInput()
 {
 
     switch (m_cKeyPress)
     {
-        case 'y':
-        case 'Y':
-            m_pEcatSensor[0]->LED_GREEN(TRUE);
-            break;
-        case 'u':
-        case 'U':
-            m_pEcatSensor[0]->LED_RED(TRUE);
-            break;
-        case 'o':
-        case 'O':
-            m_pEcatSensor[0]->LED_OFF();
-            break;   // [kv260-merge] was falling through into 'h'
         // [kv260-merge] Phase 4 — operator-gated servo arm/disarm (there was
         // NO keyboard servo-on path; the author ran AUTO_SERVO_ON=1 instead).
         // Interlock: CST drives enable at zero torque, so the controller must
@@ -632,7 +616,6 @@ CRobotIndy7::DoInput()
         case 'N':
             if (m_bRectTrigger.load()) {
                 m_bRectTrigger = false;
-                m_eRectState   = eRECT_IDLE;
                 m_bLogTrigger  = FALSE;
                 SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
                 DBG_LOG_INFO(">>> Rectangle Mode STOP");
@@ -666,7 +649,6 @@ CRobotIndy7::DoInput()
                 // 첫 번째 꼭짓점으로 1.5s 궤적 시작
                 m_nRectCornerIdx = 0;
                 m_nRectWaitCount = 0;
-                m_eRectState     = eRECT_TO_CORNER;
                 m_pEcatSensor[0]->LED_RED(TRUE);
                 m_pController->StartJointTrajectory(m_rectJointTargets[0], 2.0);
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
@@ -900,42 +882,6 @@ CRobotIndy7::DoInput()
 
     m_cKeyPress = ' ';
     return;
-}
-
-void
-CRobotIndy7::WriteDataLog()
-{
-    for (int nCnt = 0; nCnt < 8; nCnt++)
-    {
-        TSTRING strAxisNo;
-        sprintf(&strAxisNo[0], "Axis%d", nCnt);
-        TSTRING fileName =  m_strDataLog + strAxisNo.c_str() + ".csv";
-        FILE* pfFileTiming = fopen(fileName.c_str(), "w");
-        double dTimeDuration = 0.;
-
-        LISTINT::iterator itTarPos = m_stDataLog[nCnt].vecTarPos.begin();
-        LISTINT::iterator itActPos = m_stDataLog[nCnt].vecActPos.begin();
-        LISTINT::iterator itActTor = m_stDataLog[nCnt].vecActTor.begin();
-        LISTULONG::iterator itTimeStamp = m_stDataLog[nCnt].vecTimestamp.begin();
-    
-        if ((int)m_stDataLog[nCnt].vecActPos.size() == (int)m_stDataLog[nCnt].vecTarPos.size())
-        {
-        
-            for (; itTarPos != m_stDataLog[nCnt].vecTarPos.end(); itTarPos++, itActPos++, itActTor++, itTimeStamp++)
-            {
-                dTimeDuration += 0.001;
-                fprintf(pfFileTiming, "%lf %ld %d %d %d\n", dTimeDuration, *itTimeStamp, *itTarPos, *itActPos, *itActTor);
-            }
-        }
-        else
-        {
-            DBG_LOG_WARN("[%s] Cannot write datalog for Axis %d, ActPos:%d, TarPos:%d, ActTor:%d, TS:%d", "CRobotIndy7", nCnt, m_stDataLog[nCnt].vecActPos.size(),
-                m_stDataLog[nCnt].vecTarPos.size(), m_stDataLog[nCnt].vecActTor.size(), m_stDataLog[nCnt].vecTimestamp.size());
-            
-            continue;
-        }
-        fclose(pfFileTiming);
-    }
 }
 
 // [kv260-merge] arm the refinement SM (see header). Rotation is irrelevant:
@@ -1748,12 +1694,6 @@ proc_keyboard_control(void* apRobot)
 
         pRobot->m_cKeyPress = cKeyPress;
 
-        // if ((cKeyPress == 'i' || cKeyPress == 'I')&& pRTController != NULL)
-        // {
-        //     //pRTController->SetControlMode(CControllerFullDynamicsRT::eInverseKinematics);
-        //     pRTController->m_bIkTrigger = TRUE;
-
-        // }
     }
     
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_keyboard_control");
@@ -2022,6 +1962,5 @@ CRobotIndy7::SaveISOHWResults()
     fclose(fp);
     DBG_LOG_INFO("[ISO-HW] Saved: %s", szFilename);
 }
-
 
 
