@@ -999,13 +999,32 @@ CRobotIndy7::DoInput()
             m_bRefineActive = false;   // a pending refine must not fight the servo
             m_vTrackTarget =
                 RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+            m_vTrackPending     = m_vTrackTarget;
             m_uLastTrackSeq     = uSeq;
             m_nTrackNoSampleCyc = 0;
-            m_pController->StartTrackingServo();
-            m_eTrackState = eTRACK_ON;
-            DBG_LOG_WARN("[TRACK] ON — following the selected object, "
-                         "hover +%.0f mm, vmax %.2f m/s; 'p'+digit=retarget, "
-                         "'o'=stop-hold, 'g'=float, 'j'=servo off",
+            m_nTrackSettleCnt   = 0;
+            m_nTrackLegCooldown = 0;
+            // far goal → the proven trajectory stack; near → servo follow
+            m_pController->ComputeTcpFK();
+            {
+                const RigidBodyDynamics::Math::Vector3d vD =
+                    m_vTrackTarget - m_pController->GetTcpPose().m_position;
+                if (vD.norm() > TRACK_SERVO_RANGE_M)
+                {
+                    if (!StartTrackLeg(m_vTrackTarget))
+                        break;   // refused with its own message; nothing moved
+                    m_eTrackState = eTRACK_LEG;
+                }
+                else
+                {
+                    m_pController->StartTrackingServo();
+                    m_eTrackState = eTRACK_ON;
+                }
+            }
+            DBG_LOG_WARN("[TRACK] ON (%s) — hover +%.0f mm, vmax %.2f m/s; "
+                         "'p'+digit=retarget, 'o'=stop-hold, 'g'=float, "
+                         "'j'=servo off",
+                         m_eTrackState == eTRACK_LEG ? "approach leg" : "servo",
                          kv260::TRACK_ZMARGIN_M * 1e3,
                          m_pController->m_dMaxLinVel);
             break;
@@ -1085,6 +1104,48 @@ CRobotIndy7::EmitApproachReport()
     stRep.nGapAxis    = stD.nBranchAxis;
 
     m_pPickBridge->LogApproach(stRep);
+}
+
+// [kv260-merge 2026-08-03] Tracking approach leg — the proven large-move
+// stack (SolveReadyIK: deterministic, candidates ranked by MINIMUM joint
+// travel; quintic with the E13 speed cap) fired by the tracking SM whenever
+// the goal is beyond servo range. Returns TRUE when the leg started.
+BOOL
+CRobotIndy7::StartTrackLeg(const RigidBodyDynamics::Math::Vector3d& avGoal)
+{
+    CControllerFullDynamicsRT* pC = m_pController;
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErrM = 0.0, dDqMax = 0.0;
+    int    nAxis = -1;
+    if (!pC->SolveReadyIK(avGoal, vqSol, dErrM, dDqMax, nAxis))
+    {
+        DBG_LOG_WARN("[TRACK] leg refused — no reachable solution for "
+                     "(%.3f, %.3f, %.3f); holding here",
+                     avGoal[0], avGoal[1], avGoal[2]);
+        return FALSE;
+    }
+    if (dDqMax > CControllerFullDynamicsRT::IK_DQ_MAX_RAD)
+    {
+        // tracking never stages through q_ready — a two-leg surprise next to
+        // a person is the j→v trap; the operator can 'o'-stop, 'b', 'o'.
+        DBG_LOG_WARN("[TRACK] leg refused — solution %.2f rad away (J%d); "
+                     "'o' stop, 'b' home, then 'o' again", dDqMax, nAxis);
+        return FALSE;
+    }
+    const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+        dDqMax, APPROACH_DURATION_S);
+    CControllerFullDynamicsRT::Pose stTarget;
+    stTarget.m_position = avGoal;
+    stTarget.m_rotation = pC->ToolRotAt(vqSol);
+    // grav-comp bracket: the IK6dof consumer must not see a half-built
+    // trajectory (same pattern as 'b'/TryReadyApproach)
+    SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+    pC->StartJointTrajectory(vqSol, dT);
+    SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+    pC->goal_tcpPose = stTarget;   // 'd'/logger read this (E23)
+    DBG_LOG_INFO("[TRACK] leg → (%.3f, %.3f, %.3f)  T=%.1f s  dq %.2f rad J%d",
+                 avGoal[0], avGoal[1], avGoal[2], dT, dDqMax, nAxis);
+    return TRUE;
 }
 
 // [kv260-merge] One ready-seed approach attempt (rationale in the header).
@@ -1696,15 +1757,20 @@ void proc_main_control(void* apRobot)
             bool bTrkServo = true;
             for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
                 if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bTrkServo = false; break; }
+            const bool bLegState =
+                (pRobot->m_eTrackState == CRobotIndy7::eTRACK_LEG);
+            const CControllerFullDynamicsRT::eControlMode eExpect = bLegState
+                ? CControllerFullDynamicsRT::eInverseKinematics_6dof
+                : CControllerFullDynamicsRT::eTrackingServo;
             if (!bCtrlOn || !bTrkServo ||
-                pRTController->GetControlMode() !=
-                    CControllerFullDynamicsRT::eTrackingServo)
+                pRTController->GetControlMode() != eExpect)
             {
                 pRobot->m_eTrackState = CRobotIndy7::eTRACK_OFF;
                 DBG_LOG_WARN("[TRACK] cancelled (mode change / servo off)");
             }
             else
             {
+                // 1) ingest the freshest sample (all substates)
                 CROS2PickBridge::TrackSample stS;
                 uint32_t uSeq = 0;
                 if (pRobot->m_pPickBridge != nullptr &&
@@ -1714,16 +1780,16 @@ void proc_main_control(void* apRobot)
                     pRobot->m_uLastTrackSeq = uSeq;
                     if (stS.bClassMatch)
                     {
-                        // [2026-08-03 v2] every fresh matching sample is the
-                        // goal — from ANY distance (retarget via 'p'+digit,
-                        // reappearance after occlusion, pipeline restart all
-                        // just glide the TCP there at the speed cap)
                         double dGx = stS.dX, dGy = stS.dY,
                                dGz = stS.dZ + kv260::TRACK_ZMARGIN_M;
                         ClampTrackGoal(dGx, dGy, dGz);
-                        pRobot->m_vTrackTarget =
-                            RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+                        const RigidBodyDynamics::Math::Vector3d vNew(dGx, dGy, dGz);
+                        pRobot->m_vTrackPending     = vNew;
                         pRobot->m_nTrackNoSampleCyc = 0;
+                        // STAGE keeps its servo goal frozen at the TCP (it is
+                        // braking); everyone else follows the fresh goal
+                        if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_STAGE)
+                            pRobot->m_vTrackTarget = vNew;
                         if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_LOST)
                         {
                             pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
@@ -1731,23 +1797,118 @@ void proc_main_control(void* apRobot)
                         }
                     }
                 }
-                if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON &&
-                    ++pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+
+                // 2) substate logic
+                if (bLegState)
                 {
-                    pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
-                    pRobot->m_nTrackNoSampleCyc = 0;
-                    // hold at the TCP, NOT the last goal: at the speed cap
-                    // the goal leads the TCP by up to ~10 cm — holding the
-                    // goal would keep translating blind after the object
-                    // vanished ("그 자리 정지"의 정확한 구현). Tracking stays
-                    // armed indefinitely; it resumes on the next sample.
-                    pRobot->m_vTrackTarget =
-                        pRTController->GetTcpPose().m_position;
-                    DBG_LOG_WARN("[TRACK] target lost — holding until it "
-                                 "reappears ('o' to stop)");
+                    // proven quintic in flight — open-loop like 'v'; hand off
+                    // to the servo once done AND the arm has stopped
+                    if (!pRTController->IsTrajectoryRefDone())
+                    {
+                        pRobot->m_nTrackSettleCnt = 0;
+                    }
+                    else if ([&]{
+                        double dVelSq = 0.0;
+                        for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            dVelSq += pRobot->m_vCurrentVel[nCnt] *
+                                      pRobot->m_vCurrentVel[nCnt];
+                        if (dVelSq > CRobotIndy7::STAGE_VEL_EPS *
+                                     CRobotIndy7::STAGE_VEL_EPS)
+                        {
+                            pRobot->m_nTrackSettleCnt = 0;
+                            return false;
+                        }
+                        return ++pRobot->m_nTrackSettleCnt >=
+                               CRobotIndy7::STAGE_SETTLE_CYC;
+                    }())
+                    {
+                        pRobot->m_nTrackSettleCnt = 0;
+                        pRTController->StartTrackingServo();  // goal = TCP
+                        if (pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_WARN("[TRACK] leg done, target stale — "
+                                         "holding");
+                        }
+                        else
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                            DBG_LOG_INFO("[TRACK] leg done — servo follow");
+                        }
+                    }
                 }
-                pRTController->goal_tcpPose.m_position =
-                    pRobot->m_vTrackTarget;
+                else
+                {
+                    // servo substates: staleness → LOST (freeze at the TCP,
+                    // NOT the last goal — it can lead by ~10 cm at the cap)
+                    if ((pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON ||
+                         pRobot->m_eTrackState == CRobotIndy7::eTRACK_STAGE) &&
+                        ++pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+                    {
+                        pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
+                        pRobot->m_nTrackNoSampleCyc = 0;
+                        pRobot->m_nTrackSettleCnt   = 0;
+                        pRobot->m_vTrackTarget =
+                            pRTController->GetTcpPose().m_position;
+                        DBG_LOG_WARN("[TRACK] target lost — holding until it "
+                                     "reappears ('o' to stop)");
+                    }
+
+                    if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_STAGE)
+                    {
+                        // braking at the frozen TCP goal; once settled, fire
+                        // the proven trajectory at the LATEST object goal
+                        double dVelSq = 0.0;
+                        for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            dVelSq += pRobot->m_vCurrentVel[nCnt] *
+                                      pRobot->m_vCurrentVel[nCnt];
+                        if (dVelSq > CRobotIndy7::STAGE_VEL_EPS *
+                                     CRobotIndy7::STAGE_VEL_EPS)
+                            pRobot->m_nTrackSettleCnt = 0;
+                        else if (++pRobot->m_nTrackSettleCnt >=
+                                 CRobotIndy7::STAGE_SETTLE_CYC)
+                        {
+                            pRobot->m_nTrackSettleCnt = 0;
+                            if (pRobot->StartTrackLeg(pRobot->m_vTrackPending))
+                                pRobot->m_eTrackState = CRobotIndy7::eTRACK_LEG;
+                            else
+                            {
+                                // unreachable: hold and retry later (the
+                                // servo goal stays at the braked TCP; the
+                                // cooldown stops solver spam at 15 Hz)
+                                pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                                pRobot->m_vTrackTarget =
+                                    pRTController->GetTcpPose().m_position;
+                                pRobot->m_nTrackLegCooldown = 1000;
+                            }
+                        }
+                    }
+                    else if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON)
+                    {
+                        if (pRobot->m_nTrackLegCooldown > 0)
+                            pRobot->m_nTrackLegCooldown--;
+                        const RigidBodyDynamics::Math::Vector3d vD =
+                            pRobot->m_vTrackTarget -
+                            pRTController->GetTcpPose().m_position;
+                        if (vD.norm() > CRobotIndy7::TRACK_LEG_TRIGGER_M &&
+                            pRobot->m_nTrackLegCooldown == 0)
+                        {
+                            // too far for the local servo — brake, then let
+                            // the trajectory stack take the large move
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_STAGE;
+                            pRobot->m_nTrackSettleCnt = 0;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_INFO("[TRACK] target far — braking for "
+                                         "an approach leg");
+                        }
+                    }
+
+                    pRTController->goal_tcpPose.m_position =
+                        pRobot->m_vTrackTarget;
+                }
             }
         }
         //======================================================================

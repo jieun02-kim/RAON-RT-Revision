@@ -186,22 +186,33 @@ private:
 	static constexpr double REFINE_VEL_EPS    = 0.02;   // [rad/s] |qd| gate
 	static constexpr int    REFINE_SETTLE_CYC = 300;    // 0.3 s below eps
 
-	// [kv260-merge 2026-08-03, v2 same day] Real-time tracking ('o'): TCP
-	// follows the hover point of the SELECTED object at the vision rate via
-	// eTrackingServo, from wherever the arm is, until 'o' again — the TCP
-	// speed cap is the safety envelope, so goal steps (retarget via
-	// 'p'+digit, reappearance, restart) just glide the arm at the cap.
-	// Loss freezes the goal AT THE TCP (the last vision goal can lead it by
-	// ~10 cm at the cap — holding that would translate blind) and tracking
-	// stays armed until the object reappears. v1's entry-proximity /
-	// 'v'-first / jump / exit-latch gates were removed by field verdict:
-	// they chain-reacted on one occluded frame and killed following.
-	enum eTrackState { eTRACK_OFF=0, eTRACK_ON, eTRACK_LOST };
+	// [kv260-merge 2026-08-03, v3 same day] Real-time tracking ('o'), hybrid:
+	// LARGE moves ride the PROVEN approach machinery (deterministic
+	// ready-seed IK — candidates ranked by minimum joint travel — + quintic
+	// with the E13 speed cap), fired automatically whenever the goal is
+	// beyond servo range; the per-cycle eTrackingServo only FOLLOWS within
+	// TRACK_SERVO_RANGE_M. Field verdict on servo-only large moves: the
+	// local DLS law selects no branch, wanders wrist-heavy and chatters
+	// through stiction. Flow: 'o' → far goal? auto leg (eTRACK_LEG) → done →
+	// servo follow (eTRACK_ON) → object ran > TRACK_LEG_TRIGGER_M? brake at
+	// the TCP (eTRACK_STAGE, quintics must start from rest) → next leg.
+	// Loss freezes the goal AT THE TCP; tracking stays armed until the
+	// object reappears; 'o' again stops from any substate.
+	enum eTrackState { eTRACK_OFF=0, eTRACK_ON, eTRACK_LOST,
+	                   eTRACK_STAGE, eTRACK_LEG };
 	eTrackState m_eTrackState{eTRACK_OFF};
 	uint32_t    m_uLastTrackSeq{0};
 	int         m_nTrackNoSampleCyc{0};
 	int         m_nTrackLostCyc{500};      // cfg TRACK_LOST_MS (1 cyc = 1 ms)
-	RigidBodyDynamics::Math::Vector3d m_vTrackTarget;  // accepted goal (margin+clamp)
+	int         m_nTrackSettleCnt{0};      // STAGE/LEG settle counter
+	int         m_nTrackLegCooldown{0};    // cycles until next leg attempt
+	RigidBodyDynamics::Math::Vector3d m_vTrackTarget;   // servo goal (margin+clamp)
+	RigidBodyDynamics::Math::Vector3d m_vTrackPending;  // latest object goal
+	static constexpr double TRACK_SERVO_RANGE_M = 0.15; // leg→servo handoff
+	static constexpr double TRACK_LEG_TRIGGER_M = 0.25; // servo→leg (hysteresis)
+	// Lean twin of TryReadyApproach's direct leg for the tracking SM: no
+	// staging, no refine, no approach-state, no per-approach log.
+	BOOL StartTrackLeg(const RigidBodyDynamics::Math::Vector3d& avGoal);
 
 	//=====================================================
 

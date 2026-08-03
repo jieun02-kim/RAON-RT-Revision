@@ -455,8 +455,13 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
             double dG;
             if (m_eControlMode == eTrackingServo) {
+                // ramp 0.04 rad/s (was 0.01): the narrow band made the gate
+                // effectively bang-bang — full FF the instant the joint
+                // trailed, zero the instant it caught up, tens of Hz on/off
+                // = the field "J4 chatter". 0.04 turns it into a proportional
+                // velocity-deficit assist; equilibrium unchanged.
                 double dVLag = (m_Qd_ref[i] - m_Qd[i]) * (dS >= 0.0 ? 1.0 : -1.0);
-                dG = dVLag / 0.01;
+                dG = dVLag / 0.04;
             } else {
                 double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
                 dG = dLag / 0.002;
