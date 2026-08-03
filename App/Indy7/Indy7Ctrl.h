@@ -208,6 +208,14 @@ private:
 	int         m_nTrackLegCooldown{0};    // cycles until next leg attempt
 	RigidBodyDynamics::Math::Vector3d m_vTrackTarget;   // servo goal (margin+clamp)
 	RigidBodyDynamics::Math::Vector3d m_vTrackPending;  // latest object goal
+	// Joint-drift budget: near a singularity the DLS null direction lets a
+	// joint WIND with almost no TCP motion (field: axis2/3 full turn, then a
+	// collapse toward the table). Snapshot at every servo entry; any joint
+	// traveling past the budget brakes into a re-planned leg — the trajectory
+	// stack picks the clean minimum-travel branch the servo cannot.
+	RigidBodyDynamics::Math::VectorNd m_vTrackServoQ0;
+	void SnapTrackServoQ0();
+	static constexpr double TRACK_SERVO_DQ_MAX_RAD = 1.5;
 	static constexpr double TRACK_SERVO_RANGE_M = 0.15; // leg→servo handoff
 	static constexpr double TRACK_LEG_TRIGGER_M = 0.25; // servo→leg (hysteresis)
 	// Lean twin of TryReadyApproach's direct leg for the tracking SM: no

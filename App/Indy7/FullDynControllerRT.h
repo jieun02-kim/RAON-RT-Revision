@@ -371,6 +371,8 @@ public:
     void SetMaxLinVel(double adV)
     { m_dMaxLinVel = adV < 0.05 ? 0.05 : (adV > 0.50 ? 0.50 : adV); }
     bool m_bNearSingular = false;                // λ hysteresis state
+    // FF input low-pass state (tracking only) — sized at StartTrackingServo
+    RigidBodyDynamics::Math::VectorNd m_QdRefFF;
     // Enter/exit the per-cycle servo mode. RT thread only (DoInput / SM).
     void StartTrackingServo();
     void StopTrackingServo();

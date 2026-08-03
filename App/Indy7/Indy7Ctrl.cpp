@@ -1018,6 +1018,7 @@ CRobotIndy7::DoInput()
                 else
                 {
                     m_pController->StartTrackingServo();
+                    SnapTrackServoQ0();
                     m_eTrackState = eTRACK_ON;
                 }
             }
@@ -1104,6 +1105,16 @@ CRobotIndy7::EmitApproachReport()
     stRep.nGapAxis    = stD.nBranchAxis;
 
     m_pPickBridge->LogApproach(stRep);
+}
+
+// [kv260-merge 2026-08-03] drift-budget reference — see Indy7Ctrl.h.
+void
+CRobotIndy7::SnapTrackServoQ0()
+{
+    const size_t uN = m_vCurrentPos.size();
+    m_vTrackServoQ0.resize((int)uN);
+    for (size_t i = 0; i < uN; i++)
+        m_vTrackServoQ0[i] = m_vCurrentPos[i];
 }
 
 // [kv260-merge 2026-08-03] Tracking approach leg — the proven large-move
@@ -1824,6 +1835,7 @@ void proc_main_control(void* apRobot)
                     {
                         pRobot->m_nTrackSettleCnt = 0;
                         pRTController->StartTrackingServo();  // goal = TCP
+                        pRobot->SnapTrackServoQ0();
                         if (pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
                         {
                             pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
@@ -1879,6 +1891,7 @@ void proc_main_control(void* apRobot)
                                 // servo goal stays at the braked TCP; the
                                 // cooldown stops solver spam at 15 Hz)
                                 pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                                pRobot->SnapTrackServoQ0();
                                 pRobot->m_vTrackTarget =
                                     pRTController->GetTcpPose().m_position;
                                 pRobot->m_nTrackLegCooldown = 1000;
@@ -1889,11 +1902,35 @@ void proc_main_control(void* apRobot)
                     {
                         if (pRobot->m_nTrackLegCooldown > 0)
                             pRobot->m_nTrackLegCooldown--;
+                        // joint-drift budget (see header): null-direction
+                        // winding near a singularity moves joints without
+                        // moving the TCP — the Cartesian far-check below
+                        // cannot see it. Brake and re-plan a clean branch.
+                        double dDrift = 0.0;
+                        int    nDriftAx = -1;
+                        if (pRobot->m_vTrackServoQ0.size() >= (int)udof)
+                            for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            {
+                                const double dD =
+                                    std::fabs(pRobot->m_vCurrentPos[nCnt] -
+                                              pRobot->m_vTrackServoQ0[nCnt]);
+                                if (dD > dDrift) { dDrift = dD; nDriftAx = nCnt; }
+                            }
                         const RigidBodyDynamics::Math::Vector3d vD =
                             pRobot->m_vTrackTarget -
                             pRTController->GetTcpPose().m_position;
-                        if (vD.norm() > CRobotIndy7::TRACK_LEG_TRIGGER_M &&
-                            pRobot->m_nTrackLegCooldown == 0)
+                        if (dDrift > CRobotIndy7::TRACK_SERVO_DQ_MAX_RAD)
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_STAGE;
+                            pRobot->m_nTrackSettleCnt = 0;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_WARN("[TRACK] axis%d drifted %.2f rad in "
+                                         "servo — braking to re-plan",
+                                         nDriftAx, dDrift);
+                        }
+                        else if (vD.norm() > CRobotIndy7::TRACK_LEG_TRIGGER_M &&
+                                 pRobot->m_nTrackLegCooldown == 0)
                         {
                             // too far for the local servo — brake, then let
                             // the trajectory stack take the large move

@@ -451,23 +451,22 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // friction braking is what we want".
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
-            // [2026-08-03] tracking widens the sat ramp to 0.04 rad/s too
-            // (matching dG below): with the 0.01 ramp, ±0.005 rad/s command
-            // jitter — 15 Hz vision noise through the servo — swung FF by
-            // ±half scale, which the low-inertia wrist showed as tremble.
-            double dS = m_Qd_ref[i] *
-                        (m_eControlMode == eTrackingServo ? 25.0 : 100.0);
-            if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
-            double dG;
+            double dS, dG;
             if (m_eControlMode == eTrackingServo) {
-                // ramp 0.04 rad/s (was 0.01): the narrow band made the gate
-                // effectively bang-bang — full FF the instant the joint
-                // trailed, zero the instant it caught up, tens of Hz on/off
-                // = the field "J4 chatter". 0.04 turns it into a proportional
-                // velocity-deficit assist; equilibrium unchanged.
-                double dVLag = (m_Qd_ref[i] - m_Qd[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+                // [2026-08-03] tracking FF: 50 ms low-pass on the COMMANDED
+                // velocity — the residual wrist/elbow tremble was FF chasing
+                // 15 Hz vision jitter through the servo; breakaway assist
+                // only needs the DC part. Both factors read the filtered
+                // value so sat and deficit stay consistent. Ramps 0.04 rad/s
+                // (proportional band; 0.01 was bang-bang = J4 chatter).
+                m_QdRefFF[i] += 0.02 * (m_Qd_ref[i] - m_QdRefFF[i]);
+                dS = m_QdRefFF[i] * 25.0;
+                if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
+                double dVLag = (m_QdRefFF[i] - m_Qd[i]) * (dS >= 0.0 ? 1.0 : -1.0);
                 dG = dVLag / 0.04;
             } else {
+                dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
+                if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
                 double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
                 dG = dLag / 0.002;
             }
@@ -1689,6 +1688,7 @@ CControllerFullDynamicsRT::StartTrackingServo()
     m_Qdd_ref.setZero();
     m_Qd_ref_prev.setZero();     // stale from a past session = first-cycle
                                  // lurch through the accel clamp (S5)
+    m_QdRefFF = m_zero_vector;   // FF low-pass state (sized + zeroed)
     m_dKfScale = 1.0;            // friction FF ON (2026-08-03 v2): without it
                                  // the near-goal drive is only M·Kd·qd_ref
                                  // (~1-2 Nm at cm-scale error) vs the 7-10 Nm
