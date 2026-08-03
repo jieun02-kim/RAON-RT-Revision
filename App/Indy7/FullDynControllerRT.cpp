@@ -451,7 +451,12 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // friction braking is what we want".
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
-            double dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
+            // [2026-08-03] tracking widens the sat ramp to 0.04 rad/s too
+            // (matching dG below): with the 0.01 ramp, ±0.005 rad/s command
+            // jitter — 15 Hz vision noise through the servo — swung FF by
+            // ±half scale, which the low-inertia wrist showed as tremble.
+            double dS = m_Qd_ref[i] *
+                        (m_eControlMode == eTrackingServo ? 25.0 : 100.0);
             if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
             double dG;
             if (m_eControlMode == eTrackingServo) {
