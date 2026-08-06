@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,9 +18,23 @@ using namespace std::chrono_literals;
 
 static const char* TOPIC_TARGET     = "/pick_target_base";
 static const char* TOPIC_DETECTIONS = "/detections";
+static const char* TOPIC_KEY        = "/operator_key";
+static const char* TOPIC_GAINS      = "/operator_gains";
+static const char* TOPIC_JOG        = "/operator_jog";
+static const char* TOPIC_JOINTS     = "/joint_states";
+static const char* TOPIC_STATE      = "/robot_state";
 static const char* PICK_LOGIC_NODE  = "/pick_logic_node";
 static const char* PARAM_DESIRED    = "desired_class";
 static const char* CLASS_PERSON     = "person";
+
+// [gui] Whitelist for /operator_key. This topic is a NETWORK input that moves a
+// real arm, so only keys the console actually offers get through.
+// 'q' is deliberately absent and must stay that way: the terminal never reaches
+// DoInput's 'q' case (proc_keyboard_control eats 'q' for StopTasks), so that
+// case is the 10-minute ISO cube hardware run — a remote "quit" button would
+// launch it. 'z' is likewise terminal-only (software IK validation).
+static const char* KEY_WHITELIST =
+    "rhjgfcitkbpvoxensmadlw" "0123456789";
 
 constexpr double CROS2PickBridge::DEF_BOX[6];
 
@@ -81,6 +96,38 @@ CROS2PickBridge::Init()
             [this](const my_interfaces::msg::DetectionArray::SharedPtr msg)
             { OnDetections(msg); });
 
+        // [gui] Operator console. depth 1: keys are edge-triggered commands —
+        // a backlog replayed after a network hiccup would move the arm on
+        // stale intent, so only the newest key survives.
+        m_pSubKey = m_pNode->create_subscription<std_msgs::msg::String>(
+            TOPIC_KEY, rclcpp::QoS(1),
+            [this](const std_msgs::msg::String::SharedPtr msg) { OnKey(msg); });
+
+        // [gui] admin gains — same depth-1 rationale as the keys: only the
+        // newest requested set matters, a replayed backlog would re-tune a
+        // live arm on stale intent
+        m_pSubGains = m_pNode->create_subscription<std_msgs::msg::String>(
+            TOPIC_GAINS, rclcpp::QoS(1),
+            [this](const std_msgs::msg::String::SharedPtr msg) { OnGains(msg); });
+
+        // [gui] joint jog — depth 1 again: a slider drag is a stream of
+        // absolute targets; replaying stale ones would re-run old motion
+        m_pSubJog = m_pNode->create_subscription<std_msgs::msg::String>(
+            TOPIC_JOG, rclcpp::QoS(1),
+            [this](const std_msgs::msg::String::SharedPtr msg) { OnJog(msg); });
+
+        m_pPubJoints = m_pNode->create_publisher<sensor_msgs::msg::JointState>(
+            TOPIC_JOINTS, rclcpp::QoS(10));
+
+        // depth 1: only the newest state matters to the console's gating
+        m_pPubState = m_pNode->create_publisher<std_msgs::msg::String>(
+            TOPIC_STATE, rclcpp::QoS(1));
+
+        // depth 20 + reliable: menu/gate lines are events — losing one means
+        // the operator acts on a menu they cannot see
+        m_pPubMsg = m_pNode->create_publisher<std_msgs::msg::String>(
+            "/operator_msg", rclcpp::QoS(20));
+
         m_pParamClient = std::make_shared<rclcpp::AsyncParametersClient>(
             m_pNode, PICK_LOGIC_NODE);
 
@@ -92,6 +139,12 @@ CROS2PickBridge::Init()
     {
         printf("[PickBridge] Init failed: %s\n", e.what());
         m_pParamClient.reset();
+        m_pPubMsg.reset();
+        m_pPubState.reset();
+        m_pPubJoints.reset();
+        m_pSubJog.reset();
+        m_pSubGains.reset();
+        m_pSubKey.reset();
         m_pSubDetections.reset();
         m_pSubTarget.reset();
         m_pNode.reset();
@@ -104,6 +157,8 @@ CROS2PickBridge::Init()
     printf("[PickBridge] keys: 'p'=object menu, digit=select, 'v'=approach, "
            "'b'=go home (N=%d, std<%.0f mm, z+%.2f m)\n",
            m_nGateSamples, m_dStdGateM * 1e3, m_dZMarginM);
+    printf("[PickBridge] gui: sub %s (remote keys), pub %s + %s (20 Hz)\n",
+           TOPIC_KEY, TOPIC_JOINTS, TOPIC_STATE);
     return TRUE;
 }
 
@@ -139,6 +194,12 @@ CROS2PickBridge::DeInit()
         m_thWorker.join();
 
     m_pParamClient.reset();
+    m_pPubMsg.reset();
+    m_pPubState.reset();
+    m_pPubJoints.reset();
+    m_pSubJog.reset();
+    m_pSubGains.reset();
+    m_pSubKey.reset();
     m_pSubDetections.reset();
     m_pSubTarget.reset();
     m_pNode.reset();
@@ -185,6 +246,348 @@ CROS2PickBridge::PeekTrack(TrackSample& astOut, uint32_t& auSeq) const
     return TRUE;
 }
 
+/* ------------------------------------------------------ [gui] console -- */
+
+void
+CROS2PickBridge::Say(const char* acFmt, ...)
+{
+    char acBuf[768];
+    va_list cArgs;
+    va_start(cArgs, acFmt);
+    vsnprintf(acBuf, sizeof(acBuf), acFmt, cArgs);
+    va_end(cArgs);
+
+    fputs(acBuf, stdout);          // terminal behaviour unchanged
+
+    if (m_pPubMsg == nullptr)
+        return;
+    std_msgs::msg::String stMsg;
+    stMsg.data = acBuf;
+    while (!stMsg.data.empty() && stMsg.data.back() == '\n')
+        stMsg.data.pop_back();     // the console log adds its own line breaks
+    if (!stMsg.data.empty())
+        m_pPubMsg->publish(stMsg);
+}
+
+void
+CROS2PickBridge::OnKey(const std_msgs::msg::String::SharedPtr apMsg)
+{
+    // Exactly one character, lowercased, whitelisted. Anything else is dropped
+    // loudly rather than forwarded: the RT switch has no default-safe branch,
+    // and this is the app's only unauthenticated command path.
+    if (apMsg->data.size() != 1)
+    {
+        Say("[PickBridge] /operator_key: expected 1 char, got %zu — ignored\n",
+            apMsg->data.size());
+        return;
+    }
+    char c = apMsg->data[0];
+    if (c >= 'A' && c <= 'Z')
+        c = (char)(c - 'A' + 'a');
+    if (std::strchr(KEY_WHITELIST, c) == nullptr || c == '\0')
+    {
+        Say("[PickBridge] /operator_key: '%c' not allowed remotely — ignored\n", c);
+        return;
+    }
+    // Overwrite rather than queue: a key the RT loop has not sampled within
+    // 1 ms is a double-click, and replaying it later moves the arm twice.
+    m_cRemoteKey.store(c, std::memory_order_release);
+}
+
+BOOL
+CROS2PickBridge::PopKey(char& acOut)
+{
+    const char c = m_cRemoteKey.exchange(' ', std::memory_order_acq_rel);
+    if (c == ' ')
+        return FALSE;
+    acOut = c;
+    return TRUE;
+}
+
+// {"kp":[...]} → exactly GAINS_DOF doubles, terminated by ']'. Same
+// strtod-extractor style as the console's own parser — a schema we own on
+// both ends is not a JSON-library problem.
+static bool ParseGainArray(const std::string& astrJson, const char* acKey,
+                           double* adOut)
+{
+    const std::string strPat = std::string("\"") + acKey + "\":[";
+    const size_t uAt = astrJson.find(strPat);
+    if (uAt == std::string::npos)
+        return false;
+    const char* pc = astrJson.c_str() + uAt + strPat.size();
+    char* pcEnd = nullptr;
+    for (int i = 0; i < CROS2PickBridge::GAINS_DOF; i++)
+    {
+        adOut[i] = std::strtod(pc, &pcEnd);
+        if (pcEnd == pc)
+            return false;
+        pc = (*pcEnd == ',') ? pcEnd + 1 : pcEnd;
+    }
+    return *pcEnd == ']';   // reject 7-element arrays and truncation alike
+}
+
+void
+CROS2PickBridge::OnGains(const std_msgs::msg::String::SharedPtr apMsg)
+{
+    // Admin tab of the console. Network input that re-tunes a live arm, so:
+    // parse strictly, clamp hard, and refuse unless the robot is idle — a
+    // Kp step mid-tracking is a torque step on a moving goal. The RT loop
+    // applies the mailbox on its very next cycle (PopGains).
+    double adKp[GAINS_DOF], adKd[GAINS_DOF], adKf[GAINS_DOF];
+    if (!ParseGainArray(apMsg->data, "kp", adKp) ||
+        !ParseGainArray(apMsg->data, "kd", adKd) ||
+        !ParseGainArray(apMsg->data, "kf", adKf))
+    {
+        Say("[PickBridge] %s: bad JSON (need kp/kd/kf x%d) — ignored\n",
+            TOPIC_GAINS, GAINS_DOF);
+        return;
+    }
+
+    // idle gate — read the same RT state snapshot the 20 Hz publisher uses
+    // (second seqlock READER; both readers only load, the RT side writes)
+    const uint32_t uS1 = m_uStateSeq.load(std::memory_order_acquire);
+    RobotState stS = m_stStateSlot;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if ((uS1 & 1u) || m_uStateSeq.load(std::memory_order_relaxed) != uS1 ||
+        stS.nDof <= 0)
+    {
+        Say("[PickBridge] %s: robot state unavailable — try again\n", TOPIC_GAINS);
+        return;
+    }
+    if (stS.bTrack || stS.bBusy)
+    {
+        Say("[PickBridge] %s: refused — robot busy/tracking, idle only\n",
+            TOPIC_GAINS);
+        return;
+    }
+    if (m_bGainReady.load(std::memory_order_acquire))
+        return;   // RT consumes within 1 ms; a true pileup means RT is dead
+
+    // Clamps: Kp/Kd ceilings ~2.5x the stock maxima (800/80) — tuning room
+    // without runaway; Kf mirrors the controller's own [0,12] Nm clamp.
+    bool bClamped = false;
+    auto clamp = [&bClamped](double& d, double dMax)
+    {
+        if (d < 0.0 || d > dMax)
+        {
+            d = d < 0.0 ? 0.0 : dMax;
+            bClamped = true;
+        }
+    };
+    for (int i = 0; i < GAINS_DOF; i++)
+    {
+        clamp(adKp[i], 2000.0);
+        clamp(adKd[i], 200.0);
+        clamp(adKf[i], 12.0);
+        m_adGainMail[i]                 = adKp[i];
+        m_adGainMail[GAINS_DOF + i]     = adKd[i];
+        m_adGainMail[2 * GAINS_DOF + i] = adKf[i];
+    }
+    m_bGainReady.store(true, std::memory_order_release);
+    Say("[PickBridge] gains -> RT (next cycle)%s: Kp[%.0f %.0f %.0f %.0f %.0f %.0f] "
+        "Kd[%.0f %.0f %.0f %.0f %.0f %.0f] Kf[%.1f %.1f %.1f %.1f %.1f %.1f]\n",
+        bClamped ? " [CLAMPED]" : "",
+        adKp[0], adKp[1], adKp[2], adKp[3], adKp[4], adKp[5],
+        adKd[0], adKd[1], adKd[2], adKd[3], adKd[4], adKd[5],
+        adKf[0], adKf[1], adKf[2], adKf[3], adKf[4], adKf[5]);
+}
+
+BOOL
+CROS2PickBridge::PopGains(double* adOut)
+{
+    if (!m_bGainReady.load(std::memory_order_acquire))
+        return FALSE;
+    std::memcpy(adOut, m_adGainMail, sizeof(m_adGainMail));
+    m_bGainReady.store(false, std::memory_order_release);
+    return TRUE;
+}
+
+void
+CROS2PickBridge::OnJog(const std_msgs::msg::String::SharedPtr apMsg)
+{
+    // {"axis":N,"q":<rad>} from the console's Joint tab sliders. Refusals
+    // are loud; ACCEPTED jogs are silent (a drag is a message stream — the
+    // moving arm and the RViz model are the feedback, not a log flood).
+    const char* pcAxis = std::strstr(apMsg->data.c_str(), "\"axis\":");
+    const char* pcQ    = std::strstr(apMsg->data.c_str(), "\"q\":");
+    char* pcEnd = nullptr;
+    if (pcAxis == nullptr || pcQ == nullptr)
+    {
+        Say("[PickBridge] %s: bad JSON — ignored\n", TOPIC_JOG);
+        return;
+    }
+    const long nAxis = std::strtol(pcAxis + 7, &pcEnd, 10);
+    const double dQ  = std::strtod(pcQ + 4, &pcEnd);
+    if (nAxis < 0 || nAxis > 5 || pcEnd == pcQ + 4 || !std::isfinite(dQ))
+    {
+        Say("[PickBridge] %s: bad axis/value — ignored\n", TOPIC_JOG);
+        return;
+    }
+
+    // gate on the same RT snapshot the state publisher reads: jog only in
+    // FullDynamics(1)/ComputedTorque(2) — the two modes whose q_ref the jog
+    // walker owns — with controller + servo on and nothing else moving
+    const uint32_t uS1 = m_uStateSeq.load(std::memory_order_acquire);
+    RobotState stS = m_stStateSlot;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if ((uS1 & 1u) || m_uStateSeq.load(std::memory_order_relaxed) != uS1 ||
+        stS.nDof <= 0)
+    {
+        Say("[PickBridge] %s: robot state unavailable — try again\n", TOPIC_JOG);
+        return;
+    }
+    if (!stS.bCtrl || !stS.bServo || stS.bTrack || stS.bBusy ||
+        (stS.nMode != 1 && stS.nMode != 2))
+    {
+        Say("[PickBridge] %s: refused — need FullDyn/CT mode + servo + idle "
+            "(mode=%d ctrl=%d servo=%d track=%d busy=%d)\n",
+            TOPIC_JOG, stS.nMode, (int)stS.bCtrl, (int)stS.bServo,
+            (int)stS.bTrack, (int)stS.bBusy);
+        return;
+    }
+
+    // clamp to the URDF limits (controller clamps again — final defense)
+    const double dLim = (nAxis == 5) ? 3.7524578917878086 : 3.0543261909900767;
+    JogCmd stCmd;
+    stCmd.nAxis = (int)nAxis;
+    stCmd.dQ    = dQ < -dLim ? -dLim : (dQ > dLim ? dLim : dQ);
+
+    m_uJogSeq.fetch_add(1, std::memory_order_acq_rel);   // odd = writing
+    m_stJogSlot = stCmd;
+    m_uJogSeq.fetch_add(1, std::memory_order_release);   // even = consistent
+}
+
+BOOL
+CROS2PickBridge::PeekJog(JogCmd& astOut, uint32_t& auSeq) const
+{
+    // single-attempt seqlock read (PeekTrack's contract): torn read = "no
+    // new command this cycle"; same even seq as last time = nothing new
+    const uint32_t uS1 = m_uJogSeq.load(std::memory_order_acquire);
+    if (uS1 & 1u)
+        return FALSE;
+    astOut = m_stJogSlot;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (m_uJogSeq.load(std::memory_order_relaxed) != uS1)
+        return FALSE;
+    auSeq = uS1;
+    return TRUE;
+}
+
+void
+CROS2PickBridge::PushState(const RobotState& astState)
+{
+    if (astState.nDof <= 0 ||
+        astState.nDof > (int)(sizeof(astState.dQ) / sizeof(astState.dQ[0])))
+        return;
+    m_uStateSeq.fetch_add(1, std::memory_order_acq_rel);   // odd = writing
+    m_stStateSlot = astState;
+    m_uStateSeq.fetch_add(1, std::memory_order_release);   // even = consistent
+}
+
+void
+CROS2PickBridge::TickStatePub()
+{
+    if (m_pPubJoints == nullptr || m_pPubState == nullptr)
+        return;
+
+    // Same single-attempt seqlock as PeekTrack, reader side. A torn read just
+    // skips one 20 Hz frame; the next one is 50 ms away.
+    const uint32_t uS1 = m_uStateSeq.load(std::memory_order_acquire);
+    if (uS1 & 1u)
+        return;
+    RobotState stS = m_stStateSlot;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (m_uStateSeq.load(std::memory_order_relaxed) != uS1)
+        return;
+    if (stS.nDof <= 0)
+        return;                       // RT loop has not produced a sample yet
+
+    // /joint_states — the standard topic, so stock tools (rviz2 +
+    // robot_state_publisher, PlotJuggler) keep working. Names must match
+    // indy7.urdf (joint0..joint5). The stamp is REQUIRED: robot_state_publisher
+    // silently publishes no TF for a zero-stamped JointState.
+    sensor_msgs::msg::JointState stJs;
+    stJs.header.stamp = m_pNode->now();
+    stJs.name.reserve(stS.nDof);
+    stJs.position.reserve(stS.nDof);
+    for (int i = 0; i < stS.nDof; i++)
+    {
+        stJs.name.push_back("joint" + std::to_string(i));
+        stJs.position.push_back(stS.dQ[i]);
+    }
+    m_pPubJoints->publish(stJs);
+
+    // /robot_state — one JSON line for the console: joints + gating flags +
+    // the open menu's entries. JSON-by-snprintf, not a library: ten fixed
+    // keys is not a serializer problem. lock/menu are the bridge's own
+    // atomics; m_vMenu is safe here because TickStatePub, ShowMenu and
+    // HandleDigit all run on THIS worker thread.
+    // menu_items = the selectable classes in MENU NUMBER ORDER (1..N): the
+    // console maps a class button back to its digit by position, so this
+    // array and ShowMenu's numbering must never diverge — both are m_vMenu.
+    const bool bLock = m_bLocked.load(std::memory_order_acquire);
+    const bool bMenu = m_bMenuOpen.load(std::memory_order_acquire);
+    auto B = [](bool b) { return b ? "true" : "false"; };
+    char acBuf[768];   // gains readback added ~190 chars to the old 512
+    int nLen = snprintf(acBuf, sizeof(acBuf), "{\"q\":[");
+    for (int i = 0; i < stS.nDof && nLen < (int)sizeof(acBuf); i++)
+        nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen, "%s%.4f",
+                         i ? "," : "", stS.dQ[i]);
+    if (nLen < (int)sizeof(acBuf))
+        nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen,
+                         "],\"servo\":%s,\"ctrl\":%s,\"grav\":%s,\"track\":%s,"
+                         "\"busy\":%s,\"home\":%s,\"calib\":%s,\"mode\":%d,",
+                         B(stS.bServo), B(stS.bCtrl), B(stS.bGrav), B(stS.bTrack),
+                         B(stS.bBusy), B(stS.bHome), B(stS.bCalib), stS.nMode);
+    // [gui] gains readback for the console's admin tab — only when the RT
+    // controller exists (bGains); its absence is the console's signal that
+    // /operator_gains has nowhere to land
+    if (stS.bGains)
+    {
+        const int nG = stS.nDof < GAINS_DOF ? stS.nDof : GAINS_DOF;
+        const struct { const char* acKey; const double* adV; const char* acFmt; }
+            astArr[3] = { {"kp", stS.dKp, "%s%.1f"}, {"kd", stS.dKd, "%s%.1f"},
+                          {"kf", stS.dKf, "%s%.2f"} };
+        for (int a = 0; a < 3; a++)
+        {
+            if (nLen < (int)sizeof(acBuf))
+                nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen,
+                                 "\"%s\":[", astArr[a].acKey);
+            for (int i = 0; i < nG && nLen < (int)sizeof(acBuf); i++)
+                nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen,
+                                 astArr[a].acFmt, i ? "," : "", astArr[a].adV[i]);
+            if (nLen < (int)sizeof(acBuf))
+                nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen, "],");
+        }
+    }
+    if (nLen < (int)sizeof(acBuf))
+        nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen,
+                         "\"lock\":%s,\"menu\":%s,\"menu_items\":[",
+                         B(bLock), B(bMenu));
+    if (bMenu)
+    {
+        // class names are fixed [a-z_] tokens from decode_meta — no escaping
+        int nItem = 0;
+        for (const auto& rC : m_vMenu)
+        {
+            if (rC.empty())
+                continue;   // "" = the AUTO sentinel, not a class
+            if (nLen < (int)sizeof(acBuf))
+                nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen,
+                                 "%s\"%s\"", nItem ? "," : "", rC.c_str());
+            nItem++;
+        }
+    }
+    if (nLen < (int)sizeof(acBuf))
+        nLen += snprintf(acBuf + nLen, sizeof(acBuf) - nLen, "]}");
+    if (nLen >= (int)sizeof(acBuf))
+        return;   // truncated JSON is worse than a skipped frame
+
+    std_msgs::msg::String stMsg;
+    stMsg.data = acBuf;
+    m_pPubState->publish(stMsg);
+}
+
 /* ------------------------------------------------------------- threads -- */
 
 void
@@ -202,11 +605,13 @@ CROS2PickBridge::WorkerLoop()
     // pick_logic (LIVE param — it outlives us). Without this the pipeline
     // keeps publishing the stale class from the moment we boot.
     if (SetDesiredClass(std::string()))
-        printf("[PickBridge] desired_class reset for a fresh session\n");
+        Say("[PickBridge] desired_class reset for a fresh session\n");
 
     while (!m_bStop.load() && rclcpp::ok())
     {
         std::this_thread::sleep_for(50ms);
+
+        TickStatePub();   // [gui] 20 Hz /joint_states + /robot_state
 
         if (m_bMenuReq.exchange(false))
             ShowMenu();
@@ -530,23 +935,34 @@ CROS2PickBridge::ShowMenu()
     }
     std::sort(vVisible.begin(), vVisible.end());   // deterministic numbering
 
-    printf("\n[PickBridge] ---- visible objects (last %.1f s) ----\n", MENU_WINDOW_S);
+    // One buffer, one Say: the console log then shows the whole menu as a
+    // single message instead of interleaved lines.
+    char acMenu[768];
+    int  nLen = snprintf(acMenu, sizeof(acMenu),
+                         "\n[PickBridge] ---- visible objects (last %.1f s) ----\n",
+                         MENU_WINDOW_S);
+    auto add = [&](const char* acFmt, auto... args) {
+            if (nLen < (int)sizeof(acMenu))
+                nLen += snprintf(acMenu + nLen, sizeof(acMenu) - nLen,
+                                 acFmt, args...);
+        };
     m_vMenu.clear();
     if (vVisible.empty())
-        printf("[PickBridge]   (none — check pipeline / put an object in view)\n");
+        add("[PickBridge]   (none — check pipeline / put an object in view)\n");
     int nIdx = 1;
     for (const auto& rV : vVisible)
     {
-        printf("[PickBridge]   %d) %-16s (%d frames)\n", nIdx, rV.first.c_str(), rV.second);
+        add("[PickBridge]   %d) %-16s (%d frames)\n", nIdx, rV.first.c_str(), rV.second);
         m_vMenu.push_back(rV.first);
         nIdx++;
     }
-    printf("[PickBridge]   %d) AUTO (clear desired_class — best object)\n", nIdx);
+    add("[PickBridge]   %d) AUTO (clear desired_class — best object)\n", nIdx);
     m_vMenu.push_back("");   // sentinel: auto
-    printf("[PickBridge]   %d) record HOME here (return later with 'b')\n", nIdx + 1);
+    add("[PickBridge]   %d) record HOME here (return later with 'b')\n", nIdx + 1);
     if (bPersonNear)
-        printf("[PickBridge]   ! person in view — pick_logic will veto if close\n");
-    printf("[PickBridge] select 1-%d (0 = cancel)\n", nIdx + 1);
+        add("[PickBridge]   ! person in view — pick_logic will veto if close\n");
+    add("[PickBridge] select 1-%d (0 = cancel)\n", nIdx + 1);
+    Say("%s", acMenu);
     m_bMenuOpen.store(true, std::memory_order_release);
 }
 
@@ -559,19 +975,19 @@ CROS2PickBridge::HandleDigit(int anSel)
 
     if (anSel == 0)
     {
-        printf("[PickBridge] menu cancelled\n");
+        Say("[PickBridge] menu cancelled\n");
         return;
     }
     if (anSel == (int)m_vMenu.size() + 1)   // "record HOME" — last menu entry
     {
         m_bHomeRecordReq.store(true, std::memory_order_release);
-        printf("[PickBridge] HOME record requested — RT snapshots the current "
-               "joints ('b' returns there)\n");
+        Say("[PickBridge] HOME record requested — RT snapshots the current "
+            "joints ('b' returns there)\n");
         return;
     }
     if (anSel > (int)m_vMenu.size())
     {
-        printf("[PickBridge] no entry %d — menu closed\n", anSel);
+        Say("[PickBridge] no entry %d — menu closed\n", anSel);
         return;
     }
 
@@ -586,10 +1002,10 @@ CROS2PickBridge::HandleDigit(int anSel)
             m_bLockedPrev   = false;
         }
         if (strClass.empty())
-            printf("[PickBridge] desired_class cleared → AUTO select\n");
+            Say("[PickBridge] desired_class cleared → AUTO select\n");
         else
-            printf("[PickBridge] desired_class='%s' set — waiting for lock\n",
-                   strClass.c_str());
+            Say("[PickBridge] desired_class='%s' set — waiting for lock\n",
+                strClass.c_str());
     }
 }
 
@@ -603,7 +1019,7 @@ CROS2PickBridge::SetDesiredClass(const std::string& astrClass)
             if (!m_pParamClient->service_is_ready() &&
                 !m_pParamClient->wait_for_service(2s))
             {
-                printf("[PickBridge] %s param service not up (try %d/3)\n",
+                Say("[PickBridge] %s param service not up (try %d/3)\n",
                        PICK_LOGIC_NODE, nTry);
                 continue;
             }
@@ -611,23 +1027,23 @@ CROS2PickBridge::SetDesiredClass(const std::string& astrClass)
                 {rclcpp::Parameter(PARAM_DESIRED, astrClass)});
             if (cFuture.wait_for(2s) != std::future_status::ready)
             {
-                printf("[PickBridge] param set timed out (try %d/3)\n", nTry);
+                Say("[PickBridge] param set timed out (try %d/3)\n", nTry);
                 continue;
             }
             const auto vResults = cFuture.get();
             if (!vResults.empty() && vResults[0].successful)
                 return TRUE;
-            printf("[PickBridge] param set rejected: %s\n",
+            Say("[PickBridge] param set rejected: %s\n",
                    vResults.empty() ? "empty result"
                                     : vResults[0].reason.c_str());
             return FALSE;
         }
         catch (const std::exception& e)
         {
-            printf("[PickBridge] param set error: %s (try %d/3)\n", e.what(), nTry);
+            Say("[PickBridge] param set error: %s (try %d/3)\n", e.what(), nTry);
         }
     }
-    printf("[PickBridge] FAILED to set desired_class — is the pipeline running?\n");
+    Say("[PickBridge] FAILED to set desired_class — is the pipeline running?\n");
     return FALSE;
 }
 
@@ -638,12 +1054,12 @@ CROS2PickBridge::StartCollect()
 {
     if (m_bCollecting)
     {
-        printf("[PickBridge] already collecting — 'v' ignored\n");
+        Say("[PickBridge] already collecting — 'v' ignored\n");
         return;
     }
     if (m_bGoalReady.load(std::memory_order_acquire))
     {
-        printf("[PickBridge] previous goal not consumed yet (RT side OP/enabled?)\n");
+        Say("[PickBridge] previous goal not consumed yet (RT side OP/enabled?)\n");
         return;
     }
 
@@ -656,8 +1072,8 @@ CROS2PickBridge::StartCollect()
             : 1e9;
         if (!m_bHaveSample || dAge > LOCK_MAX_AGE_S || !m_stLatest.bValid)
         {
-            printf("[PickBridge] no live valid target — select ('p') and wait "
-                   "for TARGET LOCKED before 'v'\n");
+            Say("[PickBridge] no live valid target — select ('p') and wait "
+                "for TARGET LOCKED before 'v'\n");
             return;
         }
         strClass = m_stLatest.strClass;
@@ -668,8 +1084,8 @@ CROS2PickBridge::StartCollect()
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                 std::chrono::duration<double>(m_dTimeoutS));
     }
-    printf("[PickBridge] collecting %d frames of '%s'...\n",
-           m_nGateSamples, strClass.c_str());
+    Say("[PickBridge] collecting %d frames of '%s'...\n",
+        m_nGateSamples, strClass.c_str());
 }
 
 void
@@ -688,7 +1104,7 @@ CROS2PickBridge::TickCollect()
         m_bCollecting = false;
         if (!bFull)
         {
-            printf("[PickBridge] GATE FAIL: timeout — %zu/%d samples of '%s' "
+            Say("[PickBridge] GATE FAIL: timeout — %zu/%d samples of '%s' "
                    "(unstable/occluded?)\n",
                    m_vCollect.size(), m_nGateSamples, m_strCollectClass.c_str());
             return;
@@ -715,7 +1131,7 @@ CROS2PickBridge::TickCollect()
 
     if (dStd[0] > m_dStdGateM || dStd[1] > m_dStdGateM || dStd[2] > m_dStdGateM)
     {
-        printf("[PickBridge] GATE FAIL: std mm (%.1f, %.1f, %.1f) > %.1f — "
+        Say("[PickBridge] GATE FAIL: std mm (%.1f, %.1f, %.1f) > %.1f — "
                "object/camera moving?\n",
                dStd[0] * 1e3, dStd[1] * 1e3, dStd[2] * 1e3, m_dStdGateM * 1e3);
         return;
@@ -726,7 +1142,7 @@ CROS2PickBridge::TickCollect()
         dGoal[1] < m_dBox[2] || dGoal[1] > m_dBox[3] ||
         dGoal[2] < m_dBox[4] || dGoal[2] > m_dBox[5])
     {
-        printf("[PickBridge] GATE FAIL: goal (%.3f, %.3f, %.3f) outside workspace "
+        Say("[PickBridge] GATE FAIL: goal (%.3f, %.3f, %.3f) outside workspace "
                "box x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
                dGoal[0], dGoal[1], dGoal[2],
                m_dBox[0], m_dBox[1], m_dBox[2], m_dBox[3], m_dBox[4], m_dBox[5]);
@@ -735,7 +1151,7 @@ CROS2PickBridge::TickCollect()
     const double dRxy = std::sqrt(dGoal[0] * dGoal[0] + dGoal[1] * dGoal[1]);
     if (dRxy > DEF_RMAX_XY)
     {
-        printf("[PickBridge] GATE FAIL: goal r_xy %.3f m > reach %.2f m — "
+        Say("[PickBridge] GATE FAIL: goal r_xy %.3f m > reach %.2f m — "
                "move the object closer to the robot\n", dRxy, DEF_RMAX_XY);
         return;
     }
@@ -750,7 +1166,7 @@ CROS2PickBridge::TickCollect()
     m_stGoal.nSamples = (int)vDone.size();
     m_bGoalReady.store(true, std::memory_order_release);
 
-    printf("[PickBridge] GOAL READY: %s → (%.3f, %.3f, %.3f) "
+    Say("[PickBridge] GOAL READY: %s → (%.3f, %.3f, %.3f) "
            "[std mm %.1f/%.1f/%.1f, n=%d] — RT will start the approach\n",
            strClass.c_str(), dGoal[0], dGoal[1], dGoal[2],
            dStd[0] * 1e3, dStd[1] * 1e3, dStd[2] * 1e3, (int)vDone.size());
@@ -807,10 +1223,10 @@ CROS2PickBridge::TickLockWatch()
     }
 
     if (nPrint == 1)
-        printf("[PickBridge] TARGET LOCKED: %s @ base(%.3f, %.3f, %.3f) — "
+        Say("[PickBridge] TARGET LOCKED: %s @ base(%.3f, %.3f, %.3f) — "
                "'v' to approach\n",
                stCur.strClass.c_str(), stCur.dX, stCur.dY, stCur.dZ);
     else if (nPrint == 2)
-        printf("[PickBridge] target lost (>%.0f s) — reposition object or "
+        Say("[PickBridge] target lost (>%.0f s) — reposition object or "
                "'p' for a new menu\n", LOCK_LOST_DEBOUNCE_S);
 }

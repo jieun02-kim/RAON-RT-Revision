@@ -56,6 +56,12 @@ protected:
 	/* TEMPORARY */
 	char	m_cKeyPress;
 	void	DoInput						(	);
+	// [gui/safety] cancel every software motion source (tracking, approach,
+	// ISO, RECT, refine, trajectory consumption) — the shared first step of
+	// 'e' and 'x'. Drive-level stops alone do NOT stop this robot: the CIA402
+	// cyclic state machine auto re-arms out of quick stop, and the controller
+	// then resumes its still-active goal.
+	void	KillMotionSources			(	);
 
 protected:
 	friend void	proc_main_control(void*);

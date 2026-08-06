@@ -5,6 +5,20 @@
 *	Subscribes:
 *	  /pick_target_base  (my_interfaces/PickTarget3D, base_link coords)
 *	  /detections        (my_interfaces/DetectionArray, raw detector output)
+*	  /operator_key      (std_msgs/String, [gui] one key from the desktop console)
+*	  /operator_gains    (std_msgs/String JSON, [gui] admin tab —
+*	                      {"kp":[6],"kd":[6],"kf":[6]}; clamped + idle-gated
+*	                      here, applied by the RT loop via PopGains)
+*	  /operator_jog      (std_msgs/String JSON, [gui] Joint tab —
+*	                      {"axis":N,"q":rad}; clamped + gated here (FullDyn/CT
+*	                      + servo + idle only), RT walks q_ref to it at
+*	                      0.5 rad/s via PeekJog → SetJogTarget)
+*	Publishes:
+*	  /joint_states      (sensor_msgs/JointState, [gui] 20 Hz, standard tools)
+*	  /robot_state       (std_msgs/String JSON, [gui] 20 Hz — joints + the exact
+*	                      flags DoInput's guards read; drives button gating)
+*	  /operator_msg      (std_msgs/String, [gui] operator-facing lines — the 'p'
+*	                      menu, lock/goal/gate messages — mirrored to the console)
 *	Parameter client:
 *	  /pick_logic_node   desired_class (LIVE parameter, D6 interactive menu)
 *
@@ -39,6 +53,8 @@
 #include "rclcpp/parameter_client.hpp"
 #include "my_interfaces/msg/pick_target3_d.hpp"
 #include "my_interfaces/msg/detection_array.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/string.hpp"
 
 class CROS2PickBridge
 {
@@ -121,6 +137,59 @@ public:
     // auSeq: same even value as last time means "no new sample".
     BOOL PeekTrack(TrackSample& astOut, uint32_t& auSeq) const;
 
+    /* ---- [gui] operator console (raon_operator_gui on the desktop) ---- */
+    // [RT] One remote key, consumed by DoInput exactly like a local keypress.
+    // FALSE = nothing pending. Whitelisted in OnKey: /operator_key is a network
+    // input that moves a real arm.
+    BOOL PopKey(char& acOut);
+
+    // [RT] One clamped gains set from the console's admin tab, already
+    // idle-gated by OnGains. Layout: [0..5]=Kp, [6..11]=Kd, [12..17]=Kf.
+    // The RT loop applies it per-axis (SetControlGain / SetFrictionFFAxis —
+    // plain stores, no allocation).
+    static constexpr int GAINS_DOF = 6;
+    BOOL PopGains(double* adOut);   // adOut[3 * GAINS_DOF]
+
+    // [RT] Newest console jog command (single-attempt seqlock, exactly
+    // PeekTrack's contract): same even auSeq as last time = nothing new.
+    // OnJog already clamped and gated it; the controller clamps again.
+    struct JogCmd
+    {
+        int    nAxis;
+        double dQ;      // [rad], absolute target for that axis
+    };
+    BOOL PeekJog(JogCmd& astOut, uint32_t& auSeq) const;
+
+    // [gui] What the console needs to gate its buttons: the joint angles plus
+    // the SAME booleans DoInput's refusal guards read. Plain data on purpose —
+    // the RT producer fills it wait-free; the 20 Hz worker publishes it as
+    // /joint_states + /robot_state (JSON). Do not put derived UI logic here:
+    // the console mirrors DoInput, it must never out-think it.
+    struct RobotState
+    {
+        double dQ[8];
+        int    nDof;
+        bool   bServo;   // every axis IsServoOn()
+        bool   bCtrl;    // m_bRTControllerEnabled && controller IsEnabled()
+        bool   bGrav;    // control mode == eGravityCompensation
+        bool   bTrack;   // m_eTrackState != eTRACK_OFF
+        bool   bBusy;    // approach/ISO/RECT running
+        bool   bHome;    // user HOME recorded || ready-seed available
+        bool   bCalib;   // 's' writes the calibration dataset right now
+        // [gui] controller eControlMode as int (-1 = no RT controller) —
+        // the console's mode display and OnJog's mode gate read this
+        int    nMode;
+        // [gui] live controller gains for the admin tab's readback. bGains
+        // FALSE (RT controller absent) => arrays not serialized, and the
+        // console blocks sending — no readback means no proven channel.
+        bool   bGains;
+        double dKp[8];
+        double dKd[8];
+        double dKf[8];
+    };
+    // [RT] hand the cycle's snapshot to the worker. Wait-free seqlock.
+    void PushState(const RobotState& astState);
+
     /* ---- non-RT configuration (call before OP; defaults below) ---- */
     void SetWorkspaceBox(double adXMin, double adXMax, double adYMin,
                          double adYMax, double adZMin, double adZMax);
@@ -148,6 +217,14 @@ private:
     void WorkerLoop();
     void OnTarget(const my_interfaces::msg::PickTarget3D::SharedPtr apMsg);
     void OnDetections(const my_interfaces::msg::DetectionArray::SharedPtr apMsg);
+    void OnKey(const std_msgs::msg::String::SharedPtr apMsg);
+    void OnGains(const std_msgs::msg::String::SharedPtr apMsg);
+    void OnJog(const std_msgs::msg::String::SharedPtr apMsg);
+    void TickStatePub();
+    // [gui] operator-facing line: robot terminal (printf, unchanged) AND
+    // /operator_msg for the console log. Worker/ROS-callback threads ONLY —
+    // never the RT thread (publish allocates).
+    void Say(const char* acFmt, ...) __attribute__((format(printf, 2, 3)));
     void ShowMenu();
     void HandleDigit(int anSel);
     void StartCollect();
@@ -188,6 +265,10 @@ private:
     std::shared_ptr<rclcpp::Node> m_pNode;
     rclcpp::Subscription<my_interfaces::msg::PickTarget3D>::SharedPtr   m_pSubTarget;
     rclcpp::Subscription<my_interfaces::msg::DetectionArray>::SharedPtr m_pSubDetections;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr             m_pSubKey;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr         m_pPubJoints;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                m_pPubState;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                m_pPubMsg;
     std::shared_ptr<rclcpp::AsyncParametersClient> m_pParamClient;
     std::thread m_thSpin, m_thWorker;
     std::atomic<bool> m_bStop{false};
@@ -223,6 +304,29 @@ private:
     Goal              m_stGoal;
     std::atomic<bool> m_bGoalReady{false};
     std::atomic<bool> m_bHomeRecordReq{false};  // menu → RT: snapshot joints
+
+    // [gui] remote key slot (writer = ROS callback, reader = RT PopKey).
+    // ' ' = empty, same sentinel CRobotIndy7::m_cKeyPress uses.
+    std::atomic<char> m_cRemoteKey{' '};
+
+    // [gui] admin gains mailbox (writer = OnGains on the spin thread, reader
+    // = RT PopGains — same SPSC contract as the goal slot: the producer never
+    // rewrites while ready)
+    double            m_adGainMail[3 * GAINS_DOF] = {0};
+    std::atomic<bool> m_bGainReady{false};
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_pSubGains;
+
+    // [gui] jog slot: seqlock like the tracking slot (writer = OnJog on the
+    // spin thread, reader = RT PeekJog). Newest command wins — a slider drag
+    // is a stream where only the latest target matters.
+    JogCmd                m_stJogSlot{};
+    std::atomic<uint32_t> m_uJogSeq{0};
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_pSubJog;
+
+    // [gui] state slot: seqlock the other way round (writer = RT PushState,
+    // reader = worker TickStatePub). Same contract as the tracking slot below.
+    RobotState            m_stStateSlot{};
+    std::atomic<uint32_t> m_uStateSeq{0};
 
     // tracking slot: seqlock (writer = ROS callback, reader = RT PeekTrack).
     // Even seq = consistent; the writer holds it odd across the slot copy.

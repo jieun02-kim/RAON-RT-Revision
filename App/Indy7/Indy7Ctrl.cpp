@@ -548,9 +548,39 @@ static void ClampTrackGoal(double& adX, double& adY, double& adZ)
     if (adZ > kv260::WS_BOX[5]) adZ = kv260::WS_BOX[5];
 }
 
+// [gui/safety] see Indy7Ctrl.h. Runs on the 1 kHz thread (called from
+// DoInput) — flag stores and one mode switch only, same cost as the 'o'/'n'
+// stop paths it generalizes.
+void
+CRobotIndy7::KillMotionSources()
+{
+    m_eTrackState = eTRACK_OFF;
+    if (m_pController != NULL)
+    {
+        m_pController->StopTrackingServo();
+        m_pController->CancelJog();   // [gui] console jog is a motion source
+    }
+    m_bRefineActive  = false;
+    m_eApproachState = eAPPROACH_IDLE;
+    m_bIsoHWTrigger  = false;
+    m_bRectTrigger   = false;
+    m_bLogTrigger    = FALSE;
+    // grav-comp: the RT loop stops consuming any queued trajectory (the 'n'
+    // handler documents this as the abort mechanism) and holds compliantly
+    if (m_pController != NULL)
+        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+}
+
 void
 CRobotIndy7::DoInput()
 {
+    // [gui] A key from the desktop console enters here and is then
+    // indistinguishable from a local keypress — including the tracking guard
+    // below and every refusal message. The local terminal wins a tie, which is
+    // the right way round: the person at the board can always override.
+    if (m_cKeyPress == ' ' && m_pPickBridge != nullptr)
+        m_pPickBridge->PopKey(m_cKeyPress);
+
     // [2026-08-03] While tracking, only stop/safety keys and target
     // SELECTION act — everything else is swallowed. 'p' + digits stay live
     // so the operator can retarget another object mid-track (the follow
@@ -600,21 +630,37 @@ CRobotIndy7::DoInput()
             for (int nCnt = 0; nCnt < (int)GetTotalAxis(); nCnt++)
                 m_pEcatAxis[nCnt]->ServoOff();
             break;
+        // [gui/safety 2026-08-04] Both stops used to act on the DRIVES only
+        // and did not stop the robot:
+        //   'e' SetEmgStop wrote QUICK_STOP once, but SlaveCIA402Base::
+        //       WriteToSlave auto re-arms (QUICK_STOP_ACTIVE → DISABLE_VOLTAGE
+        //       → ... → ENABLE_OPERATION) while the controller's goal is
+        //       still active → brief pause, then motion resumes.
+        //   'x' SetHalt is a profile-mode halt bit — meaningless in CST.
+        // The fix stops the SOURCE (KillMotionSources) first; then:
+        //   'e' latches servo-off intent, which the cyclic state machine
+        //       cannot undo (m_bIsSetServoOnOff==FALSE ⇒ SHUTDOWN every
+        //       cycle) — motor de-energizes, brakes engage, STAYS stopped.
+        //       Re-arm is the normal 'h' flow (ctrl+grav are left true).
+        //   'x' keeps servo ON and holds in gravity compensation — the
+        //       proven soft-stop ('o'-stop and 'n'-stop use the same state).
         case 'e':
         case 'E':
+            DBG_LOG_WARN(">>> E-STOP: motion sources killed, SERVO OFF (brakes)");
+            KillMotionSources();
             for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
-            {
-                m_pEcatAxis[nMotorCnt]->EmgStopAxis();
-            }
+                m_pEcatAxis[nMotorCnt]->ServoOff();
             break;
         case 'x':
         case 'X':
-            DBG_LOG_INFO(">>> STOP AXIS!");
-            for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
-            {
-                m_pEcatAxis[nMotorCnt]->StopAxis();
-                // m_pEcatAxis[nMotorCnt]->ChangeDriveMode(CIA402_PROFILE_POSITION);
-            }
+            DBG_LOG_WARN(">>> STOP: motion sources killed — holding in grav-comp");
+            KillMotionSources();
+            // controller not running (bare drive modes) → old per-drive stop
+            // is the only thing left to try
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+                for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
+                    m_pEcatAxis[nMotorCnt]->StopAxis();
             break;
         case 't':
         case 'T':
@@ -1328,6 +1374,37 @@ void proc_main_control(void* apRobot)
         
         pRobot->DoInput();
 
+        // [gui] admin gains from the console (/operator_gains): the bridge
+        // parsed, clamped and idle-gated them; here it is per-axis plain
+        // stores only — no allocation, no lock on the RT thread.
+        if (pRobot->m_pPickBridge != nullptr && pRTController != NULL)
+        {
+            double adGains[3 * CROS2PickBridge::GAINS_DOF];
+            if (pRobot->m_pPickBridge->PopGains(adGains))
+                for (unsigned int uAx = 0;
+                     uAx < udof && uAx < (unsigned int)CROS2PickBridge::GAINS_DOF;
+                     uAx++)
+                {
+                    pRTController->SetControlGain(uAx, adGains[uAx],
+                        adGains[CROS2PickBridge::GAINS_DOF + uAx]);
+                    pRTController->SetFrictionFFAxis(uAx,
+                        adGains[2 * CROS2PickBridge::GAINS_DOF + uAx]);
+                }
+
+            // [gui] joint jog (/operator_jog, bridge-gated): newest slider
+            // target wins; the controller walks q_ref to it at 0.5 rad/s
+            // and clamps to the joint limits again.
+            static uint32_t s_uJogSeqSeen = 0;
+            CROS2PickBridge::JogCmd stJog;
+            uint32_t uJogSeq = 0;
+            if (pRobot->m_pPickBridge->PeekJog(stJog, uJogSeq) &&
+                uJogSeq != s_uJogSeqSeen)
+            {
+                s_uJogSeqSeen = uJogSeq;
+                pRTController->SetJogTarget((UINT)stJog.nAxis, stJog.dQ);
+            }
+        }
+
         // [kv260-merge] live enable state — makes 'r' actually work at runtime
         const BOOL bCtrlOn = bUseRTController && pRTController->IsEnabled();
 
@@ -1336,12 +1413,58 @@ void proc_main_control(void* apRobot)
         {
             auto ax = static_cast<CAxisNRMKCore*>(pRobot->m_pEcatAxis[nCnt]);
 
-            if (bCtrlOn) {
-                // Update RT controller vectors
-                pRobot->m_vCurrentPos[nCnt] = ax->GetCurrentPos();
-                pRobot->m_vCurrentVel[nCnt] = ax->GetCurrentVel();
-                pRobot->m_vCurrentTor[nCnt] = ax->GetCurrentTor();
-            }
+            // [gui] Read unconditionally. These used to update only while the
+            // RT controller was enabled ('r'), so before that every consumer
+            // saw the zeros from Init: the RViz model would sit folded at the
+            // origin, and 'b' would record a HOME of all-zeros. Three PDO
+            // reads per axis per cycle is not measurable at 1 kHz.
+            pRobot->m_vCurrentPos[nCnt] = ax->GetCurrentPos();
+            pRobot->m_vCurrentVel[nCnt] = ax->GetCurrentVel();
+            pRobot->m_vCurrentTor[nCnt] = ax->GetCurrentTor();
+        }
+
+        // [gui] snapshot posture + the exact booleans DoInput's refusal guards
+        // read, for the bridge's 20 Hz /robot_state (console button gating).
+        // Wait-free; the flag reads are the same atomics/bools the guards use.
+        if (pRobot->m_pPickBridge != nullptr)
+        {
+            CROS2PickBridge::RobotState stGui{};
+            stGui.nDof = (int)udof < 8 ? (int)udof : 8;
+            for (int nCnt = 0; nCnt < stGui.nDof; nCnt++)
+                stGui.dQ[nCnt] = pRobot->m_vCurrentPos[nCnt];
+            bool bServoAll = true;
+            for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                if (!pRobot->m_pEcatAxis[nCnt]->IsServoOn())
+                    { bServoAll = false; break; }
+            stGui.bServo = bServoAll;
+            stGui.bCtrl  = pRobot->m_bRTControllerEnabled &&
+                           pRTController != NULL && pRTController->IsEnabled();
+            stGui.bGrav  = pRTController != NULL &&
+                           pRTController->GetControlMode() ==
+                               CControllerFullDynamicsRT::eGravityCompensation;
+            stGui.bTrack = pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF;
+            stGui.bBusy  = pRobot->m_eApproachState != CRobotIndy7::eAPPROACH_IDLE ||
+                           pRobot->m_bIsoHWTrigger.load() ||
+                           pRobot->m_bRectTrigger.load();
+            stGui.bHome  = pRobot->m_bHomeSet ||
+                           (pRTController != NULL && pRTController->HasReadySeed());
+            stGui.bCalib = pRobot->m_bCalibMode;
+            stGui.nMode  = pRTController != NULL ?
+                           (int)pRTController->GetControlMode() : -1;
+            // [gui] gains readback for the admin tab — read from the
+            // controller (not a cache) so the console shows what the RT loop
+            // actually uses, cfg-loaded Kf included. Plain loads, ~18/cycle.
+            stGui.bGains = pRTController != NULL;
+            if (stGui.bGains)
+                for (int nCnt = 0;
+                     nCnt < stGui.nDof && nCnt < CROS2PickBridge::GAINS_DOF;
+                     nCnt++)
+                {
+                    pRTController->GetControlGain((UINT)nCnt,
+                        &stGui.dKp[nCnt], &stGui.dKd[nCnt]);
+                    stGui.dKf[nCnt] = pRTController->GetFrictionFFAxis((UINT)nCnt);
+                }
+            pRobot->m_pPickBridge->PushState(stGui);
         }
 
         // Compute control torques (Update 먼저 → tcpPose 갱신)

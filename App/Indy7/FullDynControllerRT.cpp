@@ -66,6 +66,8 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qdd_ref.resize(auDOF);
     m_zero_vector.resize(auDOF);
     m_Q_ik_target.resize(auDOF);
+    m_Q_jog_target.resize(auDOF);
+    m_Q_jog_target.setZero();
 
     m_M.resize(auDOF, auDOF);
     m_h.resize(auDOF);
@@ -228,6 +230,30 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
     // mode — re-anchor fresh on the next grav-comp entry
     if (m_eControlMode != eGravityCompensation)
         m_bHoldAnchored = false;
+
+    // [gui] console jog: walk q_ref toward the jog target at the IK-follow
+    // leash speed. Only in the two modes where nothing else writes q_ref
+    // (trajectories own it in eInverseKinematics_6dof, the vision servo in
+    // eTrackingServo, grav-comp ignores it). qd_ref carries the real ramp
+    // velocity so damping and the friction-FF lag gate see a genuine move;
+    // both return to zero when the target is reached.
+    if (m_bJogActive &&
+        (m_eControlMode == eFullDynamics || m_eControlMode == eComputedTorque))
+    {
+        const double dMaxStep = 0.5 * m_dt;   // rad/cycle — IK follow's MAX_JOINT_VEL
+        BOOL bDone = TRUE;
+        for (unsigned int i = 0; i < m_uDOF; ++i) {
+            double dStep = m_Q_jog_target[i] - m_Q_ref[i];
+            if (dStep > dMaxStep)       { dStep = dMaxStep;  bDone = FALSE; }
+            else if (dStep < -dMaxStep) { dStep = -dMaxStep; bDone = FALSE; }
+            m_Q_ref[i] += dStep;
+            m_Qd_ref[i] = dStep / m_dt;
+        }
+        if (bDone) {
+            m_Qd_ref.setZero();
+            m_bJogActive = FALSE;
+        }
+    }
 
     // Compute control based on selected mode
     BOOL result = FALSE;
@@ -1857,6 +1883,38 @@ CControllerFullDynamicsRT::SetFrictionFF(const std::vector<double>& avKf)
         DBG_LOG_INFO("(%s) Friction FF [Nm]: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
                      "CControllerFullDynamicsRT",
                      m_Kf[0], m_Kf[1], m_Kf[2], m_Kf[3], m_Kf[4], m_Kf[5]);
+}
+
+BOOL
+CControllerFullDynamicsRT::SetJogTarget(UINT auAxis, double adPos)
+{
+    if (auAxis >= m_uDOF)
+        return FALSE;
+    // URDF joint limits (indy7.urdf): J1–J5 ±3.0543 rad (175°), J6 ±3.7525
+    // rad (215°). The bridge clamps too; this is the final defense.
+    const double dLim = (auAxis == 5) ? 3.7524578917878086 : 3.0543261909900767;
+    if (adPos < -dLim) adPos = -dLim;
+    if (adPos >  dLim) adPos =  dLim;
+    if (!m_bJogActive)
+        m_Q_jog_target = m_Q_ref;   // seed untouched axes: they hold still
+    m_Q_jog_target[auAxis] = adPos;
+    m_bJogActive = TRUE;
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::SetFrictionFFAxis(UINT auAxis, double adKf)
+{
+    if (auAxis >= m_uDOF)
+        return FALSE;
+    m_Kf[auAxis] = adKf < 0.0 ? 0.0 : (adKf > 12.0 ? 12.0 : adKf);
+    return TRUE;
+}
+
+double
+CControllerFullDynamicsRT::GetFrictionFFAxis(UINT auAxis) const
+{
+    return (auAxis < m_uDOF) ? m_Kf[auAxis] : 0.0;
 }
 
 void 

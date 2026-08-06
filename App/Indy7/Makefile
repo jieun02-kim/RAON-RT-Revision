@@ -67,7 +67,7 @@ MY_IFACE_LIB=$(MY_IFACE_DIR)/lib
 ROS_PKGS = rclcpp rcl rcutils rmw rcl_yaml_param_parser rcpputils \
            rosidl_runtime_c rosidl_runtime_cpp rosidl_typesupport_interface \
            rosidl_typesupport_cpp rosidl_typesupport_c \
-           builtin_interfaces rcl_interfaces std_msgs statistics_msgs \
+           builtin_interfaces rcl_interfaces std_msgs sensor_msgs statistics_msgs \
            libstatistics_collector tracetools libyaml_vendor
 CFLAGS_ROS = -I$(MY_IFACE_INCLUDE)/my_interfaces \
              $(addprefix -I$(ROS_INCLUDE)/,$(ROS_PKGS))
@@ -88,6 +88,11 @@ LDFLAGS_ROS = -L$(MY_IFACE_LIB) \
               -lstd_msgs__rosidl_typesupport_cpp \
               -lstd_msgs__rosidl_typesupport_fastrtps_c \
               -lstd_msgs__rosidl_typesupport_fastrtps_cpp \
+              -lsensor_msgs__rosidl_generator_c \
+              -lsensor_msgs__rosidl_typesupport_c \
+              -lsensor_msgs__rosidl_typesupport_cpp \
+              -lsensor_msgs__rosidl_typesupport_fastrtps_c \
+              -lsensor_msgs__rosidl_typesupport_fastrtps_cpp \
               -lbuiltin_interfaces__rosidl_generator_c \
               -lbuiltin_interfaces__rosidl_typesupport_c \
               -lbuiltin_interfaces__rosidl_typesupport_cpp \

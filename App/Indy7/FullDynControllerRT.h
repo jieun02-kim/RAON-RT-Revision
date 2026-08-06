@@ -56,6 +56,12 @@ public:
     BOOL SetReferencePos(UINT auAxis, double adPos);
     BOOL SetControlGain(UINT auAxis, double adKp, double adKd);
     BOOL GetControlGain(UINT auAxis, double* adKp, double* adKd);
+    // [gui] per-axis friction-FF variants for the console's admin gains tab.
+    // Plain double store/load only (no vector, no log) — callable from the
+    // 1 kHz RT loop like SetControlGain. Same [0,12] Nm clamp as
+    // SetFrictionFF; the bridge clamps too, this is the final defense.
+    BOOL   SetFrictionFFAxis(UINT auAxis, double adKf);
+    double GetFrictionFFAxis(UINT auAxis) const;
     UINT GetDOF() const { return m_uDOF; }
 
     void SetTrajectoryDuration(double adT_sec) { m_traj_duration = adT_sec; }
@@ -272,9 +278,25 @@ public:
             m_Qd_ref.setZero();
             m_Qdd_ref.setZero();
         }
+        // [gui] any mode change ends a console jog: the new mode's own
+        // reference logic (trajectory / vision servo / grav-comp anchor)
+        // must not fight a leftover jog target. KillMotionSources ends here
+        // too (it switches to grav-comp).
+        if (aeMode != m_eControlMode)
+            CancelJog();
         m_eControlMode = aeMode;
     }
     eControlMode GetControlMode() const { return m_eControlMode; }
+
+    // [gui] Joint jog from the console's Joint tab. Sets a per-axis target
+    // the ACTIVE mode's q_ref walks toward at 0.5 rad/s (the IK-follow leash
+    // speed) — never a reference step. Consumed ONLY in eFullDynamics /
+    // eComputedTorque, the two modes where nothing else writes q_ref; the
+    // clamp is the URDF joint limit. Plain stores, RT-safe (mirrors
+    // SetControlGain). Mode changes cancel (see SetControlMode).
+    BOOL SetJogTarget(UINT auAxis, double adPos);
+    void CancelJog() { m_bJogActive = FALSE; }
+    BOOL IsJogActive() const { return m_bJogActive; }
     
     // Performance monitoring
     struct RTPerformance {
@@ -488,6 +510,8 @@ private:
     RigidBodyDynamics::Math::VectorNd m_Qdd_ref;        // Reference acceleration
     RigidBodyDynamics::Math::VectorNd m_zero_vector;    // Zero vector
     RigidBodyDynamics::Math::VectorNd m_Q_ik_target;    // RBDL IK solution (final target)
+    RigidBodyDynamics::Math::VectorNd m_Q_jog_target;   // [gui] console jog target
+    BOOL m_bJogActive = FALSE;                          // [gui] jog in progress
     
     // Dynamics components
     RigidBodyDynamics::Math::MatrixNd m_M;              // Inertia matrix M(q)
