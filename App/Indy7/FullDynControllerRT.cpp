@@ -14,8 +14,12 @@
 #include <fstream>
 #include <ctime>
 #include <sys/stat.h>
+/* [kv260-merge] SSE headers exist only on x86; the FTZ/DAZ intrinsics they
+ * serve are already __SSE__-guarded at the call sites (no aarch64 effect). */
+#if defined(__SSE__)
 #include <xmmintrin.h>
 #include <pmmintrin.h>
+#endif
 
 // RPY → 회전행렬 (ZYX convention: Rz*Ry*Rx)
 RigidBodyDynamics::Math::Matrix3d
@@ -62,6 +66,8 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     m_Qdd_ref.resize(auDOF);
     m_zero_vector.resize(auDOF);
     m_Q_ik_target.resize(auDOF);
+    m_Q_jog_target.resize(auDOF);
+    m_Q_jog_target.setZero();
 
     m_M.resize(auDOF, auDOF);
     m_h.resize(auDOF);
@@ -101,6 +107,7 @@ CControllerFullDynamicsRT::CControllerFullDynamicsRT(const TSTRING& astrURDFPath
     // Initialize control gains
     m_Kp.resize(auDOF, 100.0);  // Default position gains
     m_Kd.resize(auDOF, 10.0);   // Default velocity gains
+    m_Kf.resize(auDOF, 0.0);    // Friction FF off unless the cfg says so
 
     // Initialize trajectory state
     m_traj_duration    = 3.0;
@@ -219,6 +226,35 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
 
     SetTcpReferencePose();
 
+    // sticky-float anchor is only meaningful while grav-comp is the ACTIVE
+    // mode — re-anchor fresh on the next grav-comp entry
+    if (m_eControlMode != eGravityCompensation)
+        m_bHoldAnchored = false;
+
+    // [gui] console jog: walk q_ref toward the jog target at the IK-follow
+    // leash speed. Only in the two modes where nothing else writes q_ref
+    // (trajectories own it in eInverseKinematics_6dof, the vision servo in
+    // eTrackingServo, grav-comp ignores it). qd_ref carries the real ramp
+    // velocity so damping and the friction-FF lag gate see a genuine move;
+    // both return to zero when the target is reached.
+    if (m_bJogActive &&
+        (m_eControlMode == eFullDynamics || m_eControlMode == eComputedTorque))
+    {
+        const double dMaxStep = 0.5 * m_dt;   // rad/cycle — IK follow's MAX_JOINT_VEL
+        BOOL bDone = TRUE;
+        for (unsigned int i = 0; i < m_uDOF; ++i) {
+            double dStep = m_Q_jog_target[i] - m_Q_ref[i];
+            if (dStep > dMaxStep)       { dStep = dMaxStep;  bDone = FALSE; }
+            else if (dStep < -dMaxStep) { dStep = -dMaxStep; bDone = FALSE; }
+            m_Q_ref[i] += dStep;
+            m_Qd_ref[i] = dStep / m_dt;
+        }
+        if (bDone) {
+            m_Qd_ref.setZero();
+            m_bJogActive = FALSE;
+        }
+    }
+
     // Compute control based on selected mode
     BOOL result = FALSE;
     switch (m_eControlMode) {
@@ -238,12 +274,43 @@ CControllerFullDynamicsRT::Update(const std::vector<double>& avCurrentPos,
             UpdateTrajectory();
             result = ComputeComputedTorque(avOutputTorque);
             break;
+        case eTrackingServo:
+            // per-cycle servo needs a FRESH tcpPose (SetTargetPose_Jacobian
+            // reads it but does not compute it), then the torque law
+            ComputeTcpFK();
+            SetTargetPose_Jacobian();
+            result = ComputeComputedTorque(avOutputTorque);
+            break;
 
         default:
             result = ComputeGravityCompensation(avOutputTorque);
             break;
     }
-    
+
+    // Torque backstop: nothing downstream saturates (SaturateOutput is never
+    // wired and MoveTorque writes drive current unchecked). URDF effort
+    // limits per joint; any non-finite value means the dynamics are poisoned
+    // — zero ALL joints and fail the cycle (the app's FALSE path already
+    // writes zero torque) rather than emit full-scale current.
+    {
+        static constexpr double s_adTauMax[6] =
+            {431.97, 431.97, 197.23, 79.79, 79.79, 79.79};
+        for (unsigned int i = 0; i < m_uDOF; ++i) {
+            if (!std::isfinite(avOutputTorque[i])) {
+                std::fill(avOutputTorque.begin(), avOutputTorque.end(), 0.0);
+                static uint32_t s_uNanCnt = 0;
+                if ((s_uNanCnt++ % 1000) == 0)
+                    DBG_LOG_ERROR("(FullDynRT) non-finite torque on J%u — "
+                                  "output zeroed (x%u)", i, s_uNanCnt);
+                result = FALSE;
+                break;
+            }
+            const double dMax = (i < 6) ? s_adTauMax[i] : 79.79;
+            if (avOutputTorque[i] >  dMax) avOutputTorque[i] =  dMax;
+            if (avOutputTorque[i] < -dMax) avOutputTorque[i] = -dMax;
+        }
+    }
+
     // RT performance monitoring
     uint64_t t_end = read_timer();
     uint64_t computation_time = t_end - t_start;
@@ -271,11 +338,41 @@ CControllerFullDynamicsRT::ComputeGravityCompensation(std::vector<double>& avOut
 {
     // Gravity compensation: τ = g(q)
     RigidBodyDynamics::InverseDynamics(m_rbdlModel, m_Q, m_zero_vector, m_zero_vector, m_g);
-    
+
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         avOutputTorque[i] = m_g[i];
     }
-    
+
+    // [kv260-merge] Sticky-float hold (see header). Only when grav-comp is
+    // the ACTIVE mode — this function also serves as a fallback for other
+    // modes, which must stay pure g(q).
+    if (m_eControlMode == eGravityCompensation &&
+        m_bStickyEnable.load(std::memory_order_relaxed))
+    {
+        if (!m_bHoldAnchored)
+        {
+            m_Q_hold = m_Q;
+            m_bHoldAnchored = true;
+        }
+        for (unsigned int i = 0; i < m_uDOF; ++i)
+        {
+            if (std::fabs(m_Qd[i]) > HOLD_UNLOCK_QD)
+            {
+                // clearly being hand-guided — anchor follows, no spring
+                m_Q_hold[i] = m_Q[i];
+                continue;
+            }
+            double dErr = m_Q[i] - m_Q_hold[i];
+            if (dErr > HOLD_DB_RAD)          // pushed past the dead-band:
+                m_Q_hold[i] = m_Q[i] - HOLD_DB_RAD;   // the anchor drags along
+            else if (dErr < -HOLD_DB_RAD)
+                m_Q_hold[i] = m_Q[i] + HOLD_DB_RAD;
+            dErr = m_Q[i] - m_Q_hold[i];
+            avOutputTorque[i] += -HOLD_KP_FRAC * m_Kp[i] * dErr
+                                 - HOLD_KD_FRAC * m_Kd[i] * m_Qd[i];
+        }
+    }
+
     return TRUE;
 }
 
@@ -340,7 +437,70 @@ BOOL CControllerFullDynamicsRT::ComputeComputedTorque(std::vector<double>& avOut
     // Computed torque: τ = M(q) * q̈_desired + h(q,q̇)
     m_tau_M = m_M * m_Qdd;
     m_tau_total = m_tau_M + m_h;
-    
+
+    // [kv260-merge 2026-07-31] Coulomb friction feedforward. The rigid-body
+    // terms above contain no friction, so on the harmonic-drive wrists the
+    // whole breakaway torque (j3 ~7-10 Nm measured) lands on the PD - whose
+    // authority is M_jj-scaled and loses by an order of magnitude (E-series
+    // field logs: j4 parked 0.15 rad short every approach). Add the expected
+    // friction torque while a move is COMMANDED: Kf*sat(qd_ref/0.01). Ramps
+    // in smoothly (no torque step at motion start/end) and is exactly zero
+    // whenever qd_ref is zero - so it cannot buzz at rest and cannot hunt
+    // like an integrator. Kf defaults to 0 (cfg KF_n absent = term off).
+    // m_dKfScale: per-trajectory gate — 1 for gross transport, 0 for the
+    // refine mini-moves (the leash-released joint overruns a slow short
+    // reference; see SetTargetPosePositionOnly's adKfScale note).
+    // [2026-07-31] E35 lag gate: FF only while the joint TRAILS the reference
+    // in the commanded direction. On mustard's small j3 leg (0.28 rad) the
+    // ungated FF rode through the decel phase, overran the final ref by
+    // 0.13 rad, and settle stiction held it there (qd_ref=0 -> FF=0 -> no
+    // push-back): +36 mm y-miss with the SIGN FLIPPED vs every pre-FF log.
+    // Trailing is the only state where friction is the enemy; caught-up or
+    // ahead, friction braking is what we want. 0.002 rad ramp keeps the term
+    // continuous (real mid-move lag is 0.01-0.13 rad, solidly gate=1).
+    // [2026-08-03] eTrackingServo: the POSITION lag gate does not transfer —
+    // the non-accumulating reference makes lag ≈ qd_ref·dt ≈ 1e-4 rad, 5 %
+    // of the 0.002 ramp, so FF was neutered where stiction parks the wrist.
+    // [E37, same day] The first fix (bypass the gate, dG=1) recreated E33 in
+    // continuous form: sat(qd_ref/0.01) saturates at a mm-scale error, so FF
+    // was bang-bang ±KF around zero error (stick-slip twitching), and during
+    // a sustained descent a broken-away joint running on LOW KINETIC friction
+    // kept receiving full FF — the Cartesian cap limits only the COMMANDED
+    // velocity, damping alone couldn't hold 6 Nm, and the arm dove for the
+    // table. The gate's principle (assist only while TRAILING, brake when
+    // ahead) was the load-bearing part; only its measurement space was wrong
+    // for this mode. Servo regime → measure trailing in VELOCITY:
+    //   dG = clamp((qd_ref − qd)·sign(qd_ref) / 0.01, 0, 1)
+    // Stalled joint: dG=1, full breakaway assist. At commanded speed: dG→0,
+    // FF self-balances to ≈ kinetic friction. Ahead/faster than commanded:
+    // dG=0 — runaway channel closed, exactly E35's "caught-up or ahead,
+    // friction braking is what we want".
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        if (m_Kf[i] > 0.0 && m_dKfScale > 0.0) {
+            double dS, dG;
+            if (m_eControlMode == eTrackingServo) {
+                // [2026-08-03] tracking FF: 50 ms low-pass on the COMMANDED
+                // velocity — the residual wrist/elbow tremble was FF chasing
+                // 15 Hz vision jitter through the servo; breakaway assist
+                // only needs the DC part. Both factors read the filtered
+                // value so sat and deficit stay consistent. Ramps 0.04 rad/s
+                // (proportional band; 0.01 was bang-bang = J4 chatter).
+                m_QdRefFF[i] += 0.02 * (m_Qd_ref[i] - m_QdRefFF[i]);
+                dS = m_QdRefFF[i] * 25.0;
+                if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
+                double dVLag = (m_QdRefFF[i] - m_Qd[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+                dG = dVLag / 0.04;
+            } else {
+                dS = m_Qd_ref[i] * 100.0;            // /0.01 rad/s
+                if (dS > 1.0) dS = 1.0; else if (dS < -1.0) dS = -1.0;
+                double dLag = (m_Q_ref[i] - m_Q[i]) * (dS >= 0.0 ? 1.0 : -1.0);
+                dG = dLag / 0.002;
+            }
+            if (dG > 1.0) dG = 1.0; else if (dG < 0.0) dG = 0.0;
+            m_tau_total[i] += m_Kf[i] * m_dKfScale * dS * dG;
+        }
+    }
+
     // Copy result to output
     for (unsigned int i = 0; i < m_uDOF; ++i) {
         avOutputTorque[i] = m_tau_total[i];
@@ -548,7 +708,11 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = 1000;   // default 100 → 수렴 기회 늘리기
+    // ⚠ num_steps is an RBDL *output* (iterations performed); the input limit
+    // is max_steps (default 300). This line has never had any effect. Do NOT
+    // "fix" it to max_steps=1000: at ~35 us/step that is a 35 ms stall inside
+    // the 1 kHz cycle. 300 is what this path has always run at, and it works.
+    CS.num_steps      = 1000;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
     CS.AddFullConstraint(m_body_id, tcp_local_point, astTargetPose.m_position, astTargetPose.m_rotation.transpose());
@@ -561,6 +725,7 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
 
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = vjointspace;
+    m_dKfScale       = 1.0;
     m_traj.T         = m_traj_duration;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
@@ -570,29 +735,127 @@ CControllerFullDynamicsRT::SetTargetPose(Pose astTargetPose)
     return TRUE;
 }
 
+RigidBodyDynamics::Math::Matrix3d
+CControllerFullDynamicsRT::ToolRotAt(const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    // CalcBodyWorldOrientation returns base->body; Pose::m_rotation is
+    // body->base (SetTargetPosePositionOnly transposes it back for RBDL).
+    return RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aq,
+                                                       m_body_id).transpose();
+}
+
+RigidBodyDynamics::Math::Vector3d
+CControllerFullDynamicsRT::ToolPosAt(const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    // Offline use only (fk_replay) — see the header note.
+    return RigidBodyDynamics::CalcBodyToBaseCoordinates(m_rbdlModel, aq,
+                                                        m_body_id,
+                                                        tcp_local_point);
+}
+
 BOOL
-CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose)
+CControllerFullDynamicsRT::SetTargetPosePositionOnly(Pose astTargetPose,
+                                                     double adOriWeight,
+                                                     BOOL abQuiet,
+                                                     double adKfScale)
 {
     RigidBodyDynamics::Math::VectorNd vjointspace = m_Q;
     RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-    CS.num_steps      = 1000;
+    // abQuiet only suppresses this rung's refusal logs — NOT its Newton budget.
+    // Starving an exploratory rung was tried and it corrupted the solutions
+    // (see IK_SOLVE_STEPS). max_steps is the limit; num_steps is RBDL's output.
+    CS.max_steps      = (unsigned int)IK_SOLVE_STEPS;
     CS.step_tol       = 1.0e-10;
     CS.constraint_tol = 1.0e-8;
+    // [kv260-merge] E13 (2026-07-27 table strike): a point-only constraint
+    // leaves a 3-dim nullspace, so RBDL was free to return a configuration
+    // far from m_Q (elbow flip / wrist unwind) and the joint-space quintic
+    // then swept an arbitrary Cartesian arc through the table. Position is
+    // hard; the caller's orientation (m_rotation is body->base, RBDL wants
+    // base->body) enters as a SOFT regularizer that keeps the solution on
+    // the current branch without making it hypersensitive to the start pose.
     CS.AddPointConstraint(m_body_id, tcp_local_point, astTargetPose.m_position);
-    BOOL is_ok = RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
-    if (!is_ok)
+    if (adOriWeight > 0.0)
+        CS.AddOrientationConstraint(m_body_id, astTargetPose.m_rotation.transpose(),
+                                    (float)adOriWeight);
+    (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, m_Q, CS, vjointspace);
+    // 2π fold: a "wound" return (J3 at 10.42 rad) is the in-range solution in
+    // disguise — folding by 2π steps leaves the FK pose EXACTLY unchanged.
+    // Validity is judged on the PHYSICAL (zero-folded) posture; execution is
+    // then re-expressed in the LIVE counter frame (the counters themselves
+    // can be wound whole turns — E17/E-stop legacy) so the quintic never
+    // commands real extra turns.
     {
-        DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed!");
+        RigidBodyDynamics::Math::VectorNd vqPhys = vjointspace;
+        if (!CheckLimitsPhysical(vqPhys))
+        {
+            if (!abQuiet)
+                DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: solution "
+                              "outside joint limits even after 2π fold");
+            return FALSE;
+        }
+        vjointspace = vqPhys;
+    }
+    FoldTowardRef(vjointspace, m_Q, m_uDOF);
+    // Soft residual keeps RBDL's flag false — judge by the FK position error.
+    const RigidBodyDynamics::Math::Vector3d vPosSol =
+        RigidBodyDynamics::CalcBodyToBaseCoordinates(
+            m_rbdlModel, vjointspace, m_body_id, tcp_local_point);
+    const double dPosErr = (vPosSol - astTargetPose.m_position).norm();
+    if (dPosErr > IK_POS_TOL_M)
+    {
+        if (!abQuiet)
+            DBG_LOG_WARN("(SetTargetPosePositionOnly) IK failed — residual "
+                         "%.1f mm > %.1f mm", dPosErr * 1e3, IK_POS_TOL_M * 1e3);
         return FALSE;
     }
 
+    double dDqMax = 0.0;
+    int    nDqAxis = -1;
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const double dDq = std::fabs(vjointspace[i] - m_Q[i]);
+        if (dDq > dDqMax) { dDqMax = dDq; nDqAxis = (int)i; }
+    }
+    if (dDqMax > IK_DQ_MAX_RAD)
+    {
+        if (!abQuiet)
+            DBG_LOG_ERROR("(SetTargetPosePositionOnly) REFUSED: J%d jumps %.2f rad "
+                          "(> %.1f) — IK branch flip. Reposition the arm (grav-comp) "
+                          "closer to the target posture and retry.",
+                          nDqAxis, dDqMax, IK_DQ_MAX_RAD);
+        return FALSE;
+    }
+
+    double dT = m_traj_duration;
+    const double dT_need = 1.875 * dDqMax / IK_QD_PEAK_RADPS;  // quintic peak vel
+    if (dT_need > dT)
+    {
+        dT = (dT_need < IK_T_MAX_S) ? dT_need : IK_T_MAX_S;
+        DBG_LOG_INFO("(SetTargetPosePositionOnly) T stretched %.2f → %.2f s "
+                     "(dq_max %.2f rad)", m_traj_duration, dT, dDqMax);
+    }
+
+    // how far the soft constraint let the orientation drift (info only)
+    const RigidBodyDynamics::Math::Matrix3d E_sol =
+        RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, vjointspace,
+                                                    m_body_id);
+    const RigidBodyDynamics::Math::Matrix3d R_err = E_sol * astTargetPose.m_rotation;
+    double dCosA = (R_err.trace() - 1.0) / 2.0;
+    if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
+    const double dOriDevDeg = std::acos(dCosA) * 180.0 / M_PI;
+
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = vjointspace;
-    m_traj.T         = m_traj_duration;
+    m_dKfScale       = (adKfScale < 0.0) ? 0.0
+                     : (adKfScale > 1.0) ? 1.0 : adKfScale;
+    m_traj.T         = dT;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
     goal_tcpPose     = astTargetPose;
-    DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s", m_traj.T);
+    DBG_LOG_INFO("(SetTargetPosePositionOnly) Trajectory start, T=%.2f s, "
+                 "dq_max %.2f rad (J%d), w=%.2f, R held within %.1f deg",
+                 m_traj.T, dDqMax, nDqAxis, adOriWeight, dOriDevDeg);
 
     return TRUE;
 }
@@ -603,10 +866,606 @@ CControllerFullDynamicsRT::StartJointTrajectory(
 {
     m_traj.q_start   = m_Q;
     m_traj.q_goal    = q_goal;
+    m_dKfScale       = 1.0;
     m_traj.T         = T;
     m_traj.t_elapsed = 0.0;
     m_traj.active    = true;
     DBG_LOG_INFO("(StartJointTrajectory) T=%.2f s", T);
+    return TRUE;
+}
+
+//============================================================================
+// [kv260-merge] Deterministic ready-seed IK — see header for the rationale.
+// URDF joint limits (indy7.urdf <limit> tags): J1-J5 ±175°, J6 ±215°.
+// RBDL's IK iteration is limit-blind, so the check lives here.
+//============================================================================
+static const double s_adJointLo[6] = {-3.0543261909900767, -3.0543261909900767,
+                                      -3.0543261909900767, -3.0543261909900767,
+                                      -3.0543261909900767, -3.7524578917878086};
+static const double s_adJointHi[6] = { 3.0543261909900767,  3.0543261909900767,
+                                       3.0543261909900767,  3.0543261909900767,
+                                       3.0543261909900767,  3.7524578917878086};
+
+double
+CControllerFullDynamicsRT::ScaledTrajTime(double adDqMax, double adTBase)
+{
+    double dT = adTBase;
+    const double dT_need = 1.875 * adDqMax / IK_QD_PEAK_RADPS;  // quintic peak
+    if (dT_need > dT)
+        dT = (dT_need < IK_T_MAX_S) ? dT_need : IK_T_MAX_S;
+    return dT;
+}
+
+void
+CControllerFullDynamicsRT::FoldTowardRef(
+    RigidBodyDynamics::Math::VectorNd& aq,
+    const RigidBodyDynamics::Math::VectorNd& aqRef,
+    unsigned int auDof)
+{
+    for (unsigned int i = 0; i < auDof && (int)i < aq.size() &&
+                             (int)i < aqRef.size(); i++)
+        aq[i] -= 2.0 * M_PI * std::round((aq[i] - aqRef[i]) / (2.0 * M_PI));
+}
+
+bool
+CControllerFullDynamicsRT::CheckLimitsPhysical(
+    RigidBodyDynamics::Math::VectorNd& aq) const
+{
+    bool bOK = true;
+    for (unsigned int i = 0; i < m_uDOF && i < 6; i++)
+    {
+        double dQ = aq[i] - 2.0 * M_PI *
+                    std::round(aq[i] / (2.0 * M_PI));       // fold toward 0
+        if (dQ < s_adJointLo[i] && dQ + 2.0 * M_PI <= s_adJointHi[i])
+            dQ += 2.0 * M_PI;
+        else if (dQ > s_adJointHi[i] && dQ - 2.0 * M_PI >= s_adJointLo[i])
+            dQ -= 2.0 * M_PI;
+        aq[i] = dQ;
+        if (dQ < s_adJointLo[i] || dQ > s_adJointHi[i]) bOK = false;
+    }
+    return bOK;
+}
+
+BOOL
+CControllerFullDynamicsRT::SolvePositionIK(
+    const RigidBodyDynamics::Math::VectorNd& aqSeed,
+    const RigidBodyDynamics::Math::Vector3d& avTarget,
+    double adOriWeight,
+    const RigidBodyDynamics::Math::Matrix3d* apEOri,
+    RigidBodyDynamics::Math::VectorNd& aqSol,
+    double& adPosErrM,
+    int anMaxSteps)
+{
+    aqSol = aqSeed;
+    RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+    // CS.num_steps is an OUTPUT (iterations performed); CS.max_steps is the
+    // input limit. Writing num_steps, as this code did, capped nothing.
+    CS.max_steps      = (unsigned int)anMaxSteps;
+    CS.step_tol       = 1.0e-10;
+    CS.constraint_tol = 1.0e-8;
+    CS.AddPointConstraint(m_body_id, tcp_local_point, avTarget);
+    if (adOriWeight > 0.0 && apEOri != NULL)
+        CS.AddOrientationConstraint(m_body_id, *apEOri, (float)adOriWeight);
+    (void)RigidBodyDynamics::InverseKinematics(m_rbdlModel, aqSeed, CS, aqSol);
+    const RigidBodyDynamics::Math::Vector3d vPosSol =
+        RigidBodyDynamics::CalcBodyToBaseCoordinates(
+            m_rbdlModel, aqSol, m_body_id, tcp_local_point);
+    adPosErrM = (vPosSol - avTarget).norm();
+    return (adPosErrM <= IK_POS_TOL_M) ? TRUE : FALSE;
+}
+
+BOOL
+CControllerFullDynamicsRT::ComputeReadySeed(
+    const std::vector<RigidBodyDynamics::Math::Vector3d>& avProbes,
+    const RigidBodyDynamics::Math::Vector3d& avCenter,
+    const RigidBodyDynamics::Math::VectorNd* apAnchorSeed)
+{
+    // Non-RT: runs once at init, before the control threads start.
+    // ANCHOR-ONLY (v3): q_ready is only ever an operator-demonstrated
+    // posture — either the persisted file (a previous session's recorded
+    // HOME) here, or a live SetReadyAnchor at record time. The synthetic
+    // seed ladder was removed after producing two contorted postures.
+    (void)avCenter;
+    m_vProbeStore = avProbes;   // kept for record-time anchor verification
+    m_bReadySet   = false;
+
+    if (apAnchorSeed == NULL || (unsigned int)apAnchorSeed->size() < m_uDOF)
+    {
+        DBG_LOG_WARN("[SEED] no operator seed on file — approaches use "
+                     "live-posture seeding until HOME is recorded "
+                     "('p' menu, last entry)");
+        return FALSE;
+    }
+
+    RigidBodyDynamics::Math::VectorNd vq(m_uDOF);
+    for (unsigned int i = 0; i < m_uDOF; i++) vq[i] = (*apAnchorSeed)[i];
+    const RigidBodyDynamics::Math::VectorNd vqRaw = vq;
+    if (!CheckLimitsPhysical(vq))
+    {
+        DBG_LOG_WARN("[SEED] persisted seed invalid (outside limits after "
+                     "fold) — ignoring; record HOME to re-create");
+        return FALSE;
+    }
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const int nTurns = (int)std::round((vqRaw[i] - vq[i]) / (2.0 * M_PI));
+        if (nTurns != 0)
+            DBG_LOG_INFO("[SEED] note: J%d in the seed file was wound %+d "
+                         "turn(s) (E17/E-stop counter legacy) — folded to the "
+                         "physical posture", (int)i, nTurns);
+    }
+
+    m_QReady    = vq;
+    m_EReady    = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel,
+                                                              m_QReady,
+                                                              m_body_id);
+    m_bReadySet = true;
+
+    // Inline coverage verification (init is non-RT — a full pass is fine
+    // here; record-time re-verification is amortized in TickAnchorVerify).
+    int nPass = 0;
+    for (size_t p = 0; p < avProbes.size(); p++)
+    {
+        RigidBodyDynamics::Math::VectorNd vqSol;
+        double dErr = 0.0;
+        if (!SolvePositionIK(m_QReady, avProbes[p], IK_ORI_WEIGHT, &m_EReady,
+                             vqSol, dErr))
+            continue;
+        if (!CheckLimitsPhysical(vqSol))
+            continue;
+        double dDqMax = 0.0;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(vqSol[i] - m_QReady[i]);
+            if (dDq > dDqMax) dDqMax = dDq;
+        }
+        if (dDqMax <= IK_DQ_MAX_RAD) nPass++;
+    }
+
+    DBG_LOG_INFO("[SEED] ready posture q = [%.2f %.2f %.2f %.2f %.2f %.2f] "
+                 "rad [operator anchor] — %d/%d workspace probes reachable",
+                 m_QReady[0], m_QReady[1], m_QReady[2],
+                 m_QReady[3], m_QReady[4], m_QReady[5],
+                 nPass, (int)avProbes.size());
+    if (nPass < (int)avProbes.size())
+        DBG_LOG_WARN("[SEED] %d probe(s) near the box edge unreachable — "
+                     "fine unless objects sit there",
+                     (int)avProbes.size() - nPass);
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::SetReadyAnchor(
+    const RigidBodyDynamics::Math::VectorNd& aqAnchor)
+{
+    if ((unsigned int)aqAnchor.size() < m_uDOF) return FALSE;
+    RigidBodyDynamics::Math::VectorNd vq(m_uDOF);
+    for (unsigned int i = 0; i < m_uDOF; i++) vq[i] = aqAnchor[i];
+    const RigidBodyDynamics::Math::VectorNd vqRaw = vq;
+    // canonicalize: the LIVE counters may be wound whole turns (E17/E-stop
+    // legacy — J1 -6.2 / J4 -18.9 rad observed with the arm physically near
+    // zero), so the anchor is stored as the PHYSICAL posture.
+    if (!CheckLimitsPhysical(vq))
+    {
+        DBG_LOG_WARN("[SEED] anchor posture outside joint limits — keeping "
+                     "the previous seed");
+        return FALSE;
+    }
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const int nTurns = (int)std::round((vqRaw[i] - vq[i]) / (2.0 * M_PI));
+        if (nTurns != 0)
+            DBG_LOG_INFO("[SEED] note: J%d counter is wound %+d turn(s) "
+                         "(E17/E-stop legacy) — folded; motions stay in the "
+                         "live counter frame", (int)i, nTurns);
+    }
+    m_QReady    = vq;
+    m_EReady    = RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel,
+                                                              m_QReady,
+                                                              m_body_id);
+    m_bReadySet = true;
+    DBG_LOG_INFO("[SEED] ready anchor re-based to operator posture "
+                 "q = [%.2f %.2f %.2f %.2f %.2f %.2f] — approaches solve "
+                 "from here",
+                 m_QReady[0], m_QReady[1], m_QReady[2],
+                 m_QReady[3], m_QReady[4], m_QReady[5]);
+    if (!m_vProbeStore.empty())
+    {
+        m_nAnchorVerifyIdx  = 0;      // amortized coverage check starts now
+        m_nAnchorVerifyPass = 0;
+    }
+    return TRUE;
+}
+
+void
+CControllerFullDynamicsRT::TickAnchorVerify()
+{
+    if (m_nAnchorVerifyIdx < 0 || !m_bReadySet) return;
+    if (m_nAnchorVerifyIdx >= (int)m_vProbeStore.size())
+    {
+        m_nAnchorVerifyIdx = -1;
+        return;
+    }
+
+    const RigidBodyDynamics::Math::Vector3d vProbe =
+        m_vProbeStore[m_nAnchorVerifyIdx];
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErr = 0.0;
+    bool   bOK  = false;
+    if (SolvePositionIK(m_QReady, vProbe, IK_ORI_WEIGHT, &m_EReady,
+                        vqSol, dErr) &&
+        CheckLimitsPhysical(vqSol))
+    {
+        double dDqMax = 0.0;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(vqSol[i] - m_QReady[i]);
+            if (dDq > dDqMax) dDqMax = dDq;
+        }
+        bOK = (dDqMax <= IK_DQ_MAX_RAD);
+    }
+    if (bOK) m_nAnchorVerifyPass++;
+    else
+        DBG_LOG_WARN("[SEED] probe (%.2f, %.2f, %.2f) unreachable from the "
+                     "recorded posture", vProbe[0], vProbe[1], vProbe[2]);
+
+    m_nAnchorVerifyIdx++;
+    if (m_nAnchorVerifyIdx >= (int)m_vProbeStore.size())
+    {
+        DBG_LOG_INFO("[SEED] anchor coverage: %d/%d workspace probes "
+                     "reachable from the recorded posture (misses are box "
+                     "corners — fine unless objects sit there)",
+                     m_nAnchorVerifyPass, (int)m_vProbeStore.size());
+        m_nAnchorVerifyIdx = -1;
+    }
+}
+
+double
+CControllerFullDynamicsRT::ReadyBranchGap(
+    const RigidBodyDynamics::Math::VectorNd& aq, int& anAxis)
+{
+    RigidBodyDynamics::Math::VectorNd vq = aq;
+    FoldTowardRef(vq, m_QReady, m_uDOF);   // 2π laps are not branch changes
+    double dMax = 0.0;
+    anAxis = -1;
+    for (unsigned int i = 0; i < m_uDOF; i++)
+    {
+        const double d = std::fabs(vq[i] - m_QReady[i]);
+        if (d > dMax) { dMax = d; anAxis = (int)i; }
+    }
+    return dMax;
+}
+
+double
+CControllerFullDynamicsRT::AttitudeDevDeg(
+    const RigidBodyDynamics::Math::VectorNd& aq)
+{
+    const RigidBodyDynamics::Math::Matrix3d E_sol =
+        RigidBodyDynamics::CalcBodyWorldOrientation(m_rbdlModel, aq, m_body_id);
+    const RigidBodyDynamics::Math::Matrix3d R_err = E_sol * m_EReady.transpose();
+    double dCosA = (R_err.trace() - 1.0) / 2.0;
+    if (dCosA > 1.0) dCosA = 1.0; else if (dCosA < -1.0) dCosA = -1.0;
+    return std::acos(dCosA) * 180.0 / M_PI;
+}
+
+// [kv260-merge] Record what the solve did — see IkDiag in the header. Called
+// at every SolveReadyIK exit; the two attitude/branch numbers are one FK and
+// one fold each, which is why this is affordable on the pass path too.
+void
+CControllerFullDynamicsRT::StampIkDiag(
+    eIkVerdict aeVerdict, double adW, int anSolves, uint64_t atStart,
+    const RigidBodyDynamics::Math::VectorNd& aq, double adPosErrM,
+    int anSeed, int anCandidates)
+{
+    m_stIkDiag.eVerdict = aeVerdict;
+    m_stIkDiag.dW       = adW;
+    m_stIkDiag.nSolves  = anSolves;
+    m_stIkDiag.dMs      = (double)(read_timer() - atStart) / 1.0e6;
+    m_stIkDiag.dPosErrM = adPosErrM;
+    m_stIkDiag.dTiltDeg = AttitudeDevDeg(aq);
+    m_stIkDiag.dBranchGap = ReadyBranchGap(aq, m_stIkDiag.nBranchAxis);
+    m_stIkDiag.nSeed       = anSeed;
+    m_stIkDiag.nCandidates = anCandidates;
+}
+
+// [kv260-merge] Branch seeds — see IK_NUM_SEEDS in the header.
+//
+// Indy7's joint axes at q=0 are Z, Y, Y, Z, Y, Z: J0 is base yaw, J1/J2 are a
+// parallel pair forming a planar arm in the vertical plane, and J3/J4/J5 are
+// the wrist. That gives the three classic branch choices, applied here as
+// discrete transforms of the reference posture:
+//
+//   bit 0  base    J0 += pi with the planar pair mirrored — reach the same
+//                  point from the opposite side of the base
+//   bit 1  elbow   negate the elbow (up <-> down) in the planar pair
+//   bit 2  wrist   J3 += pi, J4 = -J4, J5 += pi — exact for an intersecting
+//                  Z-Y-Z wrist, approximate here (the 183 mm J3-J5 offset)
+//
+// These are START POINTS, not answers. They only have to be closer to the
+// target basin than q_ready is; the solver walks the rest. Index 0 is the
+// identity so the fast path stays bit-identical to the previous solver.
+void
+CControllerFullDynamicsRT::BuildBranchSeeds(
+    const RigidBodyDynamics::Math::VectorNd& aqRef,
+    std::vector<RigidBodyDynamics::Math::VectorNd>& avSeeds) const
+{
+    avSeeds.clear();
+    avSeeds.reserve(IK_NUM_SEEDS);
+    for (int nMask = 0; nMask < IK_NUM_SEEDS; nMask++)
+    {
+        RigidBodyDynamics::Math::VectorNd vq = aqRef;
+        if ((nMask & 1) && m_uDOF > 3)          // base flip
+        {
+            vq[0] += M_PI;
+            vq[1]  = -vq[1];
+            vq[2]  = -vq[2];
+            vq[3]  = -vq[3];
+        }
+        if ((nMask & 2) && m_uDOF > 2)          // elbow up <-> down
+        {
+            const double dElbow = vq[2];
+            vq[2] = -dElbow;
+            vq[1] =  vq[1] + dElbow;            // keep the hand roughly put
+        }
+        if ((nMask & 4) && m_uDOF > 5)          // wrist flip
+        {
+            vq[3] += M_PI;
+            vq[4]  = -vq[4];
+            vq[5] += M_PI;
+        }
+        avSeeds.push_back(vq);
+    }
+}
+
+BOOL
+CControllerFullDynamicsRT::SolveReadyIK(
+    const RigidBodyDynamics::Math::Vector3d& avTarget,
+    RigidBodyDynamics::Math::VectorNd& aqSol,
+    double& adPosErrM, double& adDqMaxFromCur, int& anDqAxis)
+{
+    m_stIkDiag = IkDiag{eIkNoSeed, -1.0, 0, 0.0, 0.0, 0.0, 0.0, -1, -1, 0};
+    if (!m_bReadySet) return FALSE;
+
+    const uint64_t tIkStart = read_timer();
+    int  nSolves    = 0;
+    bool bReachable = false;      // some solve met the 2 mm test, somewhere
+
+    // Every candidate is judged by the same gates, in one place: joint limits,
+    // distance from the q_ready branch, and — only where the attitude was
+    // relaxed — the tool tilt cone. (Position is inside SolvePositionIK.) E28
+    // happened because ONE path, polish, skipped the branch gate; a single
+    // gate function is how that stops recurring.
+    struct Cand {
+        RigidBodyDynamics::Math::VectorNd q;
+        double dPosErr, dW, dTilt, dGap;
+        int    nAxis, nSeed;
+    };
+    auto Accept = [&](RigidBodyDynamics::Math::VectorNd& avq, double adW,
+                      double adErr, int anSeed, Cand& astOut) -> bool
+    {
+        if (!CheckLimitsPhysical(avq)) return false;
+        int nAxis = -1;
+        const double dGap = ReadyBranchGap(avq, nAxis);
+        if (dGap > IK_DQ_MAX_RAD) return false;
+        const double dTilt = AttitudeDevDeg(avq);
+        if (adW < (double)IK_ORI_WEIGHT && dTilt > APPROACH_RDEV_MAX_DEG)
+            return false;
+        astOut = Cand{avq, adErr, adW, dTilt, dGap, nAxis, anSeed};
+        return true;
+    };
+
+    // Position is already satisfied, so a light weight spends only the
+    // nullspace pulling the tool back toward the ready attitude. Goes through
+    // Accept() like everything else (E28), and is kept only if the tilt really
+    // improves.
+    auto Polish = [&](Cand& astC)
+    {
+        if (astC.dW > 0.0) return;
+        static const double adPolishW[] = { 0.1, 0.03, 0.01 };
+        for (int k = 0; k < 3; k++)
+        {
+            nSolves++;
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            Cand   stP;
+            if (!SolvePositionIK(astC.q, avTarget, adPolishW[k], &m_EReady,
+                                 vq, dErr, IK_SOLVE_STEPS))
+                continue;                   // this weight loses the point
+            if (Accept(vq, adPolishW[k], dErr, astC.nSeed, stP) &&
+                stP.dTilt < astC.dTilt)
+            {
+                DBG_LOG_INFO("(SolveReadyIK) polish w=%.2f pulled the tool "
+                             "%.0f -> %.0f deg", adPolishW[k], astC.dTilt,
+                             stP.dTilt);
+                astC = stP;
+            }
+            break;      // first weight that holds position is the strongest
+        }
+    };
+
+    // Express the answer in the LIVE counter frame so the commanded travel is
+    // the true physical delta (never extra turns), and report the largest
+    // travel for the caller's direct-vs-stage decision.
+    auto Finish = [&](RigidBodyDynamics::Math::VectorNd& avq)
+    {
+        FoldTowardRef(avq, m_Q, m_uDOF);
+        adDqMaxFromCur = 0.0;
+        anDqAxis       = -1;
+        for (unsigned int i = 0; i < m_uDOF; i++)
+        {
+            const double dDq = std::fabs(avq[i] - m_Q[i]);
+            if (dDq > adDqMaxFromCur) { adDqMaxFromCur = dDq; anDqAxis = (int)i; }
+        }
+    };
+
+    Cand stBest;
+    bool bHave = false;
+
+    // ---- Stage 1: the q_ready ladder — unchanged from the previous solver ---
+    // Runs FIRST and in full, because it is not just a fallback: the ladder
+    // walks the attitude down gradually and the warm start carries that into
+    // the w=0 rung, which is where the good attitudes come from. Solving w=0
+    // straight from q_ready instead — the first version of this branch did —
+    // still reached the targets but left the tool at 53-57 deg where the
+    // ladder gives 3. So Stage 1 stays whole, and multi-start below is what
+    // happens only when it comes back with nothing.
+    {
+        static const double adLadder[] = { IK_ORI_WEIGHT, 0.1, 0.03, 0.01 };
+        RigidBodyDynamics::Math::VectorNd vqSeed = m_QReady;
+        for (int i = 0; i < 4 && !bHave; i++)
+        {
+            nSolves++;
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            const bool bHit = SolvePositionIK(vqSeed, avTarget, adLadder[i],
+                                              &m_EReady, vq, dErr,
+                                              IK_SOLVE_STEPS);
+            if (bHit) bReachable = true;
+            if (bHit && Accept(vq, adLadder[i], dErr, 0, stBest)) bHave = true;
+            else vqSeed = vq;               // stalled iterate seeds the next
+        }
+        if (!bHave)
+        {
+            nSolves++;
+            RigidBodyDynamics::Math::VectorNd vq;
+            double dErr = 0.0;
+            if (SolvePositionIK(vqSeed, avTarget, 0.0, NULL, vq, dErr,
+                                IK_SOLVE_STEPS))
+            {
+                bReachable = true;
+                if (Accept(vq, 0.0, dErr, 0, stBest)) { Polish(stBest); bHave = true; }
+            }
+        }
+    }
+
+    // ---- Stage 1b: position-only, straight from q_ready ---------------------
+    // The warm start that makes Stage 1's attitudes good also drags the w=0
+    // rung along the chain, and on the E27 targets that chain ends in the
+    // flipped basin (gap 2.9 rad). Solving w=0 from q_ready UNWARMED lands in
+    // the near branch instead (gap 0.87) — a worse attitude, ~55 deg against
+    // 3, but inside the cone and on the right branch, so it is a real answer
+    // where Stage 1 had none. One solve, so it is tried before the seed fan-out.
+    if (!bHave)
+    {
+        nSolves++;
+        RigidBodyDynamics::Math::VectorNd vq;
+        double dErr = 0.0;
+        if (SolvePositionIK(m_QReady, avTarget, 0.0, NULL, vq, dErr,
+                            IK_SOLVE_STEPS))
+        {
+            bReachable = true;
+            if (Accept(vq, 0.0, dErr, 0, stBest)) { Polish(stBest); bHave = true; }
+        }
+    }
+
+    // ---- Stage 2: multi-start ----------------------------------------------
+    // Stage 1 reached the point but could not use the answer — off the
+    // q_ready branch, or past the tilt cone. Relaxing the weight further
+    // cannot fix that, because the basin is what is wrong and the weight does
+    // not change basins. Re-solve from seeds planted in the OTHER branches and
+    // see whether one of them descends into a usable near-branch solution.
+    // These seeds are not there to USE a far branch — Accept() still refuses
+    // those — they are there to find a near one the first descent missed.
+    if (!bHave)
+    {
+        std::vector<RigidBodyDynamics::Math::VectorNd> vSeeds;
+        BuildBranchSeeds(m_QReady, vSeeds);
+        std::vector<Cand> vCands;
+        static const double adRoundW[] = { IK_ORI_WEIGHT, 0.0 };
+
+        for (int r = 0; r < 2 && vCands.empty(); r++)
+        {
+            const double dW = adRoundW[r];
+            for (size_t s = 1; s < vSeeds.size(); s++)   // 0 was Stage 1
+            {
+                nSolves++;
+                RigidBodyDynamics::Math::VectorNd vq;
+                double dErr = 0.0;
+                Cand   stC;
+                const bool bHit = SolvePositionIK(vSeeds[s], avTarget, dW,
+                                                  (dW > 0.0) ? &m_EReady : NULL,
+                                                  vq, dErr, IK_SEED_STEPS);
+                if (bHit) bReachable = true;
+                if (bHit && Accept(vq, dW, dErr, (int)s, stC))
+                    vCands.push_back(stC);
+            }
+        }
+
+        if (!vCands.empty())
+        {
+            // A TOTAL order, so the answer never depends on an iteration
+            // accident: stay on the q_ready branch first, then keep the tool
+            // attitude, then land accurately, and break exact ties by seed
+            // index (the seed list is fixed, so the call is reproducible).
+            size_t nBest = 0;
+            for (size_t i = 1; i < vCands.size(); i++)
+            {
+                const Cand& a = vCands[i];
+                const Cand& b = vCands[nBest];
+                bool bBetter;
+                if      (a.dGap    < b.dGap    - 1e-9)  bBetter = true;
+                else if (a.dGap    > b.dGap    + 1e-9)  bBetter = false;
+                else if (a.dTilt   < b.dTilt   - 1e-9)  bBetter = true;
+                else if (a.dTilt   > b.dTilt   + 1e-9)  bBetter = false;
+                else if (a.dPosErr < b.dPosErr - 1e-12) bBetter = true;
+                else if (a.dPosErr > b.dPosErr + 1e-12) bBetter = false;
+                else                                    bBetter = (a.nSeed < b.nSeed);
+                if (bBetter) nBest = i;
+            }
+            stBest = vCands[nBest];
+            Polish(stBest);
+            bHave  = true;
+            m_stIkDiag.nCandidates = (int)vCands.size();
+            DBG_LOG_INFO("(SolveReadyIK) multi-start rescued this target: "
+                         "%d candidate(s), seed %d wins", (int)vCands.size(),
+                         stBest.nSeed);
+        }
+    }
+
+    if (!bHave)
+    {
+        // Report the distinction the operator can act on: out of reach, versus
+        // reached but only by flipping the arm or tipping the tool over.
+        RigidBodyDynamics::Math::VectorNd vq;
+        double dErr = 0.0;
+        nSolves++;
+        const bool bHit = SolvePositionIK(m_QReady, avTarget, 0.0, NULL, vq,
+                                          dErr, IK_SOLVE_STEPS);
+        int nAxis = -1;
+        const double dGap  = ReadyBranchGap(vq, nAxis);
+        const double dTilt = AttitudeDevDeg(vq);
+        const eIkVerdict e = (!bHit && !bReachable) ? eIkNoSolution
+                           : (dGap > IK_DQ_MAX_RAD) ? eIkBranch : eIkTilt;
+        StampIkDiag(e, -1.0, nSolves, tIkStart, vq, dErr, -1, 0);
+        if (e == eIkNoSolution)
+            DBG_LOG_WARN("(SolveReadyIK) no solution — residual %.1f mm even "
+                         "position-only (genuinely out of reach)", dErr * 1e3);
+        else if (e == eIkBranch)
+            DBG_LOG_WARN("(SolveReadyIK) reachable only on a different arm "
+                         "branch (J%d %.2f rad from q_ready) and none of the "
+                         "%d seeds found a near-branch solution — refused",
+                         nAxis, dGap, IK_NUM_SEEDS);
+        else
+            DBG_LOG_WARN("(SolveReadyIK) reachable only with extreme tool tilt "
+                         "(%.0f deg > %.0f) — refused; move the object closer",
+                         dTilt, APPROACH_RDEV_MAX_DEG);
+        return FALSE;
+    }
+
+    const int nCands = (m_stIkDiag.nCandidates > 0) ? m_stIkDiag.nCandidates : 1;
+    aqSol     = stBest.q;
+    adPosErrM = stBest.dPosErr;
+    StampIkDiag(eIkPass, stBest.dW, nSolves, tIkStart, aqSol, adPosErrM,
+                stBest.nSeed, nCands);
+    DBG_LOG_INFO("(SolveReadyIK) w=%.2f, seed %d, %d solve(s), gap %.2f rad "
+                 "on J%d, tilt %.0f deg, %.1f mm, %.2f ms",
+                 stBest.dW, stBest.nSeed, nSolves, stBest.dGap, stBest.nAxis,
+                 stBest.dTilt, stBest.dPosErr * 1e3, m_stIkDiag.dMs);
+    if (m_stIkDiag.dMs > 0.8)
+        DBG_LOG_WARN("(SolveReadyIK) %d IK solve(s) took %.2f ms — over the "
+                     "1 kHz cycle budget", nSolves, m_stIkDiag.dMs);
+
+    Finish(aqSol);
     return TRUE;
 }
 
@@ -711,23 +1570,30 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_e_task[4] = goal_tcpPose.m_position[1] - tcpPose.m_position[1];
     m_e_task[5] = goal_tcpPose.m_position[2] - tcpPose.m_position[2];
 
-    // 자세 오차: TCP z축 방향 정렬만 수행 (roll 무시)
-    // e_rot = curZ × goalZ — z축을 goalZ로 회전시키는 각속도 방향, magnitude = sin(θ)
+    // 자세: 능동 정렬 없음 — 각속도 명령 0. [2026-08-03] 이전의 z-정렬 항
+    // (동결 자세로의 능동 복원)은 회전 명령이 TCP 위치를 밀고 위치 루프가
+    // 되돌리는 시소를 만들어 J3/J4가 도달 후에도 끝없이 미세 구동했고
+    // (데드밴드 안에서도 회전 명령은 살아 있음), 그 명령이 FF까지 깨워
+    // stick-slip 크립을 유발했다. 각속도 0 명령만으로 DLS 최소노름 해가
+    // 자세를 소프트하게 유지한 채 병진한다 — 능동 복원은 불필요한 일이었다.
+    m_e_task[0] = 0.0;
+    m_e_task[1] = 0.0;
+    m_e_task[2] = 0.0;
+
+    // [E37] rest deadband: ±3 mm vision noise at 15 Hz must not stick-slip
+    // the wrist around the center. Shaped (err − db), not a hard cut, so the
+    // command grows continuously from zero at the band edge — a hard edge
+    // would bang the FF on/off right where stiction lives.
     {
-        double pos_err_raw = sqrt(m_e_task[3]*m_e_task[3] +
-                                  m_e_task[4]*m_e_task[4] +
-                                  m_e_task[5]*m_e_task[5]);
-        if (pos_err_raw < 0.08) {
-            RigidBodyDynamics::Math::Vector3d curZ  = tcpPose.m_rotation.col(2);
-            RigidBodyDynamics::Math::Vector3d goalZ = goal_tcpPose.m_rotation.col(2);
-            RigidBodyDynamics::Math::Vector3d e_rot = curZ.cross(goalZ);
-            m_e_task[0] = m_Kp_task_rot * e_rot[0];
-            m_e_task[1] = m_Kp_task_rot * e_rot[1];
-            m_e_task[2] = m_Kp_task_rot * e_rot[2];
+        const double TRACK_DEADBAND_M = 0.010;
+        const double dErr = sqrt(m_e_task[3]*m_e_task[3] +
+                                 m_e_task[4]*m_e_task[4] +
+                                 m_e_task[5]*m_e_task[5]);
+        if (dErr <= TRACK_DEADBAND_M) {
+            m_e_task[3] = 0.0; m_e_task[4] = 0.0; m_e_task[5] = 0.0;
         } else {
-            m_e_task[0] = 0.0;
-            m_e_task[1] = 0.0;
-            m_e_task[2] = 0.0;
+            const double dSh = (dErr - TRACK_DEADBAND_M) / dErr;
+            m_e_task[3] *= dSh; m_e_task[4] *= dSh; m_e_task[5] *= dSh;
         }
     }
 
@@ -735,38 +1601,32 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_e_task[4] *= m_Kp_task_pos;
     m_e_task[5] *= m_Kp_task_pos;
 
-    // 각속도 클램핑 (rad/s)
+    // [2026-08-03] Cartesian speed hard cap — a person stands next to the arm
+    // during tracking (E17). Kp_task_pos = 1.0 makes e_task[3..5] the
+    // commanded velocity in m/s, so scaling the error vector IS the limit.
     {
-        double rot_mag = sqrt(m_e_task[0]*m_e_task[0] +
-                              m_e_task[1]*m_e_task[1] +
-                              m_e_task[2]*m_e_task[2]);
-        const double MAX_ROT_VEL = 0.30; // rad/s
-        if (rot_mag > MAX_ROT_VEL) {
-            double s = MAX_ROT_VEL / rot_mag;
-            m_e_task[0] *= s;
-            m_e_task[1] *= s;
-            m_e_task[2] *= s;
+        double dLin = sqrt(m_e_task[3]*m_e_task[3] +
+                           m_e_task[4]*m_e_task[4] +
+                           m_e_task[5]*m_e_task[5]);
+        if (dLin > m_dMaxLinVel) {
+            const double dS = m_dMaxLinVel / dLin;
+            m_e_task[3] *= dS;
+            m_e_task[4] *= dS;
+            m_e_task[5] *= dS;
         }
     }
 
-    // 선속도 클램핑 제거 — 관절 속도 한계(MAX_JOINT_VEL)로만 제한
-
-    // 6. q_ref 적분용 위치 오차 계산 (gain 적용 전 raw 오차)
-    double pos_err_now = sqrt(m_e_task[3]*m_e_task[3] +
-                              m_e_task[4]*m_e_task[4] +
-                              m_e_task[5]*m_e_task[5]) / m_Kp_task_pos;
-
     // 4. DLS pseudo-inverse: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
     // manipulability 기반 adaptive damping
+    // [2026-08-03] two-state with hysteresis (was a 3-way ladder): the raw
+    // w threshold flipped λ by 100x cycle-to-cycle at the boundary, and the
+    // near-goal λ=0.0005 high-gain regime bought nothing — accuracy is
+    // stiction-bound (~10-15 mm) — while keeping near-singular amplification.
     m_JJt.noalias() = m_J * m_J.transpose();
     double w = std::sqrt(std::max(0.0, m_JJt.determinant()));
-    const double w_threshold   = 0.01;
-    const double lambda_high   = 0.05;
-    const double lambda_low    = 0.0005;
-    double lambda;
-    if      (w < w_threshold)    lambda = lambda_high;
-    else if (pos_err_now < 0.01) lambda = lambda_low;
-    else                         lambda = m_lambda;
+    if (m_bNearSingular) { if (w > 0.012) m_bNearSingular = false; }
+    else                 { if (w < 0.008) m_bNearSingular = true;  }
+    const double lambda = m_bNearSingular ? 0.05 : m_lambda;
     m_JJt.diagonal().array() += lambda * lambda;
     m_J_pinv.noalias() = m_J.transpose() * m_JJt.inverse();
 
@@ -802,6 +1662,23 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     for (unsigned int i = 0; i < m_uDOF; ++i)
         m_Qd_ref[i] = std::max(-MAX_JOINT_VEL, std::min(MAX_JOINT_VEL, m_Qd_ref[i]));
 
+    // [2026-08-03] joint soft limits — the servo path has no IK acceptance
+    // gate (CheckLimitsPhysical never runs here); kill outward velocity
+    // within 0.1 rad of a hard stop instead of leaning on it indefinitely.
+    // [E36 fix, same day] judge in the PHYSICAL frame: m_Q is the ENCODER
+    // COUNTER frame, wound by 2π·k laps (E20 — live session showed J1 −5.8,
+    // J4 −12.6). Comparing raw counters blocked J1's negative velocity
+    // permanently → TCP followed +y but never −y. Fold toward zero first,
+    // exactly like CheckLimitsPhysical. (J6's ±3.75 range exceeds the fold
+    // window so the gate is inert there — roll, no position effect.)
+    for (unsigned int i = 0; i < m_uDOF && i < 6; ++i)
+    {
+        const double dQph = m_Q[i] - 2.0 * M_PI *
+                            std::round(m_Q[i] / (2.0 * M_PI));
+        if (dQph > s_adJointHi[i] - 0.1 && m_Qd_ref[i] > 0.0) m_Qd_ref[i] = 0.0;
+        if (dQph < s_adJointLo[i] + 0.1 && m_Qd_ref[i] < 0.0) m_Qd_ref[i] = 0.0;
+    }
+
     m_Qd_ref_prev = m_Qd_ref;
 
     // 적분 제거: 매 주기 m_Q 기준으로 Q_ref 재계산 (드리프트 없음)
@@ -821,6 +1698,44 @@ CControllerFullDynamicsRT::SetTargetPose_Jacobian()
     m_Qdd_ref = m_zero_vector;
 
     return TRUE;
+}
+
+// [2026-08-03] Tracking-servo entry/exit. RT thread only — DoInput and the
+// tracking SM both run inside proc_main_control, so nothing interleaves;
+// mode is still set LAST as hygiene (references primed before dispatch).
+void
+CControllerFullDynamicsRT::StartTrackingServo()
+{
+    ComputeTcpFK();
+    goal_tcpPose = tcpPose;      // zero initial error; R FROZEN here — the
+                                 // z-align term now HOLDS this attitude
+    m_Q_ref   = m_Q;
+    m_Qd_ref.setZero();
+    m_Qdd_ref.setZero();
+    m_Qd_ref_prev.setZero();     // stale from a past session = first-cycle
+                                 // lurch through the accel clamp (S5)
+    m_QdRefFF = m_zero_vector;   // FF low-pass state (sized + zeroed)
+    m_dKfScale = 1.0;            // friction FF ON (2026-08-03 v2): without it
+                                 // the near-goal drive is only M·Kd·qd_ref
+                                 // (~1-2 Nm at cm-scale error) vs the 7-10 Nm
+                                 // J3 breakaway — the wrist froze short of
+                                 // center in the field. The FF block bypasses
+                                 // the E35 lag gate in this mode (see there).
+    m_bNearSingular = false;
+    m_traj.active   = false;     // no quintic fighting per-cycle references
+    m_eControlMode  = eTrackingServo;
+}
+
+void
+CControllerFullDynamicsRT::StopTrackingServo()
+{
+    // freeze-and-hold, the post-approach idiom: with m_traj inactive,
+    // UpdateTrajectory no-ops and CTC holds the parked reference
+    m_Q_ref   = m_Q;
+    m_Qd_ref.setZero();
+    m_Qdd_ref.setZero();
+    m_traj.active  = false;
+    m_eControlMode = eInverseKinematics_6dof;
 }
 
 
@@ -945,6 +1860,61 @@ CControllerFullDynamicsRT::SetControlGains(const std::vector<double>& avKp, cons
         m_Kp = avKp;
         m_Kd = avKd;
     }
+}
+
+void
+CControllerFullDynamicsRT::SetFrictionFF(const std::vector<double>& avKf)
+{
+    if (avKf.size() != m_uDOF)
+        return;
+    // Clamp to [0, 12] Nm: a cfg typo must not become a torque source. 12 is
+    // above the largest measured breakaway (j3 ~10.6 Nm) yet well under the
+    // wrist axes' 21 Nm rated limit.
+    bool bClamped = false;
+    for (unsigned int i = 0; i < m_uDOF; ++i) {
+        double d = avKf[i];
+        if (d < 0.0 || d > 12.0) { d = (d < 0.0) ? 0.0 : 12.0; bClamped = true; }
+        m_Kf[i] = d;
+    }
+    if (bClamped)
+        DBG_LOG_WARN("(%s) Friction FF value out of [0,12] Nm - clamped",
+                     "CControllerFullDynamicsRT");
+    if (m_uDOF == 6)
+        DBG_LOG_INFO("(%s) Friction FF [Nm]: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
+                     "CControllerFullDynamicsRT",
+                     m_Kf[0], m_Kf[1], m_Kf[2], m_Kf[3], m_Kf[4], m_Kf[5]);
+}
+
+BOOL
+CControllerFullDynamicsRT::SetJogTarget(UINT auAxis, double adPos)
+{
+    if (auAxis >= m_uDOF)
+        return FALSE;
+    // URDF joint limits (indy7.urdf): J1–J5 ±3.0543 rad (175°), J6 ±3.7525
+    // rad (215°). The bridge clamps too; this is the final defense.
+    const double dLim = (auAxis == 5) ? 3.7524578917878086 : 3.0543261909900767;
+    if (adPos < -dLim) adPos = -dLim;
+    if (adPos >  dLim) adPos =  dLim;
+    if (!m_bJogActive)
+        m_Q_jog_target = m_Q_ref;   // seed untouched axes: they hold still
+    m_Q_jog_target[auAxis] = adPos;
+    m_bJogActive = TRUE;
+    return TRUE;
+}
+
+BOOL
+CControllerFullDynamicsRT::SetFrictionFFAxis(UINT auAxis, double adKf)
+{
+    if (auAxis >= m_uDOF)
+        return FALSE;
+    m_Kf[auAxis] = adKf < 0.0 ? 0.0 : (adKf > 12.0 ? 12.0 : adKf);
+    return TRUE;
+}
+
+double
+CControllerFullDynamicsRT::GetFrictionFFAxis(UINT auAxis) const
+{
+    return (auAxis < m_uDOF) ? m_Kf[auAxis] : 0.0;
 }
 
 void 
@@ -1164,7 +2134,11 @@ CControllerFullDynamicsRT::ComputeInverseKinematics_6dof(std::vector<double>& av
 
         // 6DOF IK: position + orientation 동시 제약 → m_Q_ik_target에 저장
         RigidBodyDynamics::InverseKinematicsConstraintSet CS;
-        CS.num_steps      = 1000;   // default 100 → 수렴 기회 늘리기
+        // ⚠ num_steps is an RBDL *output* (iterations performed); the input limit
+    // is max_steps (default 300). This line has never had any effect. Do NOT
+    // "fix" it to max_steps=1000: at ~35 us/step that is a 35 ms stall inside
+    // the 1 kHz cycle. 300 is what this path has always run at, and it works.
+    CS.num_steps      = 1000;
         CS.step_tol       = 1.0e-10;
         CS.constraint_tol = 1.0e-8;
         CS.AddFullConstraint(m_body_id, tcp_local_point, goal_tcpPose.m_position, goal_tcpPose.m_rotation.transpose());
@@ -1408,6 +2382,8 @@ CControllerFullDynamicsRT::RunISOCubeIKValidation()
             RigidBodyDynamics::Math::VectorNd q_sol  = q_seed;
 
             RigidBodyDynamics::InverseKinematicsConstraintSet CS;
+            // ⚠ output field, not a limit — see the note above. Effective
+            // budget here is RBDL's default max_steps = 300.
             CS.num_steps      = 1000;
             CS.step_tol       = 1.0e-10;
             CS.constraint_tol = 1.0e-8;

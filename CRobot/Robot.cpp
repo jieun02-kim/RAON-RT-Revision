@@ -131,6 +131,22 @@ CRobot::InitRTTasks()
 
 		create_rt_task(&taskTemp, (const PCHAR)vTaskConf[nCnt].strName.c_str(), 2*1024*1024, vTaskConf[nCnt].nPriority);
 
+		// [kv260-merge] D10 3+1 isolation: RT-POSIX pins every task to CPU0
+		// by default (posix_rt.c) — an optional CPU= key in the cfg re-pins
+		// it (e.g. the two 1 kHz tasks onto the isolated core 3).
+		if (vTaskConf[nCnt].nCpu >= 0)
+		{
+			if (RET_SUCC == set_cpu_affinity(&taskTemp, vTaskConf[nCnt].nCpu))
+				DBG_LOG_INFO("(CRobot) task '%s' pinned to CPU%d",
+				             vTaskConf[nCnt].strName.c_str(),
+				             vTaskConf[nCnt].nCpu);
+			else
+				DBG_LOG_WARN("(CRobot) task '%s' CPU%d pin FAILED — stays on "
+				             "the RT-POSIX default CPU0",
+				             vTaskConf[nCnt].strName.c_str(),
+				             vTaskConf[nCnt].nCpu);
+		}
+
 		if (0 != vTaskConf[nCnt].nPeriod)
 		{
 			RTTIME tmStartDelay;

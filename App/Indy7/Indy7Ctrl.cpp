@@ -9,9 +9,11 @@
 #include "CalibCapture.h"
 #include <unistd.h>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <sys/stat.h>
 
-CalibCapture s_calibCapture("/home/raimlab/RAON-RT/App/CalibUtils");
+CalibCapture s_calibCapture("/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260");
 
 #define CTRL_MODE_GRAV_COMP     0
 #define CTRL_MODE_FULL_DYN      1
@@ -23,7 +25,6 @@ void proc_ethercat_control(void* apRobot);
 void proc_keyboard_control(void* apRobot);
 void proc_terminal_output(void* apRobot);
 void proc_logger(void* apRobot);
-void proc_visual_servo(void* apRobot);
 
 
 /****************************************************************************/
@@ -33,8 +34,6 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     m_pEcatAxis = NULL;
     m_pEcatSensor = NULL;
     m_bStopTask = FALSE;
-    m_strDataLog = "DataLog_";
-    m_nEcatCycle = 0;
     m_bEcatOP = FALSE;
  
     // Initialize RT Controller
@@ -56,14 +55,24 @@ CRobotIndy7::CRobotIndy7(CConfigRobot* apConfig)
     /* Set Robot Name */
     m_strName = m_pcConfigRobot->GetSystemConf().strName;
 
-    /* todo: 1. check return values, 2. include fucnction pointers in the loop without using void vectors */
-    /* this is temporary */
-    AddTaskFunction(&proc_main_control);
-    AddTaskFunction(&proc_ethercat_control);
-    AddTaskFunction(&proc_keyboard_control);
-    AddTaskFunction(&proc_terminal_output);
-    AddTaskFunction(&proc_logger);
-    AddTaskFunction(&proc_visual_servo);
+    static PTASKFCN apTaskFunctions[] =
+    {
+        &proc_main_control,
+        &proc_ethercat_control,
+        &proc_keyboard_control,
+        &proc_terminal_output,
+        &proc_logger
+    };
+
+    for (UINT32 uCnt = 0; uCnt < sizeof(apTaskFunctions) / sizeof(apTaskFunctions[0]); uCnt++)
+    {
+        if (FALSE == AddTaskFunction(apTaskFunctions[uCnt]))
+        {
+            DBG_LOG_ERROR("(%s) Cannot add task function No. %u", "CRobotIndy7", uCnt);
+            m_bStopTask = TRUE;
+            break;
+        }
+    }
 }
 
 CRobotIndy7::~CRobotIndy7()
@@ -91,8 +100,68 @@ CRobotIndy7::Init(BOOL abSim)
         return FALSE;
     }
 
-    if (!m_visualServo.Init())
-        DBG_LOG_WARN("(%s) VisualServo Init failed — VS disabled", "CRobotIndy7");
+    // [kv260-merge] Deterministic ready seed: bootstrap ONE posture from the
+    // measured workspace box and verify its (r-gate-clamped) corners, so every
+    // approach solves from the same seed no matter where the operator parked
+    // the arm. Non-fatal: on failure approaches fall back to live-posture
+    // seeding (the pre-2026-07-27 behavior).
+    {
+        using RigidBodyDynamics::Math::Vector3d;
+        const double* pdBox  = CROS2PickBridge::DEF_BOX;
+        const double  dRMax  = CROS2PickBridge::DEF_RMAX_XY;
+        Vector3d vCenter(0.5 * (pdBox[0] + pdBox[1]),
+                         0.5 * (pdBox[2] + pdBox[3]),
+                         0.5 * (pdBox[4] + pdBox[5]));
+        std::vector<Vector3d> vProbes;
+        for (int ix = 0; ix < 2; ix++)
+            for (int iy = 0; iy < 2; iy++)
+                for (int iz = 0; iz < 2; iz++)
+                {
+                    double dX = pdBox[ix], dY = pdBox[2 + iy];
+                    const double dR = std::sqrt(dX * dX + dY * dY);
+                    if (dR > dRMax) { dX *= dRMax / dR; dY *= dRMax / dR; }
+                    vProbes.push_back(Vector3d(dX, dY, pdBox[4 + iz]));
+                }
+        // A persisted operator posture (a previous session's recorded HOME)
+        // anchors the bootstrap to a branch a human actually demonstrated —
+        // the synthetic ladder alone once produced a contorted q_ready
+        // (2026-07-27 field, J4 2.61 / J5 1.65 rad).
+        RigidBodyDynamics::Math::VectorNd vqFileSeed;
+        bool bFileSeed = false;
+        {
+            FILE* pSeedFile = fopen(CROS2PickBridge::ReadySeedPath(), "r");
+            if (pSeedFile != NULL)
+            {
+                double adQ[8];
+                int    nRead = 0;
+                while (nRead < 8 && fscanf(pSeedFile, "%lf", &adQ[nRead]) == 1)
+                    nRead++;
+                fclose(pSeedFile);
+                const int nDof = (int)m_pcConfigRobot->GetSystemConf().nRobotAxis;
+                if (nRead >= nDof && nDof > 0)
+                {
+                    vqFileSeed.resize(nDof);
+                    for (int i = 0; i < nDof; i++) vqFileSeed[i] = adQ[i];
+                    bFileSeed = true;
+                    DBG_LOG_INFO("[SEED] persisted operator posture found (%s)",
+                                 CROS2PickBridge::ReadySeedPath());
+                }
+            }
+        }
+        m_pController->ComputeReadySeed(vProbes, vCenter,
+                                        bFileSeed ? &vqFileSeed : NULL);
+    }
+
+    // [kv260-merge] Gate 2b — perception-pipeline bridge. Non-fatal: the
+    // robot must stay usable standalone (no ROS2 pipeline running).
+    m_pPickBridge = new CROS2PickBridge();
+    m_pPickBridge->SetTrackAlpha(m_pcConfigRobot->GetSystemConf().dTrackEmaAlpha);
+    if (FALSE == m_pPickBridge->Init())
+    {
+        DBG_LOG_WARN("(%s) ROS2 pick bridge unavailable — running without pipeline link", "CRobotIndy7");
+        delete m_pPickBridge;
+        m_pPickBridge = nullptr;
+    }
 
     if (!CRobot::Init(abSim))
         return FALSE;
@@ -110,6 +179,14 @@ CRobotIndy7::DeInit()
 
         delete[] m_pEcatSensor;
         m_pEcatSensor = nullptr;
+
+        // [kv260-merge] bridge teardown (joins its non-RT threads)
+        if (m_pPickBridge != nullptr)
+        {
+            m_pPickBridge->DeInit();
+            delete m_pPickBridge;
+            m_pPickBridge = nullptr;
+        }
 
         return TRUE;
     }
@@ -212,7 +289,31 @@ CRobotIndy7::InitController(const TSTRING& astrURDFPath)
         }
     }
     m_pController->SetControlGains(Kp, Kd);
-    
+
+    // Coulomb friction feedforward from cfg (KF_n, [Nm]); absent keys parse
+    // to 0.0 = term off. Only the 6-DOF cfg path carries real values.
+    {
+        std::vector<double> Kf(dof, 0.0);
+        const std::vector<double>& vKfCfg = m_pcConfigRobot->GetSystemConf().vKf;
+        if (dof == 6 && vKfCfg.size() >= dof)
+            for (unsigned int i = 0; i < dof; i++)
+                Kf[i] = vKfCfg[i];
+        m_pController->SetFrictionFF(Kf);
+    }
+
+    // [kv260-merge 2026-08-03] tracking knobs (setters clamp the ranges)
+    m_pController->SetMaxLinVel(m_pcConfigRobot->GetSystemConf().dTrackVmaxMps);
+    {
+        INT32 nLostMs = m_pcConfigRobot->GetSystemConf().nTrackLostMs;
+        if (nLostMs < 100)  nLostMs = 100;
+        if (nLostMs > 1900) nLostMs = 1900;   // must fire before TRACK_EXIT_CYC
+        m_nTrackLostCyc = nLostMs;
+    }
+    DBG_LOG_INFO("(%s) Tracking: vmax %.2f m/s, EMA a=%.2f, lost %d ms",
+                 "CRobotIndy7", m_pController->m_dMaxLinVel,
+                 m_pcConfigRobot->GetSystemConf().dTrackEmaAlpha,
+                 m_nTrackLostCyc);
+
     // Pre-allocate RT control vectors
     m_vCurrentPos.resize(dof, 0.0);
     m_vCurrentVel.resize(dof, 0.0);
@@ -338,7 +439,7 @@ CRobotIndy7::InitEtherCAT()
             m_pEcatAxis[nCnt]->SetAccelerationLimits(stSlaveInfo.dAccLimitL, stSlaveInfo.dAccLimitU);
             m_pEcatAxis[nCnt]->SetDecelerationLimits(stSlaveInfo.dDecLimitL, stSlaveInfo.dDecLimitU);
             m_pEcatAxis[nCnt]->SetJerkLimits(stSlaveInfo.dJerkLimitL, stSlaveInfo.dJerkLimitU);
-            m_pEcatAxis[nCnt]->SetTorqueLimits(stSlaveInfo.dTorLimitL, stSlaveInfo.dJerkLimitU);
+            m_pEcatAxis[nCnt]->SetTorqueLimits(stSlaveInfo.dTorLimitL, stSlaveInfo.dTorLimitU);
             m_pEcatAxis[nCnt]->SetPositionLimits(stSlaveInfo.dPosLimitL, stSlaveInfo.dPosLimitU);
             m_pEcatAxis[nCnt]->SetAutoServoOn(stSlaveInfo.bAutoServoOn);
             
@@ -384,6 +485,18 @@ CRobotIndy7::InitEtherCAT()
                 return FALSE;
             }
             AddAxis(m_pEcatAxis[nCnt]);
+
+            /* [kv260-merge] guide §14.2 #6: Init() never auto-selects the DC
+             * reference clock — pin slave 0 explicitly. No-op while the cfg
+             * leaves DC_SUPPORT off (author's proven SM-sync setup); becomes
+             * active the moment DC_SUPPORT=1 is enabled per-axis. */
+            if (nCnt == 0 && stSlaveInfo.bDCSupported)
+            {
+                if (FALSE == m_pEcatAxis[0]->GetEcatSlave().SetAsDCRef())
+                    DBG_LOG_WARN("(%s) SetAsDCRef(slave 0) failed", "CRobotIndy7");
+                else
+                    DBG_LOG_INFO("(%s) Slave 0 pinned as DC reference clock", "CRobotIndy7");
+            }
         }
         else if (nSlaveType == 1) // Sensor
         {
@@ -406,7 +519,6 @@ CRobotIndy7::InitEtherCAT()
 	}
     
     ST_CONFIG_ECAT_MASTER stEcatMaster = m_pcConfigRobot->GetEcatMasterConf();
-    m_nEcatCycle = stEcatMaster.nCycleTime;
     /* todo: parameterize EtherCAT cycle time (task period) */
     if (FALSE == m_pcEcatMaster->Init(stEcatMaster.nCycleTime, stEcatMaster.bDCEnabled))
     {
@@ -416,53 +528,139 @@ CRobotIndy7::InitEtherCAT()
 	return TRUE;
 }
 
-BOOL
-CRobotIndy7::InitConfig()
+// [kv260-merge 2026-08-03] Final backstop on a tracking goal — the bridge's
+// admission gates are the primary defence (out-of-box samples never publish);
+// this only bounds what a torn read or a boundary-eps sample could command.
+static void ClampTrackGoal(double& adX, double& adY, double& adZ)
 {
-    return TRUE;
+    const double dR = std::sqrt(adX * adX + adY * adY);
+    if (dR > kv260::WS_RMAX_XY)
+    {
+        adX *= kv260::WS_RMAX_XY / dR;
+        adY *= kv260::WS_RMAX_XY / dR;
+    }
+    if (adX < kv260::WS_BOX[0]) adX = kv260::WS_BOX[0];
+    if (adX > kv260::WS_BOX[1]) adX = kv260::WS_BOX[1];
+    if (adY < kv260::WS_BOX[2]) adY = kv260::WS_BOX[2];
+    if (adY > kv260::WS_BOX[3]) adY = kv260::WS_BOX[3];
+    // z floor = tracking minimum, NOT the box z_min (= the table surface)
+    if (adZ < kv260::TRACK_GOAL_ZMIN_M) adZ = kv260::TRACK_GOAL_ZMIN_M;
+    if (adZ > kv260::WS_BOX[5]) adZ = kv260::WS_BOX[5];
 }
 
+// [gui/safety] see Indy7Ctrl.h. Runs on the 1 kHz thread (called from
+// DoInput) — flag stores and one mode switch only, same cost as the 'o'/'n'
+// stop paths it generalizes.
 void
-CRobotIndy7::DoAgingTest()
+CRobotIndy7::KillMotionSources()
 {
-   
+    m_eTrackState = eTRACK_OFF;
+    if (m_pController != NULL)
+    {
+        m_pController->StopTrackingServo();
+        m_pController->CancelJog();   // [gui] console jog is a motion source
+    }
+    m_bRefineActive  = false;
+    m_eApproachState = eAPPROACH_IDLE;
+    m_bIsoHWTrigger  = false;
+    m_bRectTrigger   = false;
+    m_bLogTrigger    = FALSE;
+    // grav-comp: the RT loop stops consuming any queued trajectory (the 'n'
+    // handler documents this as the abort mechanism) and holds compliantly
+    if (m_pController != NULL)
+        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
 }
 
 void
 CRobotIndy7::DoInput()
 {
+    // [gui] A key from the desktop console enters here and is then
+    // indistinguishable from a local keypress — including the tracking guard
+    // below and every refusal message. The local terminal wins a tie, which is
+    // the right way round: the person at the board can always override.
+    if (m_cKeyPress == ' ' && m_pPickBridge != nullptr)
+        m_pPickBridge->PopKey(m_cKeyPress);
+
+    // [2026-08-03] While tracking, only stop/safety keys and target
+    // SELECTION act — everything else is swallowed. 'p' + digits stay live
+    // so the operator can retarget another object mid-track (the follow
+    // goal just glides there at the speed cap). 'v' is a DELAYED action
+    // (its goal pops ~1 s later, mid-track), 'i' sits one key from 'o'
+    // (legacy servo, no singularity threshold), 'Q' starts the 10-min ISO
+    // run, 'b'/'m'/'a'/'n' launch large trajectories next to the person.
+    if (m_eTrackState != eTRACK_OFF && m_cKeyPress != ' ')
+    {
+        switch (m_cKeyPress)
+        {
+            case 'o': case 'O': case 'j': case 'J': case 'e': case 'E':
+            case 'x': case 'X': case 'g': case 'G': case 'p': case 'P':
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                break;
+            default:
+                printf("[TRACK] key '%c' ignored while tracking — "
+                       "'o' stop-hold, 'g' float, 'j' servo off\n", m_cKeyPress);
+                m_cKeyPress = ' ';
+                return;
+        }
+    }
 
     switch (m_cKeyPress)
     {
-        case 'y':
-        case 'Y':
-            m_pEcatSensor[0]->LED_GREEN(TRUE);
-            break;
-        case 'u':
-        case 'U':
-            m_pEcatSensor[0]->LED_RED(TRUE);
-            break;
-        case 'o':
-        case 'O':
-            m_pEcatSensor[0]->LED_OFF();
+        // [kv260-merge] Phase 4 — operator-gated servo arm/disarm (there was
+        // NO keyboard servo-on path; the author ran AUTO_SERVO_ON=1 instead).
+        // Interlock: CST drives enable at zero torque, so the controller must
+        // already be enabled ('r') and in grav-comp before the brakes release.
         case 'h':
         case 'H':
+            if (!m_bRTControllerEnabled ||
+                m_pController->GetControlMode() !=
+                    CControllerFullDynamicsRT::eGravityCompensation)
+            {
+                printf("[ARM] refused — press 'r' (controller) then 'g' (grav-comp) first\n");
+                break;
+            }
+            DBG_LOG_WARN(">>> SERVO ON (all axes, CST) — brakes release, grav-comp holds");
+            for (int nCnt = 0; nCnt < (int)GetTotalAxis(); nCnt++)
+                m_pEcatAxis[nCnt]->ServoOn(CIA402_CYCLIC_TORQUE);
             break;
+        case 'j':
+        case 'J':
+            DBG_LOG_WARN(">>> SERVO OFF (all axes) — brakes engage");
+            for (int nCnt = 0; nCnt < (int)GetTotalAxis(); nCnt++)
+                m_pEcatAxis[nCnt]->ServoOff();
+            break;
+        // [gui/safety 2026-08-04] Both stops used to act on the DRIVES only
+        // and did not stop the robot:
+        //   'e' SetEmgStop wrote QUICK_STOP once, but SlaveCIA402Base::
+        //       WriteToSlave auto re-arms (QUICK_STOP_ACTIVE → DISABLE_VOLTAGE
+        //       → ... → ENABLE_OPERATION) while the controller's goal is
+        //       still active → brief pause, then motion resumes.
+        //   'x' SetHalt is a profile-mode halt bit — meaningless in CST.
+        // The fix stops the SOURCE (KillMotionSources) first; then:
+        //   'e' latches servo-off intent, which the cyclic state machine
+        //       cannot undo (m_bIsSetServoOnOff==FALSE ⇒ SHUTDOWN every
+        //       cycle) — motor de-energizes, brakes engage, STAYS stopped.
+        //       Re-arm is the normal 'h' flow (ctrl+grav are left true).
+        //   'x' keeps servo ON and holds in gravity compensation — the
+        //       proven soft-stop ('o'-stop and 'n'-stop use the same state).
         case 'e':
         case 'E':
+            DBG_LOG_WARN(">>> E-STOP: motion sources killed, SERVO OFF (brakes)");
+            KillMotionSources();
             for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
-            {
-                m_pEcatAxis[nMotorCnt]->EmgStopAxis();
-            }
+                m_pEcatAxis[nMotorCnt]->ServoOff();
             break;
         case 'x':
         case 'X':
-            DBG_LOG_INFO(">>> STOP AXIS!");
-            for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
-            {
-                m_pEcatAxis[nMotorCnt]->StopAxis();
-                // m_pEcatAxis[nMotorCnt]->ChangeDriveMode(CIA402_PROFILE_POSITION);
-            }
+            DBG_LOG_WARN(">>> STOP: motion sources killed — holding in grav-comp");
+            KillMotionSources();
+            // controller not running (bare drive modes) → old per-drive stop
+            // is the only thing left to try
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+                for (int nMotorCnt = 0; nMotorCnt < (int)GetTotalAxis(); nMotorCnt++)
+                    m_pEcatAxis[nMotorCnt]->StopAxis();
             break;
         case 't':
         case 'T':
@@ -521,7 +719,6 @@ CRobotIndy7::DoInput()
         case 'N':
             if (m_bRectTrigger.load()) {
                 m_bRectTrigger = false;
-                m_eRectState   = eRECT_IDLE;
                 m_bLogTrigger  = FALSE;
                 SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
                 DBG_LOG_INFO(">>> Rectangle Mode STOP");
@@ -555,7 +752,6 @@ CRobotIndy7::DoInput()
                 // 첫 번째 꼭짓점으로 1.5s 궤적 시작
                 m_nRectCornerIdx = 0;
                 m_nRectWaitCount = 0;
-                m_eRectState     = eRECT_TO_CORNER;
                 m_pEcatSensor[0]->LED_RED(TRUE);
                 m_pController->StartJointTrajectory(m_rectJointTargets[0], 2.0);
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
@@ -601,12 +797,53 @@ CRobotIndy7::DoInput()
             DBG_LOG_INFO(">>> Log Distance Error");
             m_pController->LogDistanceError(m_Pose);
             break;
+        case 'w':
+        case 'W':
+            // [kv260-merge] Calibration-capture arming (2026-07-29). 's' used to
+            // write the hand-eye dataset unconditionally while LOOKING like a
+            // read-only pose print, and the first press of every run TRUNCATES
+            // robot_poses.csv. Worse than losing the files: only the robot side
+            // (pose_rPe_N) is rewritten, so the set silently DE-PAIRS from
+            // image000N/pose_cPo_N and the solve still succeeds — with a wrong
+            // rMc that every object coordinate then inherits.
+            // DoInput() runs on the 1 kHz RT thread, so the banner is ONE
+            // printf rather than seven: one write() instead of seven, each of
+            // which could block on a slow terminal. (The pose print below has
+            // always done this from here; file IO on this thread is likewise
+            // pre-existing — and now only happens when armed.)
+            m_bCalibMode = !m_bCalibMode;
+            if (m_bCalibMode)
+                printf("\n================= CALIB CAPTURE: ON =================\n"
+                       " 's' now WRITES App/CalibUtils/kv260/ :\n"
+                       "   robot_poses.csv     (capture #1 TRUNCATES it)\n"
+                       "   pose_rPe_<N>.yaml   next N = %d\n"
+                       " 'w' again to disarm.\n"
+                       " Undo: git checkout -- App/CalibUtils/kv260/\n"
+                       "=====================================================\n\n",
+                       s_calibCapture.GetCount());
+            else
+                printf("[CALIB] capture DISARMED — 's' only prints the pose\n");
+            break;
+            // ⚠ 'w' was the ONLY free letter. Before adding any new key, check
+            // proc_keyboard_control FIRST: it consumes 'q' (StopTasks) and
+            // 'z'/'Z' (ISO cube IK validation) and `continue`s WITHOUT setting
+            // m_cKeyPress, so a case for either here is unreachable — the
+            // 'q' case below is exactly that, dead since the thread claimed it.
         case 's':
         case 'S':
             m_pController->GetCurrentPose(m_Pose);
-            SaveRobotPose();
-            s_calibCapture.Capture(m_Pose);
-            printf("[TCP Pose]\n");
+            // Guarded: these are the ONLY two writers of the calibration
+            // dataset in the app (verified 2026-07-29), so one gate covers it.
+            if (m_bCalibMode)
+            {
+                SaveRobotPose();
+                s_calibCapture.Capture(m_Pose);
+            }
+            // "%s" and not the ternary directly as the format: a non-literal
+            // format string is a smell even when both branches are %-free.
+            printf("%s", m_bCalibMode
+                             ? "[TCP Pose] *** CAPTURED ***\n"
+                             : "[TCP Pose] (print only — 'w' arms capture)\n");
             printf("  t = [%.6f, %.6f, %.6f]\n",
                    m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
             printf("  R = [%.6f, %.6f, %.6f]\n"
@@ -616,21 +853,6 @@ CRobotIndy7::DoInput()
                    m_Pose.m_rotation(1,0), m_Pose.m_rotation(1,1), m_Pose.m_rotation(1,2),
                    m_Pose.m_rotation(2,0), m_Pose.m_rotation(2,1), m_Pose.m_rotation(2,2));
             break;
-        case 'v':
-        case 'V':
-            if (!m_bVSTrigger.load()) {
-                m_visualServo.Start();
-                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
-                m_bVSTrigger = true;
-                printf("[VS] Visual Servoing ON\n");
-            } else {
-                m_visualServo.Stop();
-                m_bVSTrigger = false;
-                m_pController->SetControlMode(CControllerFullDynamicsRT::eGravityCompensation);
-                printf("[VS] Visual Servoing OFF — Gravity Compensation\n");
-            }
-            break;
-
         case 'a':
         case 'A':
         {
@@ -651,12 +873,215 @@ CRobotIndy7::DoInput()
             {
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
                 m_bLogTrigger = TRUE;
+                StartRefine(ref_pose);   // [kv260-merge] close the CTC droop
             }
             else
                 DBG_LOG_ERROR(">>> SetTargetPose FAILED — IK did not converge");
 
             break;
         }
+
+        //==============================================================
+        // [kv260-merge] Gate 2b — pipeline pick flow ('p' → digit → 'v').
+        // Handlers only flip bridge atomics; all ROS2 work runs on the
+        // bridge's own non-RT threads.
+        case 'p':
+        case 'P':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->RequestMenu();
+            else
+                printf("[PickBridge] not available (init failed at startup)\n");
+            break;
+        case 'v':
+        case 'V':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->RequestApproach();
+            else
+                printf("[PickBridge] not available (init failed at startup)\n");
+            break;
+        case 'k':
+        case 'K':
+            if (m_pController != NULL)
+            {
+                const bool bEn = !m_pController->m_bStickyEnable.load();
+                m_pController->m_bStickyEnable = bEn;
+                DBG_LOG_INFO("[STICKY] grav-comp hold %s (dead-band %.0f mrad)",
+                             bEn ? "ON" : "OFF — pure float",
+                             CControllerFullDynamicsRT::HOLD_DB_RAD * 1e3);
+            }
+            break;
+        case 'b':
+        case 'B':
+        {
+            // [kv260-merge] no user HOME recorded → fall back to the computed
+            // q_ready (same posture every approach solves from)
+            const bool bUseReady = (!m_bHomeSet && m_pController != NULL &&
+                                    m_pController->HasReadySeed());
+            if (!m_bHomeSet && !bUseReady)
+            {
+                DBG_LOG_WARN("[HOME] no home recorded — 'p' menu, last entry");
+                break;
+            }
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+            {
+                DBG_LOG_WARN("[HOME] controller not enabled ('r' first)");
+                break;
+            }
+            {
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < GetTotalAxis(); i++)
+                    if (!m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (!bServoAll)
+                {
+                    DBG_LOG_WARN("[HOME] servo OFF — press 'h' first");
+                    break;
+                }
+            }
+            // pure joint-space return: no IK, so no branch risk — just cap
+            // the quintic's peak speed like E13 and go.
+            m_bRefineActive  = false;
+            m_eApproachState = eAPPROACH_IDLE;
+            RigidBodyDynamics::Math::VectorNd vqTarget =
+                bUseReady ? m_pController->GetReadyQ() : m_vHomeQ;
+            // Counter-frame safety (E20): fold each joint toward the LIVE
+            // counter — a lap mismatch between record time and replay time
+            // (E-stop bus-power cycles re-reference the multiturn encoders)
+            // would otherwise command REAL full-turn rotations.
+            {
+                const size_t uN = m_vCurrentPos.size();
+                RigidBodyDynamics::Math::VectorNd vqCur(uN);
+                for (size_t i = 0; i < uN; i++) vqCur[i] = m_vCurrentPos[i];
+                CControllerFullDynamicsRT::FoldTowardRef(vqTarget, vqCur,
+                                                         (unsigned int)uN);
+            }
+            double dDqMax = 0.0;
+            for (size_t i = 0; i < m_vCurrentPos.size() &&
+                               i < (size_t)vqTarget.size(); i++)
+            {
+                const double dDq = std::fabs(vqTarget[i] - m_vCurrentPos[i]);
+                if (dDq > dDqMax) dDqMax = dDq;
+            }
+            const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+                dDqMax, APPROACH_DURATION_S);
+            SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+            m_pController->StartJointTrajectory(vqTarget, dT);
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+            DBG_LOG_INFO("[HOME] returning%s, T=%.1f s (dq_max %.2f rad)",
+                         bUseReady ? " to computed q_ready (no user HOME)" : "",
+                         dT, dDqMax);
+            break;
+        }
+        case 'o':
+        case 'O':
+        {
+            // [kv260-merge 2026-08-03] tracking toggle — see Indy7Ctrl.h.
+            if (m_eTrackState != eTRACK_OFF)
+            {
+                m_eTrackState = eTRACK_OFF;
+                m_pController->StopTrackingServo();
+                DBG_LOG_INFO("[TRACK] stop — holding here; 'g'=grav-comp");
+                break;
+            }
+            // Entry gates, each with its own refusal (E17 discipline).
+            // [2026-08-03 v2] slimmed by field verdict: no 'v'-first, no
+            // proximity gate — 'o' follows the selected object from wherever
+            // the arm is, gliding there at the speed cap. Kept: servo on,
+            // controller enabled, arm settled, live target.
+            if (m_pPickBridge == nullptr)
+            {
+                printf("[TRACK] refused — pick bridge unavailable\n");
+                break;
+            }
+            if (!m_bRTControllerEnabled || m_pController == NULL ||
+                !m_pController->IsEnabled())
+            {
+                printf("[TRACK] refused — controller not enabled ('r' first)\n");
+                break;
+            }
+            {
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < GetTotalAxis(); i++)
+                    if (!m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (!bServoAll)
+                {
+                    printf("[TRACK] refused — servo OFF ('h' first)\n");
+                    break;
+                }
+            }
+            if (m_eApproachState != eAPPROACH_IDLE ||
+                m_bIsoHWTrigger.load() || m_bRectTrigger.load())
+            {
+                printf("[TRACK] refused — approach/ISO/RECT busy\n");
+                break;
+            }
+            {
+                // arm settled — entering the non-accumulating servo reference
+                // mid-motion releases the trajectory hold torque (S5)
+                double dVelSq = 0.0;
+                for (size_t i = 0; i < m_vCurrentVel.size(); i++)
+                    dVelSq += m_vCurrentVel[i] * m_vCurrentVel[i];
+                if (dVelSq > STAGE_VEL_EPS * STAGE_VEL_EPS)
+                {
+                    printf("[TRACK] refused — arm still moving\n");
+                    break;
+                }
+            }
+            if (!m_pPickBridge->HasLockedTarget())
+            {
+                printf("[TRACK] refused — no fresh target lock ('p' menu)\n");
+                break;
+            }
+            CROS2PickBridge::TrackSample stS;
+            uint32_t uSeq = 0;
+            if (!m_pPickBridge->PeekTrack(stS, uSeq) || !stS.bClassMatch)
+            {
+                printf("[TRACK] refused — no matching tracking sample\n");
+                break;
+            }
+            double dGx = stS.dX, dGy = stS.dY,
+                   dGz = stS.dZ + kv260::TRACK_ZMARGIN_M;
+            ClampTrackGoal(dGx, dGy, dGz);
+            m_bRefineActive = false;   // a pending refine must not fight the servo
+            m_vTrackTarget =
+                RigidBodyDynamics::Math::Vector3d(dGx, dGy, dGz);
+            m_vTrackPending     = m_vTrackTarget;
+            m_uLastTrackSeq     = uSeq;
+            m_nTrackNoSampleCyc = 0;
+            m_nTrackSettleCnt   = 0;
+            m_nTrackLegCooldown = 0;
+            // far goal → the proven trajectory stack; near → servo follow
+            m_pController->ComputeTcpFK();
+            {
+                const RigidBodyDynamics::Math::Vector3d vD =
+                    m_vTrackTarget - m_pController->GetTcpPose().m_position;
+                if (vD.norm() > TRACK_SERVO_RANGE_M)
+                {
+                    if (!StartTrackLeg(m_vTrackTarget))
+                        break;   // refused with its own message; nothing moved
+                    m_eTrackState = eTRACK_LEG;
+                }
+                else
+                {
+                    m_pController->StartTrackingServo();
+                    SnapTrackServoQ0();
+                    m_eTrackState = eTRACK_ON;
+                }
+            }
+            DBG_LOG_WARN("[TRACK] ON (%s) — hover +%.0f mm, vmax %.2f m/s; "
+                         "'p'+digit=retarget, 'o'=stop-hold, 'g'=float, "
+                         "'j'=servo off",
+                         m_eTrackState == eTRACK_LEG ? "approach leg" : "servo",
+                         kv260::TRACK_ZMARGIN_M * 1e3,
+                         m_pController->m_dMaxLinVel);
+            break;
+        }
+        case '0': case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9':
+            if (m_pPickBridge != nullptr)
+                m_pPickBridge->FeedDigit(m_cKeyPress);
+            break;
+        //==============================================================
 
         default:
             break;
@@ -666,40 +1091,241 @@ CRobotIndy7::DoInput()
     return;
 }
 
+// [kv260-merge] arm the refinement SM (see header). Rotation is irrelevant:
+// refinement passes use position-only IK.
 void
-CRobotIndy7::WriteDataLog()
+CRobotIndy7::StartRefine(const CControllerFullDynamicsRT::Pose& astDesired)
 {
-    for (int nCnt = 0; nCnt < 8; nCnt++)
-    {
-        TSTRING strAxisNo;
-        sprintf(&strAxisNo[0], "Axis%d", nCnt);
-        TSTRING fileName =  m_strDataLog + strAxisNo.c_str() + ".csv";
-        FILE* pfFileTiming = fopen(fileName.c_str(), "w");
-        double dTimeDuration = 0.;
+    m_vRefineDesired = astDesired.m_position;
+    m_stRefineCmd    = astDesired;   // bias accumulates on top of m_position;
+                                     // m_rotation rides along for the IK
+                                     // orientation constraint (E13)
+    m_nRefineIter = 0;
+    m_nRefineSettleCnt = 0;
+    m_bRefineActive = true;
+}
 
-        LISTINT::iterator itTarPos = m_stDataLog[nCnt].vecTarPos.begin();
-        LISTINT::iterator itActPos = m_stDataLog[nCnt].vecActPos.begin();
-        LISTINT::iterator itActTor = m_stDataLog[nCnt].vecActTor.begin();
-        LISTULONG::iterator itTimeStamp = m_stDataLog[nCnt].vecTimestamp.begin();
-    
-        if ((int)m_stDataLog[nCnt].vecActPos.size() == (int)m_stDataLog[nCnt].vecTarPos.size())
-        {
-        
-            for (; itTarPos != m_stDataLog[nCnt].vecTarPos.end(); itTarPos++, itActPos++, itActTor++, itTimeStamp++)
-            {
-                dTimeDuration += 0.001;
-                fprintf(pfFileTiming, "%lf %ld %d %d %d\n", dTimeDuration, *itTimeStamp, *itTarPos, *itActPos, *itActTor);
-            }
-        }
-        else
-        {
-            DBG_LOG_WARN("[%s] Cannot write datalog for Axis %d, ActPos:%d, TarPos:%d, ActTor:%d, TS:%d", "CRobotIndy7", nCnt, m_stDataLog[nCnt].vecActPos.size(),
-                m_stDataLog[nCnt].vecTarPos.size(), m_stDataLog[nCnt].vecActTor.size(), m_stDataLog[nCnt].vecTimestamp.size());
-            
-            continue;
-        }
-        fclose(pfFileTiming);
+// [kv260-merge] Hand one finished approach to the bridge for logging+plotting.
+// [RT] — fills a wait-free mailbox and returns; the worker thread does the IO.
+// Called exactly once per approach, at the eAPPROACH_MOVING → IDLE edge.
+void
+CRobotIndy7::EmitApproachReport()
+{
+    if (m_pPickBridge == nullptr || m_pController == nullptr)
+        return;
+
+    // strncpy, not snprintf: this runs on the 1 kHz thread and the printf
+    // family is a poor neighbour there (locale, potential allocation).
+    CROS2PickBridge::ApproachReport stRep{};
+    const char* pcCls = (m_stActiveGoal.szClass[0] != '\0')
+                            ? m_stActiveGoal.szClass : "unknown";
+    strncpy(stRep.szClass, pcCls, sizeof(stRep.szClass) - 1);
+    stRep.szClass[sizeof(stRep.szClass) - 1] = '\0';
+
+    // The commanded target is m_vRefineDesired, not the raw goal: both the
+    // direct and the staged leg set it from the goal, and it is what every
+    // refinement pass was measured against. Using it keeps the CSV honest if
+    // those paths ever diverge.
+    const RigidBodyDynamics::Math::Vector3d& vTcp =
+        m_pController->GetTcpPose().m_position;
+    for (int i = 0; i < 3; i++)
+    {
+        stRep.dGoal[i] = m_vRefineDesired[i];
+        stRep.dTcp[i]  = vTcp[i];
+        stRep.dTcpFirst[i] = m_bFirstTcpSet
+                                 ? m_vFirstTcp[i]
+                                 : std::numeric_limits<double>::quiet_NaN();
+        stRep.dStdMM[i] = m_stActiveGoal.dStdMM[i];
     }
+    stRep.nSamples    = m_stActiveGoal.nSamples;
+    stRep.nRefineIter = m_nRefineIter;
+    stRep.dZMarginM   = m_pPickBridge->GetZMarginM();
+
+    const CControllerFullDynamicsRT::IkDiag& stD = m_pController->GetLastIkDiag();
+    stRep.dTiltDeg    = stD.dTiltDeg;
+    stRep.dGapRad     = stD.dBranchGap;
+    stRep.dIkMs       = stD.dMs;
+    stRep.dIkPosErrM  = stD.dPosErrM;
+    stRep.nSeed       = stD.nSeed;
+    stRep.nSolves     = stD.nSolves;
+    stRep.nGapAxis    = stD.nBranchAxis;
+
+    m_pPickBridge->LogApproach(stRep);
+}
+
+// [kv260-merge 2026-08-03] drift-budget reference — see Indy7Ctrl.h.
+void
+CRobotIndy7::SnapTrackServoQ0()
+{
+    const size_t uN = m_vCurrentPos.size();
+    m_vTrackServoQ0.resize((int)uN);
+    for (size_t i = 0; i < uN; i++)
+        m_vTrackServoQ0[i] = m_vCurrentPos[i];
+}
+
+// [kv260-merge 2026-08-03] Tracking approach leg — the proven large-move
+// stack (SolveReadyIK: deterministic, candidates ranked by MINIMUM joint
+// travel; quintic with the E13 speed cap) fired by the tracking SM whenever
+// the goal is beyond servo range. Returns TRUE when the leg started.
+BOOL
+CRobotIndy7::StartTrackLeg(const RigidBodyDynamics::Math::Vector3d& avGoal)
+{
+    CControllerFullDynamicsRT* pC = m_pController;
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErrM = 0.0, dDqMax = 0.0;
+    int    nAxis = -1;
+    if (!pC->SolveReadyIK(avGoal, vqSol, dErrM, dDqMax, nAxis))
+    {
+        DBG_LOG_WARN("[TRACK] leg refused — no reachable solution for "
+                     "(%.3f, %.3f, %.3f); holding here",
+                     avGoal[0], avGoal[1], avGoal[2]);
+        return FALSE;
+    }
+    if (dDqMax > CControllerFullDynamicsRT::IK_DQ_MAX_RAD)
+    {
+        // tracking never stages through q_ready — a two-leg surprise next to
+        // a person is the j→v trap; the operator can 'o'-stop, 'b', 'o'.
+        DBG_LOG_WARN("[TRACK] leg refused — solution %.2f rad away (J%d); "
+                     "'o' stop, 'b' home, then 'o' again", dDqMax, nAxis);
+        return FALSE;
+    }
+    const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+        dDqMax, APPROACH_DURATION_S);
+    CControllerFullDynamicsRT::Pose stTarget;
+    stTarget.m_position = avGoal;
+    stTarget.m_rotation = pC->ToolRotAt(vqSol);
+    // grav-comp bracket: the IK6dof consumer must not see a half-built
+    // trajectory (same pattern as 'b'/TryReadyApproach)
+    SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+    pC->StartJointTrajectory(vqSol, dT);
+    SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+    pC->goal_tcpPose = stTarget;   // 'd'/logger read this (E23)
+    DBG_LOG_INFO("[TRACK] leg → (%.3f, %.3f, %.3f)  T=%.1f s  dq %.2f rad J%d",
+                 avGoal[0], avGoal[1], avGoal[2], dT, dDqMax, nAxis);
+    return TRUE;
+}
+
+// [kv260-merge] One ready-seed approach attempt (rationale in the header).
+// Called from the main-control SM only. Returns TRUE when a motion started
+// (direct goal leg or the staging leg); FALSE means nothing moved.
+BOOL
+CRobotIndy7::TryReadyApproach(const CROS2PickBridge::Goal& astGoal,
+                              BOOL abAllowStage)
+{
+    CControllerFullDynamicsRT* pC = m_pController;
+
+    // Accuracy report bookkeeping: remember what this attempt was asked to
+    // reach. Harmless on the paths that refuse below — nothing is emitted
+    // unless a motion actually completes.
+    m_stActiveGoal = astGoal;
+    m_bFirstTcpSet = false;
+
+    CControllerFullDynamicsRT::Pose stTarget;
+    pC->GetCurrentPose(stTarget);            // R rides along for refine/logs
+    stTarget.m_position[0] = astGoal.dX;
+    stTarget.m_position[1] = astGoal.dY;
+    stTarget.m_position[2] = astGoal.dZ;
+
+    RigidBodyDynamics::Math::VectorNd vqSol;
+    double dErrM = 0.0, dDqMax = 0.0;
+    int    nAxis = -1;
+    if (!pC->SolveReadyIK(stTarget.m_position, vqSol, dErrM, dDqMax, nAxis))
+    {
+        DBG_LOG_ERROR("[APPROACH] no reachable solution for (%.3f, %.3f, %.3f)"
+                      " even from q_ready — move the object closer",
+                      astGoal.dX, astGoal.dY, astGoal.dZ);
+        return FALSE;
+    }
+
+    // E26: anchor refine on the attitude the SOLUTION reaches, not on wherever
+    // the arm happened to be parked when the goal was accepted. GetCurrentPose
+    // above filled m_rotation with the pre-approach attitude, so every refine
+    // pass was measuring (and, once weighted, would have been pulling toward)
+    // the park pose — 24 deg away on tennis_ball. With the solution's own
+    // attitude as the reference, "R held within N deg" finally means "how far
+    // refine has drifted from the approach".
+    stTarget.m_rotation = pC->ToolRotAt(vqSol);
+
+    if (dDqMax <= CControllerFullDynamicsRT::IK_DQ_MAX_RAD)
+    {
+        const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+            dDqMax, APPROACH_DURATION_S);
+        // grav-comp bracket: the IK6dof consumer must not see a half-built
+        // trajectory (same pattern as 'b')
+        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+        pC->StartJointTrajectory(vqSol, dT);
+        SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+        m_eApproachState = eAPPROACH_MOVING;
+        StartRefine(stTarget);
+        // 'd' (LogDistanceError) reads goal_tcpPose — the joint-trajectory
+        // path never filled it, so 'd' showed a bogus 0,0,0 target (E23).
+        pC->goal_tcpPose = stTarget;
+        // Per-approach trajectory log: arm the EXISTING logging block (the
+        // one 'l'/'a'/RECT use — proven on the robot at 1 kHz) and tell the
+        // logger to close the file at the approach-done edge instead of the
+        // 24 s timer. Order matters: mode flag before trigger (the trigger's
+        // release store publishes it). Guarded on the trigger being idle:
+        // the logger consumed m_bLogUntilDone with exchange() when the window
+        // opened, so re-setting it here (staged leg 2 re-enters this path)
+        // would leak a stale 'true' into the NEXT, possibly manual, log.
+        if (!m_bLogTrigger.load(std::memory_order_relaxed))
+        {
+            m_bLogUntilDone = true;
+            m_bLogTrigger   = TRUE;
+        }
+        DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  "
+                     "[ready-seed direct, dq %.2f rad J%d]  "
+                     "[std mm %.1f/%.1f/%.1f n=%d]",
+                     astGoal.szClass, astGoal.dX, astGoal.dY, astGoal.dZ, dT,
+                     dDqMax, nAxis,
+                     astGoal.dStdMM[0], astGoal.dStdMM[1], astGoal.dStdMM[2],
+                     astGoal.nSamples);
+        return TRUE;
+    }
+
+    if (!abAllowStage)
+    {
+        DBG_LOG_ERROR("[APPROACH] solution still %.2f rad away (J%d) after "
+                      "staging — holding at q_ready", dDqMax, nAxis);
+        return FALSE;
+    }
+
+    // stage: 'b'-class joint move to q_ready, goal leg fires on settle.
+    // E20: q_ready is stored canonically (physical posture) while the live
+    // counters may be wound — fold toward the current counter so the staging
+    // move is the true physical delta, never extra turns.
+    RigidBodyDynamics::Math::VectorNd vqReady = pC->GetReadyQ();
+    {
+        const size_t uN = m_vCurrentPos.size();
+        RigidBodyDynamics::Math::VectorNd vqCur(uN);
+        for (size_t i = 0; i < uN; i++) vqCur[i] = m_vCurrentPos[i];
+        CControllerFullDynamicsRT::FoldTowardRef(vqReady, vqCur,
+                                                 (unsigned int)uN);
+    }
+    double dDqHome = 0.0;
+    for (size_t i = 0; i < m_vCurrentPos.size() &&
+                       i < (size_t)vqReady.size(); i++)
+    {
+        const double dDq = std::fabs(vqReady[i] - m_vCurrentPos[i]);
+        if (dDq > dDqHome) dDqHome = dDq;
+    }
+    const double dT = CControllerFullDynamicsRT::ScaledTrajTime(
+        dDqHome, APPROACH_DURATION_S);
+    m_stStagedGoal    = astGoal;
+    m_nStageSettleCnt = 0;
+    SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+    pC->StartJointTrajectory(vqReady, dT);
+    SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+    m_eApproachState = eAPPROACH_STAGING;
+    if (!m_bLogTrigger.load(std::memory_order_relaxed))
+    {
+        m_bLogUntilDone = true;   // per-approach trajectory log (staged
+        m_bLogTrigger   = TRUE;   // journey included — leg 1 starts here)
+    }
+    DBG_LOG_INFO("[APPROACH] %s: solution %.2f rad away (J%d) — staging via "
+                 "q_ready first (T=%.1f s), goal leg follows",
+                 astGoal.szClass, dDqMax, nAxis, dT);
+    return TRUE;
 }
 
 BOOL
@@ -728,11 +1354,13 @@ void proc_main_control(void* apRobot)
 
      // Check if RT Controller is available
     CControllerFullDynamicsRT* pRTController = pRobot->GetController();
-    BOOL bUseRTController = (pRTController != NULL && pRTController->IsEnabled());
-    if (bUseRTController)
-        DBG_LOG_INFO("(proc_main_control) Using RT Controller");
-    else 
-        DBG_LOG_INFO("(proc_main_control) RT Controller not available - using fallback");
+    // [kv260-merge] availability only — the enable state is re-read EVERY
+    // cycle below. The upstream one-shot snapshot froze IsEnabled() at task
+    // start, which silently killed the runtime 'r' key whenever
+    // ENABLE_CONTROLLER_AT_STARTUP=0 (our safe bring-up cfg).
+    const BOOL bUseRTController = (pRTController != NULL);
+    DBG_LOG_INFO("(proc_main_control) RT Controller %s (enable at runtime: 'r')",
+                 bUseRTController ? "available" : "NOT available - fallback");
 
     RTTIME tPrev = read_timer();
     uint64_t max_calc_ns = 0, avg_calc_ns = 0, samp = 0;
@@ -746,21 +1374,101 @@ void proc_main_control(void* apRobot)
         
         pRobot->DoInput();
 
-        // Read current joint states
-        for (int nCnt = 0; nCnt < (int)udof; ++nCnt) 
-        {   
-            auto ax = static_cast<CAxisNRMKCore*>(pRobot->m_pEcatAxis[nCnt]);
-            
-            if (bUseRTController) {
-                // Update RT controller vectors
-                pRobot->m_vCurrentPos[nCnt] = ax->GetCurrentPos();
-                pRobot->m_vCurrentVel[nCnt] = ax->GetCurrentVel();
-                pRobot->m_vCurrentTor[nCnt] = ax->GetCurrentTor();
+        // [gui] admin gains from the console (/operator_gains): the bridge
+        // parsed, clamped and idle-gated them; here it is per-axis plain
+        // stores only — no allocation, no lock on the RT thread.
+        if (pRobot->m_pPickBridge != nullptr && pRTController != NULL)
+        {
+            double adGains[3 * CROS2PickBridge::GAINS_DOF];
+            if (pRobot->m_pPickBridge->PopGains(adGains))
+                for (unsigned int uAx = 0;
+                     uAx < udof && uAx < (unsigned int)CROS2PickBridge::GAINS_DOF;
+                     uAx++)
+                {
+                    pRTController->SetControlGain(uAx, adGains[uAx],
+                        adGains[CROS2PickBridge::GAINS_DOF + uAx]);
+                    pRTController->SetFrictionFFAxis(uAx,
+                        adGains[2 * CROS2PickBridge::GAINS_DOF + uAx]);
+                }
+
+            // [gui] joint jog (/operator_jog, bridge-gated): newest slider
+            // target wins; the controller walks q_ref to it at 0.5 rad/s
+            // and clamps to the joint limits again.
+            static uint32_t s_uJogSeqSeen = 0;
+            CROS2PickBridge::JogCmd stJog;
+            uint32_t uJogSeq = 0;
+            if (pRobot->m_pPickBridge->PeekJog(stJog, uJogSeq) &&
+                uJogSeq != s_uJogSeqSeen)
+            {
+                s_uJogSeqSeen = uJogSeq;
+                pRTController->SetJogTarget((UINT)stJog.nAxis, stJog.dQ);
             }
         }
 
+        // [kv260-merge] live enable state — makes 'r' actually work at runtime
+        const BOOL bCtrlOn = bUseRTController && pRTController->IsEnabled();
+
+        // Read current joint states
+        for (int nCnt = 0; nCnt < (int)udof; ++nCnt)
+        {
+            auto ax = static_cast<CAxisNRMKCore*>(pRobot->m_pEcatAxis[nCnt]);
+
+            // [gui] Read unconditionally. These used to update only while the
+            // RT controller was enabled ('r'), so before that every consumer
+            // saw the zeros from Init: the RViz model would sit folded at the
+            // origin, and 'b' would record a HOME of all-zeros. Three PDO
+            // reads per axis per cycle is not measurable at 1 kHz.
+            pRobot->m_vCurrentPos[nCnt] = ax->GetCurrentPos();
+            pRobot->m_vCurrentVel[nCnt] = ax->GetCurrentVel();
+            pRobot->m_vCurrentTor[nCnt] = ax->GetCurrentTor();
+        }
+
+        // [gui] snapshot posture + the exact booleans DoInput's refusal guards
+        // read, for the bridge's 20 Hz /robot_state (console button gating).
+        // Wait-free; the flag reads are the same atomics/bools the guards use.
+        if (pRobot->m_pPickBridge != nullptr)
+        {
+            CROS2PickBridge::RobotState stGui{};
+            stGui.nDof = (int)udof < 8 ? (int)udof : 8;
+            for (int nCnt = 0; nCnt < stGui.nDof; nCnt++)
+                stGui.dQ[nCnt] = pRobot->m_vCurrentPos[nCnt];
+            bool bServoAll = true;
+            for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                if (!pRobot->m_pEcatAxis[nCnt]->IsServoOn())
+                    { bServoAll = false; break; }
+            stGui.bServo = bServoAll;
+            stGui.bCtrl  = pRobot->m_bRTControllerEnabled &&
+                           pRTController != NULL && pRTController->IsEnabled();
+            stGui.bGrav  = pRTController != NULL &&
+                           pRTController->GetControlMode() ==
+                               CControllerFullDynamicsRT::eGravityCompensation;
+            stGui.bTrack = pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF;
+            stGui.bBusy  = pRobot->m_eApproachState != CRobotIndy7::eAPPROACH_IDLE ||
+                           pRobot->m_bIsoHWTrigger.load() ||
+                           pRobot->m_bRectTrigger.load();
+            stGui.bHome  = pRobot->m_bHomeSet ||
+                           (pRTController != NULL && pRTController->HasReadySeed());
+            stGui.bCalib = pRobot->m_bCalibMode;
+            stGui.nMode  = pRTController != NULL ?
+                           (int)pRTController->GetControlMode() : -1;
+            // [gui] gains readback for the admin tab — read from the
+            // controller (not a cache) so the console shows what the RT loop
+            // actually uses, cfg-loaded Kf included. Plain loads, ~18/cycle.
+            stGui.bGains = pRTController != NULL;
+            if (stGui.bGains)
+                for (int nCnt = 0;
+                     nCnt < stGui.nDof && nCnt < CROS2PickBridge::GAINS_DOF;
+                     nCnt++)
+                {
+                    pRTController->GetControlGain((UINT)nCnt,
+                        &stGui.dKp[nCnt], &stGui.dKd[nCnt]);
+                    stGui.dKf[nCnt] = pRTController->GetFrictionFFAxis((UINT)nCnt);
+                }
+            pRobot->m_pPickBridge->PushState(stGui);
+        }
+
         // Compute control torques (Update 먼저 → tcpPose 갱신)
-        if (bUseRTController)
+        if (bCtrlOn)
         {
             // Use RT Controller - it handles all RT optimizations internally
             if (pRTController->Update(pRobot->m_vCurrentPos, pRobot->m_vCurrentVel,
@@ -784,45 +1492,13 @@ void proc_main_control(void* apRobot)
             }
         }
 
-        // Visual Servoing: Update() 이후 호출
-        if (bUseRTController && pRobot->m_bVSTrigger.load())
-        {
-            CControllerFullDynamicsRT::Pose vsGoal;
-            if (pRobot->m_visualServo.GetGoalPose(vsGoal))
-            {
-                // tcpPose를 현재 m_Q 기준으로 갱신 (eGravityComp 모드에서는 Update()에서 갱신 안 됨)
-                pRTController->ComputeTcpFK();
-                pRTController->goal_tcpPose = vsGoal;
-                pRTController->SetTargetPose_Jacobian();
-
-                // Q_ref가 계산됐으므로 CTC 모드로 전환 → 실제 관절 추종
-                pRTController->SetControlMode(
-                    CControllerFullDynamicsRT::eComputedTorque);
-
-                // 특이점 감지: 관절 속도가 임계값 초과 시
-                const double SINGULARITY_VEL_THRESHOLD = 0.45; // rad/s
-                for (int i = 0; i < (int)udof; ++i)
-                {
-                    if (std::fabs(pRobot->m_vCurrentVel[i]) > SINGULARITY_VEL_THRESHOLD)
-                    {
-                        pRobot->m_visualServo.NotifySingularity();
-                        pRTController->SetControlMode(
-                            CControllerFullDynamicsRT::eGravityCompensation);
-                        break;
-                    }
-                }
-            }
-            else
-            {
-                // 목표 없음 또는 SINGULARITY 상태 → 중력보상 유지
-                pRTController->SetControlMode(
-                    CControllerFullDynamicsRT::eGravityCompensation);
-            }
-        }
+        // [kv260-merge] ViSP visual-servo goal injection removed here.
+        // The ROS2 bridge (/pick_target_base) will provide goal poses instead;
+        // its safety-gated injection lands with the bridge wiring.
 
         //======================================================================
         // TCP Trajectory Logging
-        if (bUseRTController && pRobot->m_bLogTrigger.load(std::memory_order_acquire))
+        if (bCtrlOn && pRobot->m_bLogTrigger.load(std::memory_order_acquire))
         {
             ST_LOG_ENTRY entry{};
             entry.timestamp_ns = (uint64_t)read_timer();
@@ -922,6 +1598,477 @@ void proc_main_control(void* apRobot)
                     pRobot->m_nRectCornerIdx + 1,
                     pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[1],
                     pRobot->m_rectCorners[pRobot->m_nRectCornerIdx].m_position[2]);
+            }
+        }
+        //======================================================================
+        // [kv260-merge] HOME record — menu entry N+1 asked for a snapshot of
+        // the CURRENT joints (works in any mode; measured q is always live).
+        if (pRobot->m_pPickBridge != nullptr &&
+            pRobot->m_pPickBridge->PopHomeRecord())
+        {
+            const size_t uDof = pRobot->m_vCurrentPos.size();
+            pRobot->m_vHomeQ.resize(uDof);
+            for (size_t i = 0; i < uDof; i++)
+                pRobot->m_vHomeQ[i] = pRobot->m_vCurrentPos[i];
+            pRobot->m_bHomeSet = true;
+            DBG_LOG_INFO("[HOME] recorded q = [%.2f %.2f %.2f %.2f %.2f %.2f] rad"
+                         " — 'b' returns here",
+                         pRobot->m_vHomeQ[0], pRobot->m_vHomeQ[1],
+                         pRobot->m_vHomeQ[2], pRobot->m_vHomeQ[3],
+                         pRobot->m_vHomeQ[4], pRobot->m_vHomeQ[5]);
+            // [kv260-merge] the recorded posture IS the best IK anchor — a
+            // branch demonstrated by a human beats any synthetic bootstrap.
+            // Re-base q_ready now; on success persist the CANONICAL
+            // (zero-folded) values — never raw counters, which can be wound
+            // whole turns (E20) — for the next boot (file IO is on the
+            // bridge worker; here only a wait-free mailbox fill).
+            if (pRobot->m_pController != NULL &&
+                pRobot->m_pController->SetReadyAnchor(pRobot->m_vHomeQ))
+            {
+                const RigidBodyDynamics::Math::VectorNd& vqA =
+                    pRobot->m_pController->GetReadyQ();
+                double adQ[8];
+                int    nN = (int)vqA.size() < 8 ? (int)vqA.size() : 8;
+                for (int i = 0; i < nN; i++) adQ[i] = vqA[i];
+                pRobot->m_pPickBridge->PersistReadySeed(adQ, nN);
+            }
+        }
+        // [kv260-merge] amortized anchor-coverage verification: one IK solve
+        // per cycle for a few cycles right after a HOME record (same per-cycle
+        // cost as the field-proven 'v' solve; a 9-solve burst would stall the
+        // loop). No-op while idle.
+        if (pRobot->m_pController != NULL)
+            pRobot->m_pController->TickAnchorVerify();
+        //======================================================================
+        // [kv260-merge] Vision approach — consume a gated goal from the ROS2
+        // bridge ('p' → digit → 'v'). Bridge already ran the N-frame std gate
+        // and the workspace-box check; here we mirror the proven 'n'-key
+        // sequence: position-only IK → quintic joint trajectory → IK6dof+CTC.
+        if (pRobot->m_pPickBridge != nullptr && bCtrlOn)
+        {
+            if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_MOVING)
+            {
+                // refinement runs between the first trajectory and "done"
+                if (pRTController->IsTrajectoryRefDone() && !pRobot->m_bRefineActive)
+                {
+                    pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    // Refinement's last act was ComputeTcpFK() and the arm has
+                    // been stationary since, but the trajectory-done path can
+                    // also get here without refine ever measuring — refresh so
+                    // the logged TCP is never a stale pose.
+                    pRTController->ComputeTcpFK();
+                    const auto& tcp = pRTController->GetTcpPose();
+                    DBG_LOG_INFO("[APPROACH] done — holding at (%.3f, %.3f, %.3f); 'g'=grav-comp",
+                                 tcp.m_position[0], tcp.m_position[1], tcp.m_position[2]);
+                    pRobot->EmitApproachReport();
+                    // Falling edge for the per-approach trajectory log: the
+                    // logger task (prio 30) sees the trigger drop and writes
+                    // one DataLog file spanning exactly this approach. Its
+                    // wall-clock stamp lands within ~1 s of the approach_log
+                    // row's — that proximity IS the pairing key the plot
+                    // watcher uses.
+                    pRobot->m_bLogTrigger = FALSE;
+                }
+            }
+            else if (pRobot->m_eApproachState == CRobotIndy7::eAPPROACH_STAGING)
+            {
+                // [kv260-merge] staged approach leg 2 — fire ONLY if the run
+                // is still exactly as we left it (IK6dof + servo on). Any
+                // operator intervention cancels the stashed goal instead of
+                // deferring it (a deferred motion is the j→v surprise again).
+                bool bServoAll = true;
+                for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                    if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bServoAll = false; break; }
+                if (pRTController->GetControlMode() !=
+                        CControllerFullDynamicsRT::eInverseKinematics_6dof || !bServoAll)
+                {
+                    pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_IDLE;
+                    pRobot->m_bLogTrigger    = FALSE;   // close the traj log
+                    DBG_LOG_WARN("[APPROACH] staging cancelled (mode change / "
+                                 "servo off) — goal dropped");
+                }
+                else if (!pRTController->IsTrajectoryRefDone())
+                {
+                    pRobot->m_nStageSettleCnt = 0;
+                }
+                else if ([&]{   // wait until the arm has actually stopped
+                    double dVelSq = 0.0;
+                    for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                        dVelSq += pRobot->m_vCurrentVel[nCnt] * pRobot->m_vCurrentVel[nCnt];
+                    if (dVelSq > CRobotIndy7::STAGE_VEL_EPS * CRobotIndy7::STAGE_VEL_EPS)
+                    {
+                        pRobot->m_nStageSettleCnt = 0;
+                        return false;
+                    }
+                    return ++pRobot->m_nStageSettleCnt >= CRobotIndy7::STAGE_SETTLE_CYC;
+                }())
+                {
+                    // arrived at q_ready — the goal leg is near by init
+                    // verification, so no further staging is allowed
+                    pRobot->m_nStageSettleCnt = 0;
+                    pRobot->m_eApproachState  = CRobotIndy7::eAPPROACH_IDLE;
+                    if (!pRobot->TryReadyApproach(pRobot->m_stStagedGoal, FALSE))
+                    {
+                        pRobot->m_bLogTrigger = FALSE;   // close the traj log
+                        DBG_LOG_WARN("[APPROACH] staged goal leg did not start"
+                                     " — holding at q_ready; 'g'=grav-comp");
+                    }
+                }
+            }
+            else if (!pRobot->m_bIsoHWTrigger.load() && !pRobot->m_bRectTrigger.load() &&
+                     pRobot->m_bRTControllerEnabled)
+            {
+                CROS2PickBridge::Goal stGoal;
+                if (pRobot->m_pPickBridge->PopGoal(stGoal))
+                {
+                    // Brakes engaged? The whole approach+refine would then run
+                    // against a frozen arm and read as a huge "droop"
+                    // (operator hit this with j->v on 2026-07-27). Discard —
+                    // deferring the goal would fire surprise motion at 'h'.
+                    bool bServo = true;
+                    for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                        if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bServo = false; break; }
+                    if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF)
+                    {
+                        // delayed 'v': a collection armed BEFORE 'o' pops its
+                        // goal mid-track — discarding is the j→v lesson (a
+                        // deferred goal would fire surprise motion later)
+                        DBG_LOG_ERROR("[APPROACH] goal discarded — tracking "
+                                      "active ('o' stop first, then 'v').");
+                    }
+                    else if (!bServo)
+                    {
+                        DBG_LOG_ERROR("[APPROACH] goal discarded — servo OFF. "
+                                      "Press 'h' (servo on) first, then 'v' again.");
+                    }
+                    else if (pRTController->HasReadySeed())
+                    {
+                        // [kv260-merge] deterministic path: solve from
+                        // q_ready, then direct or staged (TryReadyApproach).
+                        // If nothing started, the arm floats in grav-comp.
+                        pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                        (void)pRobot->TryReadyApproach(stGoal, TRUE);
+                    }
+                    else
+                    {
+                    // legacy live-posture seeding (ready seed unavailable)
+                    pRobot->m_stActiveGoal = stGoal;   // accuracy report
+                    pRobot->m_bFirstTcpSet = false;
+                    pRobot->SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                    pRobot->m_pController->GetCurrentPose(pRobot->m_Pose);
+                    CControllerFullDynamicsRT::Pose stTarget = pRobot->m_Pose;  // keep current R
+                    stTarget.m_position[0] = stGoal.dX;
+                    stTarget.m_position[1] = stGoal.dY;
+                    stTarget.m_position[2] = stGoal.dZ;
+                    // E13: SetTargetPosePositionOnly now starts the (possibly
+                    // T-stretched) trajectory itself — re-issuing
+                    // StartJointTrajectory here would clobber the scaled T.
+                    pRTController->SetTrajectoryDuration(CRobotIndy7::APPROACH_DURATION_S);
+                    if (pRTController->SetTargetPosePositionOnly(stTarget))
+                    {
+                        pRobot->SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                        pRobot->m_eApproachState = CRobotIndy7::eAPPROACH_MOVING;
+                        pRobot->StartRefine(stTarget);
+                        if (!pRobot->m_bLogTrigger.load(std::memory_order_relaxed))
+                        {
+                            pRobot->m_bLogUntilDone = true;  // per-approach traj log
+                            pRobot->m_bLogTrigger   = TRUE;
+                        }
+                        DBG_LOG_INFO("[APPROACH] %s → (%.3f, %.3f, %.3f)  T=%.1f s  [std mm %.1f/%.1f/%.1f n=%d]",
+                                     stGoal.szClass, stGoal.dX, stGoal.dY, stGoal.dZ,
+                                     pRTController->GetTrajT(),
+                                     stGoal.dStdMM[0], stGoal.dStdMM[1], stGoal.dStdMM[2],
+                                     stGoal.nSamples);
+                    }
+                    else
+                    {
+                        DBG_LOG_ERROR("[APPROACH] IK failed for (%.3f, %.3f, %.3f) — staying in grav-comp",
+                                      stGoal.dX, stGoal.dY, stGoal.dZ);
+                    }
+                    }  // servo-on legacy path
+                }
+            }
+        }
+        //======================================================================
+        // [kv260-merge] Position-refinement state machine (see Indy7Ctrl.h).
+        // Waits REFINE_SETTLE_CYC after each trajectory, measures the FK
+        // error vs the desired position, folds it into the commanded target
+        // as an accumulated bias and re-runs IK — until <REFINE_TOL_M or
+        // REFINE_MAX_ITER. A mode change ('g'/'j'/E-stop paths) aborts it.
+        if (pRobot->m_bRefineActive)
+        {
+            if (!bCtrlOn || pRTController->GetControlMode() !=
+                                CControllerFullDynamicsRT::eInverseKinematics_6dof)
+            {
+                pRobot->m_bRefineActive = false;
+                DBG_LOG_WARN("[REFINE] aborted (controller/mode change)");
+            }
+            else if (!pRTController->IsTrajectoryRefDone())
+            {
+                pRobot->m_nRefineSettleCnt = 0;
+            }
+            else if ([&]{   // measure only once the arm has actually stopped
+                double dVelSq = 0.0;
+                for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                    dVelSq += pRobot->m_vCurrentVel[nCnt] * pRobot->m_vCurrentVel[nCnt];
+                if (dVelSq > CRobotIndy7::REFINE_VEL_EPS * CRobotIndy7::REFINE_VEL_EPS)
+                {
+                    pRobot->m_nRefineSettleCnt = 0;
+                    return false;
+                }
+                return ++pRobot->m_nRefineSettleCnt >= CRobotIndy7::REFINE_SETTLE_CYC;
+            }())
+            {
+                pRobot->m_nRefineSettleCnt = 0;
+                pRTController->ComputeTcpFK();
+                // First settle of this approach = the raw CTC result, before
+                // any refinement bias. The accuracy plot shows it next to the
+                // final position, which is the only way to see whether refine
+                // is earning its passes.
+                if (!pRobot->m_bFirstTcpSet)
+                {
+                    pRobot->m_vFirstTcp   = pRTController->GetTcpPose().m_position;
+                    pRobot->m_bFirstTcpSet = true;
+                }
+                const RigidBodyDynamics::Math::Vector3d vErr =
+                    pRobot->m_vRefineDesired - pRTController->GetTcpPose().m_position;
+                const double dErrMM = vErr.norm() * 1e3;
+
+                if (vErr.norm() <= CRobotIndy7::REFINE_TOL_M)
+                {
+                    pRobot->m_bRefineActive = false;
+                    DBG_LOG_INFO("[REFINE] done — err %.1f mm after %d pass(es)",
+                                 dErrMM, pRobot->m_nRefineIter);
+                }
+                else if (pRobot->m_nRefineIter >= CRobotIndy7::REFINE_MAX_ITER)
+                {
+                    pRobot->m_bRefineActive = false;
+                    DBG_LOG_WARN("[REFINE] stop at max iters — residual %.1f mm", dErrMM);
+                }
+                else
+                {
+                    pRobot->m_stRefineCmd.m_position += CRobotIndy7::REFINE_DAMPING * vErr;   // damped bias
+                    // E13: trajectory (incl. any T stretch) starts inside.
+                    // E26 ladder: a flat weight of 0 left the tool free to
+                    // wander the 3-dim nullspace between passes, so the
+                    // position correction arrived polluted by an attitude
+                    // change and the residual bounced (tennis_ball 37.9 -> 23.7
+                    // -> 39.9 mm, R drifting 20-29 deg, max iters at 14.8 mm).
+                    // E18 showed a FIXED 0.3 stalls on large biases; these are
+                    // 10-26 mm, so walk down instead. The last rung IS the old
+                    // behaviour, which makes this strictly no worse: it can
+                    // only hold attitude where holding it is free.
+                    pRTController->SetTrajectoryDuration(CRobotIndy7::REFINE_TRAJ_T_S);
+                    static const double adRefineW[] = { 0.1, 0.03, 0.01, 0.0 };
+                    const int nRefineW = (int)(sizeof(adRefineW) / sizeof(adRefineW[0]));
+                    BOOL bStarted = FALSE;
+                    for (int k = 0; k < nRefineW && !bStarted; k++)
+                        bStarted = pRTController->SetTargetPosePositionOnly(
+                                       pRobot->m_stRefineCmd, adRefineW[k],
+                                       (k < nRefineW - 1) ? TRUE : FALSE,
+                                       0.0 /* no friction FF on mini-moves */);
+                    if (bStarted)
+                    {
+                        pRobot->m_nRefineIter++;
+                        DBG_LOG_INFO("[REFINE] pass %d — err %.1f mm, re-targeting",
+                                     pRobot->m_nRefineIter, dErrMM);
+                    }
+                    else
+                    {
+                        pRobot->m_bRefineActive = false;
+                        DBG_LOG_ERROR("[REFINE] IK failed on bias target — stop");
+                    }
+                }
+            }
+        }
+        //======================================================================
+        // [kv260-merge 2026-08-03] Tracking SM ('o') — consumes the bridge's
+        // seqlock sample pipe at the vision rate and retargets the servo goal
+        // every cycle. Cancel-on-any-change like the staging leg: mode or
+        // servo not exactly as tracking left them → OFF within one cycle.
+        if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_OFF)
+        {
+            bool bTrkServo = true;
+            for (unsigned int i = 0; i < pRobot->GetTotalAxis(); i++)
+                if (!pRobot->m_pEcatAxis[i]->IsServoOn()) { bTrkServo = false; break; }
+            const bool bLegState =
+                (pRobot->m_eTrackState == CRobotIndy7::eTRACK_LEG);
+            const CControllerFullDynamicsRT::eControlMode eExpect = bLegState
+                ? CControllerFullDynamicsRT::eInverseKinematics_6dof
+                : CControllerFullDynamicsRT::eTrackingServo;
+            if (!bCtrlOn || !bTrkServo ||
+                pRTController->GetControlMode() != eExpect)
+            {
+                pRobot->m_eTrackState = CRobotIndy7::eTRACK_OFF;
+                DBG_LOG_WARN("[TRACK] cancelled (mode change / servo off)");
+            }
+            else
+            {
+                // 1) ingest the freshest sample (all substates)
+                CROS2PickBridge::TrackSample stS;
+                uint32_t uSeq = 0;
+                if (pRobot->m_pPickBridge != nullptr &&
+                    pRobot->m_pPickBridge->PeekTrack(stS, uSeq) &&
+                    uSeq != pRobot->m_uLastTrackSeq)
+                {
+                    pRobot->m_uLastTrackSeq = uSeq;
+                    if (stS.bClassMatch)
+                    {
+                        double dGx = stS.dX, dGy = stS.dY,
+                               dGz = stS.dZ + kv260::TRACK_ZMARGIN_M;
+                        ClampTrackGoal(dGx, dGy, dGz);
+                        const RigidBodyDynamics::Math::Vector3d vNew(dGx, dGy, dGz);
+                        pRobot->m_vTrackPending     = vNew;
+                        pRobot->m_nTrackNoSampleCyc = 0;
+                        // STAGE keeps its servo goal frozen at the TCP (it is
+                        // braking); everyone else follows the fresh goal
+                        if (pRobot->m_eTrackState != CRobotIndy7::eTRACK_STAGE)
+                            pRobot->m_vTrackTarget = vNew;
+                        if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_LOST)
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                            DBG_LOG_INFO("[TRACK] reacquired");
+                        }
+                    }
+                }
+
+                // 2) substate logic
+                if (bLegState)
+                {
+                    // proven quintic in flight — open-loop like 'v'; hand off
+                    // to the servo once done AND the arm has stopped
+                    if (!pRTController->IsTrajectoryRefDone())
+                    {
+                        pRobot->m_nTrackSettleCnt = 0;
+                    }
+                    else if ([&]{
+                        double dVelSq = 0.0;
+                        for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            dVelSq += pRobot->m_vCurrentVel[nCnt] *
+                                      pRobot->m_vCurrentVel[nCnt];
+                        if (dVelSq > CRobotIndy7::STAGE_VEL_EPS *
+                                     CRobotIndy7::STAGE_VEL_EPS)
+                        {
+                            pRobot->m_nTrackSettleCnt = 0;
+                            return false;
+                        }
+                        return ++pRobot->m_nTrackSettleCnt >=
+                               CRobotIndy7::STAGE_SETTLE_CYC;
+                    }())
+                    {
+                        pRobot->m_nTrackSettleCnt = 0;
+                        pRTController->StartTrackingServo();  // goal = TCP
+                        pRobot->SnapTrackServoQ0();
+                        if (pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_WARN("[TRACK] leg done, target stale — "
+                                         "holding");
+                        }
+                        else
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                            DBG_LOG_INFO("[TRACK] leg done — servo follow");
+                        }
+                    }
+                }
+                else
+                {
+                    // servo substates: staleness → LOST (freeze at the TCP,
+                    // NOT the last goal — it can lead by ~10 cm at the cap)
+                    if ((pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON ||
+                         pRobot->m_eTrackState == CRobotIndy7::eTRACK_STAGE) &&
+                        ++pRobot->m_nTrackNoSampleCyc > pRobot->m_nTrackLostCyc)
+                    {
+                        pRobot->m_eTrackState = CRobotIndy7::eTRACK_LOST;
+                        pRobot->m_nTrackNoSampleCyc = 0;
+                        pRobot->m_nTrackSettleCnt   = 0;
+                        pRobot->m_vTrackTarget =
+                            pRTController->GetTcpPose().m_position;
+                        DBG_LOG_WARN("[TRACK] target lost — holding until it "
+                                     "reappears ('o' to stop)");
+                    }
+
+                    if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_STAGE)
+                    {
+                        // braking at the frozen TCP goal; once settled, fire
+                        // the proven trajectory at the LATEST object goal
+                        double dVelSq = 0.0;
+                        for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            dVelSq += pRobot->m_vCurrentVel[nCnt] *
+                                      pRobot->m_vCurrentVel[nCnt];
+                        if (dVelSq > CRobotIndy7::STAGE_VEL_EPS *
+                                     CRobotIndy7::STAGE_VEL_EPS)
+                            pRobot->m_nTrackSettleCnt = 0;
+                        else if (++pRobot->m_nTrackSettleCnt >=
+                                 CRobotIndy7::STAGE_SETTLE_CYC)
+                        {
+                            pRobot->m_nTrackSettleCnt = 0;
+                            if (pRobot->StartTrackLeg(pRobot->m_vTrackPending))
+                                pRobot->m_eTrackState = CRobotIndy7::eTRACK_LEG;
+                            else
+                            {
+                                // unreachable: hold and retry later (the
+                                // servo goal stays at the braked TCP; the
+                                // cooldown stops solver spam at 15 Hz)
+                                pRobot->m_eTrackState = CRobotIndy7::eTRACK_ON;
+                                pRobot->SnapTrackServoQ0();
+                                pRobot->m_vTrackTarget =
+                                    pRTController->GetTcpPose().m_position;
+                                pRobot->m_nTrackLegCooldown = 1000;
+                            }
+                        }
+                    }
+                    else if (pRobot->m_eTrackState == CRobotIndy7::eTRACK_ON)
+                    {
+                        if (pRobot->m_nTrackLegCooldown > 0)
+                            pRobot->m_nTrackLegCooldown--;
+                        // joint-drift budget (see header): null-direction
+                        // winding near a singularity moves joints without
+                        // moving the TCP — the Cartesian far-check below
+                        // cannot see it. Brake and re-plan a clean branch.
+                        double dDrift = 0.0;
+                        int    nDriftAx = -1;
+                        if (pRobot->m_vTrackServoQ0.size() >= (int)udof)
+                            for (int nCnt = 0; nCnt < (int)udof; nCnt++)
+                            {
+                                const double dD =
+                                    std::fabs(pRobot->m_vCurrentPos[nCnt] -
+                                              pRobot->m_vTrackServoQ0[nCnt]);
+                                if (dD > dDrift) { dDrift = dD; nDriftAx = nCnt; }
+                            }
+                        const RigidBodyDynamics::Math::Vector3d vD =
+                            pRobot->m_vTrackTarget -
+                            pRTController->GetTcpPose().m_position;
+                        if (dDrift > CRobotIndy7::TRACK_SERVO_DQ_MAX_RAD)
+                        {
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_STAGE;
+                            pRobot->m_nTrackSettleCnt = 0;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_WARN("[TRACK] axis%d drifted %.2f rad in "
+                                         "servo — braking to re-plan",
+                                         nDriftAx, dDrift);
+                        }
+                        else if (vD.norm() > CRobotIndy7::TRACK_LEG_TRIGGER_M &&
+                                 pRobot->m_nTrackLegCooldown == 0)
+                        {
+                            // too far for the local servo — brake, then let
+                            // the trajectory stack take the large move
+                            pRobot->m_eTrackState = CRobotIndy7::eTRACK_STAGE;
+                            pRobot->m_nTrackSettleCnt = 0;
+                            pRobot->m_vTrackTarget =
+                                pRTController->GetTcpPose().m_position;
+                            DBG_LOG_INFO("[TRACK] target far — braking for "
+                                         "an approach leg");
+                        }
+                    }
+
+                    pRTController->goal_tcpPose.m_position =
+                        pRobot->m_vTrackTarget;
+                }
             }
         }
         //======================================================================
@@ -1059,6 +2206,12 @@ proc_keyboard_control(void* apRobot)
             continue;
         }
 
+        // [kv260-merge] newline never carries a command; without this a piped
+        // "p\n" overwrites m_cKeyPress with '\n' before the 1 kHz consumer
+        // samples it (real-terminal Enter would clobber a pending key too).
+        if (cKeyPress == '\n' || cKeyPress == '\r')
+            continue;
+
         if ('q' == cKeyPress)
         {
             pRobot->StopTasks();
@@ -1075,12 +2228,6 @@ proc_keyboard_control(void* apRobot)
 
         pRobot->m_cKeyPress = cKeyPress;
 
-        // if ((cKeyPress == 'i' || cKeyPress == 'I')&& pRTController != NULL)
-        // {
-        //     //pRTController->SetControlMode(CControllerFullDynamicsRT::eInverseKinematics);
-        //     pRTController->m_bIkTrigger = TRUE;
-
-        // }
     }
     
     DBG_LOG_WARN("[%s]TASK ENDED!", "proc_keyboard_control");
@@ -1160,11 +2307,29 @@ proc_logger(void* apRobot)
 
         nCount = 0;
 
-        DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");
+        // [kv260-merge] Window mode. exchange() — not load() — so that a NEXT
+        // approach armed while this file is still being written keeps its own
+        // flag intact. Cap 55 s: the ring holds 65.5 s at 1 kHz; staged
+        // worst case is ~31 s (10 s leg + settle + 10 s leg + 6 refine
+        // passes), so the cap only fires if the done edge never comes.
+        const bool bUntilDone = pRobot->m_bLogUntilDone.exchange(false);
+
+        DBG_LOG_INFO("(proc_logger) Trigger received (%s). Flushing old buffer...",
+                     bUntilDone ? "per-approach" : "fixed 24 s");
         while (pRobot->m_logBuffer.pop(entry)) {}
 
-        DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
-        sleep(24);
+        if (bUntilDone)
+        {
+            const time_t tWinStart = time(nullptr);
+            while (pRobot->m_bLogTrigger.load(std::memory_order_acquire) &&
+                   (time(nullptr) - tWinStart) < 55)
+                usleep(50000);
+        }
+        else
+        {
+            DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
+            sleep(24);
+        }
 
         pRobot->m_bLogTrigger.store(false, std::memory_order_release);
 
@@ -1216,12 +2381,13 @@ proc_logger(void* apRobot)
 FILE*
 make_csv(CRobotIndy7* pRobot)
 {
-    mkdir("/home/raimlab/RAON-RT/App/Indy7/rt_log_results", 0777);
+    // [kv260-merge] was the author's absolute home path — every log write failed
+    mkdir("/home/ubuntu/RAON-RT-Revision/App/Indy7/rt_log_results", 0777);
     char szFilename[256];
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     snprintf(szFilename, sizeof(szFilename),
-        "/home/raimlab/RAON-RT/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
+        "/home/ubuntu/RAON-RT-Revision/App/Indy7/rt_log_results/DataLog_%04d%02d%02d_%02d%02d%02d.csv",
         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
         t->tm_hour, t->tm_min, t->tm_sec);
     FILE* fp = fopen(szFilename, "w");
@@ -1237,8 +2403,8 @@ make_csv(CRobotIndy7* pRobot)
 void
 CRobotIndy7::SaveRobotPose()
 {
-    static const char* kDir  = "/home/raimlab/RAON-RT/App/Indy7/calib_data";
-    static const char* kPath = "/home/raimlab/RAON-RT/App/Indy7/calib_data/robot_poses.csv";
+    static const char* kDir  = "/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260";
+    static const char* kPath = "/home/ubuntu/RAON-RT-Revision/App/CalibUtils/kv260/robot_poses.csv";
 
     mkdir(kDir, 0777);
     m_nPoseCapture++;
@@ -1269,29 +2435,6 @@ CRobotIndy7::SaveRobotPose()
     DBG_LOG_INFO("[SaveRobotPose] #%d saved: t=[%.4f, %.4f, %.4f]",
                  m_nPoseCapture, p[0], p[1], p[2]);
     printf("[robot_poses] #%d saved → %s\n", m_nPoseCapture, kPath);
-}
-
-void
-proc_visual_servo(void* apRobot)
-{
-    // Drop to non-RT: camera I/O (USB/RealSense) must not run at RT priority.
-    // pipe.start() and wait_for_frames() can block for tens of ms and would
-    // starve proc_ethercat_control, triggering Sync Manager watchdog on all slaves.
-    struct sched_param sp = {};
-    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
-
-    CRobotIndy7* pRobot = static_cast<CRobotIndy7*>(apRobot);
-    DBG_LOG_INFO("(proc_visual_servo) Visual Servo Task Started (non-RT)!");
-
-    while (!pRobot->CheckStopTask())
-    {
-        if (!pRobot->m_bVSTrigger.load()) {
-            usleep(10000);
-            continue;
-        }
-        pRobot->m_visualServo.Loop();
-    }
-    DBG_LOG_WARN("[proc_visual_servo] TASK ENDED!");
 }
 
 void
@@ -1353,6 +2496,5 @@ CRobotIndy7::SaveISOHWResults()
     fclose(fp);
     DBG_LOG_INFO("[ISO-HW] Saved: %s", szFilename);
 }
-
 
 

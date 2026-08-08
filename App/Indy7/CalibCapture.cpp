@@ -2,6 +2,7 @@
 #include <sstream>
 #include <cstdio>
 #include <sys/stat.h>
+#include <Eigen/Geometry>
 
 CalibCapture::CalibCapture(const std::string& outDir)
     : m_outDir(outDir), m_count(1)
@@ -11,14 +12,31 @@ CalibCapture::CalibCapture(const std::string& outDir)
 
 void CalibCapture::Capture(const CControllerFullDynamicsRT::Pose& pose)
 {
-    vpHomogeneousMatrix rMe = ToMatrix(pose);
-    vpPoseVector rPe(rMe);
+    // rotation matrix -> theta-u (axis-angle) vector, ViSP/vpPoseVector convention
+    Eigen::AngleAxisd aa(pose.m_rotation);
+    const Eigen::Vector3d tu = aa.axis() * aa.angle();
 
     std::stringstream ss;
     ss << m_outDir << "/pose_rPe_" << m_count << ".yaml";
-    rPe.saveYAML(ss.str(), rPe);
 
-    printf("[CalibCapture] #%d saved: t=[%.4f, %.4f, %.4f] → %s\n",
+    FILE* fp = fopen(ss.str().c_str(), "w");
+    if (!fp) {
+        printf("[CalibCapture] ERROR: cannot open %s\n", ss.str().c_str());
+        return;
+    }
+    // Same layout ViSP vpPoseVector::saveYAML writes (rows/cols/data)
+    fprintf(fp, "rows: 6\n");
+    fprintf(fp, "cols: 1\n");
+    fprintf(fp, "data: \n");
+    fprintf(fp, "  - [%.9f]\n", pose.m_position[0]);
+    fprintf(fp, "  - [%.9f]\n", pose.m_position[1]);
+    fprintf(fp, "  - [%.9f]\n", pose.m_position[2]);
+    fprintf(fp, "  - [%.9f]\n", tu[0]);
+    fprintf(fp, "  - [%.9f]\n", tu[1]);
+    fprintf(fp, "  - [%.9f]\n", tu[2]);
+    fclose(fp);
+
+    printf("[CalibCapture] #%d saved: t=[%.4f, %.4f, %.4f] -> %s\n",
            m_count,
            pose.m_position[0], pose.m_position[1], pose.m_position[2],
            ss.str().c_str());
@@ -28,17 +46,4 @@ void CalibCapture::Capture(const CControllerFullDynamicsRT::Pose& pose)
 void CalibCapture::Reset()
 {
     m_count = 0;
-}
-
-vpHomogeneousMatrix CalibCapture::ToMatrix(const CControllerFullDynamicsRT::Pose& pose)
-{
-    vpHomogeneousMatrix M;
-    for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            M[r][c] = pose.m_rotation(r, c);
-    M[0][3] = pose.m_position[0];
-    M[1][3] = pose.m_position[1];
-    M[2][3] = pose.m_position[2];
-    M[3][3] = 1.0;
-    return M;
 }

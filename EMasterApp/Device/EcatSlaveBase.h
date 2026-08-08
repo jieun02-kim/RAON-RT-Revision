@@ -31,7 +31,9 @@ private:
     ECAT_SLAVE_TYPE         GetSlaveType            (   ){return m_stEcatSlaveInfo.eSlaveType;}
 
 protected:
-    UINT32                  RegisterPDOEntry        (UINT16, UINT8, UINT32*, ECAT_COMM_DIR anEcatCommDir = eInput);
+    /* [kv260-merge] was UINT32 — unsigned return made every "<0" failure guard
+     * dead code and left offsets at 0xFFFFFFFF on failure (OOB next cycle). */
+    INT64                   RegisterPDOEntry        (UINT16, UINT8, UINT32*, ECAT_COMM_DIR anEcatCommDir = eInput);
     BOOL                    Init                    (stEcatMasterDesc);
     void                    SetVendorID             (UINT32 aunVendorId) { m_stEcatSlaveInfo.unVendorID = aunVendorId; }
     void                    SetProductCode          (UINT32 aunProdCode) { m_stEcatSlaveInfo.unProdCode = aunProdCode; }

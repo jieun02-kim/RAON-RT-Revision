@@ -89,10 +89,10 @@ CEcatSlaveBase::SetDeviceType(ECAT_DEVICE_TYPE aeDeviceType /*=eUNKNOWN*/)
     SetSlaveType( eslavetype );
 }
 
-UINT32
+INT64
 CEcatSlaveBase::RegisterPDOEntry(UINT16 asIndex, UINT8 abtSubIndex, UINT32* anBitPos,ECAT_COMM_DIR anEcatCommDir /*=eInput*/)
 {
-    UINT32 unRet = -1;
+    INT64 unRet = -1;
     /* ecrt_slave_config_reg_pdo_entry()
     * \retval >=0 Success: Offset of the PDO entry's process data.
     * \retval  <0 Error code.

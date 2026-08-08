@@ -1,18 +1,19 @@
 #pragma once
 #include <string>
-#include <visp3/core/vpHomogeneousMatrix.h>
-#include <visp3/core/vpPoseVector.h>
 #include "FullDynControllerRT.h"
 
 // Captures robot TCP poses for hand-eye calibration.
-// All ViSP dependencies are confined to this class.
+// [kv260-merge] ViSP-free reimplementation: the only math ViSP provided was
+// rotation-matrix -> theta-u (axis-angle), which Eigen::AngleAxisd covers.
+// Output stays byte-compatible with ViSP vpPoseVector::saveYAML so
+// App/CalibUtils/eye_to_hand_calib.py keeps reading it unchanged.
 class CalibCapture
 {
 public:
     explicit CalibCapture(const std::string& outDir = "calib_data");
 
-    // Convert current pose to vpPoseVector and save as YAML.
-    // File: <outDir>/pose_rPe_<N>.yaml  (N = 0-based index)
+    // Save current pose as <outDir>/pose_rPe_<N>.yaml
+    // (6x1 pose vector: [tx ty tz, thetau_x thetau_y thetau_z])
     void Capture(const CControllerFullDynamicsRT::Pose& pose);
 
     void Reset();
@@ -21,6 +22,4 @@ public:
 private:
     std::string m_outDir;
     int         m_count;
-
-    static vpHomogeneousMatrix ToMatrix(const CControllerFullDynamicsRT::Pose& pose);
 };

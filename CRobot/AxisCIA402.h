@@ -65,6 +65,9 @@ public:
 
 	void 			SetTargetTorq		(int16_t target) { m_cEcSlave.SetTargetTor(target); }
 	void			SetTargetPos		(int32_t target) { m_cEcSlave.SetTargetPos(target); }
+
+	/* [kv260-merge] expose the slave for master-level ops (DC reference clock) */
+	CSlaveCIA402&	GetEcatSlave		() { return m_cEcSlave; }
 	
 
 protected:

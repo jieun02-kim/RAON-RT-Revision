@@ -187,6 +187,15 @@
       <inertia ixx="0.00078982" ixy="-3.4e-07" ixz="8.3e-07" iyy="0.00079764" iyz="-5.08e-06" izz="0.00058319"/>
     </inertial>
   </link>
+  <!-- [kv260-merge 2026-07-30] A/B TEST: end-of-arm payload REMOVED (back to
+       the pre-merge zero-mass tcp). The 285 g F/T stack modeled in
+       fdc3f8f/9dc5ae3 rested on a GUESSED tag-plate mass and a CoM placed on
+       the -X tool-axis reading that the 07-29 field check contradicted (+Z)
+       — suspected of overdriving grav-comp at the wrist: first landings come
+       in HIGH (banana #23 first miss +36 mm, wrist-pitch 10 deg short at the
+       0.15 rad settle leash). Kinematics untouched, so the hand-eye calib
+       and the reach map stay valid. Restore with:
+       git checkout 9dc5ae3 - - App/Indy7/indy7.urdf  (drop the space) -->
   <link name="tcp">
     <inertial>
       <mass value="0.0"/>

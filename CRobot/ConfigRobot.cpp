@@ -109,6 +109,11 @@ CConfigRobot::ReadRTTaskConfig()
 			GetPrivateProfileString(strKey.c_str(), "START_DELAY", "0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
 			stTask.nStartDelay = atoi(str);
 
+			// [kv260-merge] D10: optional CPU pin (-1 = RT-POSIX default CPU0)
+			ZeroMemory(str);
+			GetPrivateProfileString(strKey.c_str(), "CPU", "-1", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+			stTask.nCpu = atoi(str);
+
 			m_vstTaskList.push_back(stTask);
 		}
 	}
@@ -411,11 +416,13 @@ CConfigRobot::ReadSystemConfig()
 
 		m_stSystem.vKp.resize(m_stSystem.nRobotAxis);
 		m_stSystem.vKd.resize(m_stSystem.nRobotAxis);
+		m_stSystem.vKf.resize(m_stSystem.nRobotAxis);
 
 		for (int nCnt = 0; nCnt < m_stSystem.nRobotAxis; nCnt++)
 		{
 			TSTRING strKp = "KP_" + TOSTRING(nCnt);
 			TSTRING strKd = "KD_" + TOSTRING(nCnt);
+			TSTRING strKf = "KF_" + TOSTRING(nCnt);
 			ZeroMemory(str);
 			GetPrivateProfileString(strKey.c_str(), strKp.c_str(), "0.0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
 			m_stSystem.vKp[nCnt] = atof(str);
@@ -423,7 +430,27 @@ CConfigRobot::ReadSystemConfig()
 			ZeroMemory(str);
 			GetPrivateProfileString(strKey.c_str(), strKd.c_str(), "0.0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
 			m_stSystem.vKd[nCnt] = atof(str);
+
+			// [kv260-merge 2026-07-31] Coulomb friction feedforward [Nm].
+			// Absent key -> 0.0 -> the term vanishes (behavior unchanged).
+			ZeroMemory(str);
+			GetPrivateProfileString(strKey.c_str(), strKf.c_str(), "0.0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+			m_stSystem.vKf[nCnt] = atof(str);
 		}
+
+		// [kv260-merge 2026-08-03] tracking knobs — absent keys keep the
+		// code defaults, so an unedited operator cfg still runs.
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_VMAX_MPS", "0.20", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.dTrackVmaxMps = atof(str);
+
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_EMA_ALPHA", "0.4", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.dTrackEmaAlpha = atof(str);
+
+		ZeroMemory(str);
+		GetPrivateProfileString(strKey.c_str(), "TRACK_LOST_MS", "500", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());
+		m_stSystem.nTrackLostMs = atoi(str);
 
 		ZeroMemory(str);
 		GetPrivateProfileString(strKey.c_str(), "ENABLE_CONTROLLER_AT_STARTUP", "0", str, (size_t)__MAX_PATH__, m_strConfigPath.c_str());

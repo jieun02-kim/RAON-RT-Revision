@@ -1,0 +1,16 @@
+diff --git a/src/posix_rt.c b/src/posix_rt.c
+index 00f7e75..81b2fef 100644
+--- a/src/posix_rt.c
++++ b/src/posix_rt.c
+@@ -264,6 +264,11 @@ _create_task(POSIX_TASK* apTask, const PCHAR astrName, INT anStkSize, INT anPrio
+ 	else
+ 		apTask->ullStackSize = (UINT64)anStkSize;
+ 
++	// [kv260-merge] aarch64 glibc has PTHREAD_STACK_MIN=128K > DEFAULT_STKSIZE(64K);
++	// clamp so default/small requests stay valid on every architecture.
++	if (apTask->ullStackSize < (UINT64)PTHREAD_STACK_MIN)
++		apTask->ullStackSize = (UINT64)PTHREAD_STACK_MIN;
++
+ 	nRet = pthread_attr_setstacksize(&apTask->stThreadAttr, apTask->ullStackSize);
+ 	if (nRet != RET_SUCC)
+ 	{

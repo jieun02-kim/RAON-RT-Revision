@@ -426,15 +426,21 @@ CSlaveCIA402Base::WriteToSlave ()
 BOOL
 CSlaveCIA402Base::RegisterPDO()
 {
+	/* [kv260-merge] signed capture revives the dead "<0" guards (UINT32 return made them no-ops) */
+	INT64 nPdoOff = -1;
 	/* Output PDOs */
-	if (0 > (m_stSlaveParams.GET_OFFSET(ControlWord) = CEcatSlaveBase::RegisterPDOEntry(0x6040, 0x00, &m_stSlaveParams.GET_BITPOS(ControlWord), eOutput)))
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6040, 0x00, &m_stSlaveParams.GET_BITPOS(ControlWord), eOutput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(TargetPos) = CEcatSlaveBase::RegisterPDOEntry(0x607A, 0x00, &m_stSlaveParams.GET_BITPOS(TargetPos), eOutput)))
+	m_stSlaveParams.GET_OFFSET(ControlWord) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x607A, 0x00, &m_stSlaveParams.GET_BITPOS(TargetPos), eOutput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(TargetVel) = CEcatSlaveBase::RegisterPDOEntry(0x60FF, 0x00, &m_stSlaveParams.GET_BITPOS(TargetVel), eOutput)))
+	m_stSlaveParams.GET_OFFSET(TargetPos) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x60FF, 0x00, &m_stSlaveParams.GET_BITPOS(TargetVel), eOutput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(TargetTor) = CEcatSlaveBase::RegisterPDOEntry(0x6071, 0x00, &m_stSlaveParams.GET_BITPOS(TargetTor), eOutput)))
+	m_stSlaveParams.GET_OFFSET(TargetVel) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6071, 0x00, &m_stSlaveParams.GET_BITPOS(TargetTor), eOutput)))
 		return FALSE;
+	m_stSlaveParams.GET_OFFSET(TargetTor) = (UINT32)nPdoOff;
 	// if (0 > (m_stSlaveParams.GET_OFFSET(ProfileVel) = CEcatSlaveBase::RegisterPDOEntry(0x6081, 0x00, &m_stSlaveParams.GET_BITPOS(ProfileVel), eOutput)))
 	// 	return FALSE;
 	// if (0 > (m_stSlaveParams.GET_OFFSET(ProfileAcc) = CEcatSlaveBase::RegisterPDOEntry(0x6083, 0x00, &m_stSlaveParams.GET_BITPOS(ProfileAcc), eOutput)))
@@ -447,20 +453,26 @@ CSlaveCIA402Base::RegisterPDO()
 	// 	return FALSE;
 	// if (0 > (m_stSlaveParams.GET_OFFSET(MaxProfileAcc) = CEcatSlaveBase::RegisterPDOEntry(0x60C5, 0x00, &m_stSlaveParams.GET_BITPOS(MaxProfileAcc), eOutput)))
 	// 	return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(DriveMode) = CEcatSlaveBase::RegisterPDOEntry(0x6060, 0x00, &m_stSlaveParams.GET_BITPOS(DriveMode), eOutput)))
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6060, 0x00, &m_stSlaveParams.GET_BITPOS(DriveMode), eOutput)))
 		return FALSE;
+	m_stSlaveParams.GET_OFFSET(DriveMode) = (UINT32)nPdoOff;
 
 	/* Input PDOs */
-	if (0 > (m_stSlaveParams.GET_OFFSET(StatusWord) = CEcatSlaveBase::RegisterPDOEntry(0x6041, 0x00, &m_stSlaveParams.GET_BITPOS(StatusWord), eInput)))
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6041, 0x00, &m_stSlaveParams.GET_BITPOS(StatusWord), eInput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(ActualPos) = CEcatSlaveBase::RegisterPDOEntry(0x6064, 0x00, &m_stSlaveParams.GET_BITPOS(ActualPos), eInput)))
+	m_stSlaveParams.GET_OFFSET(StatusWord) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6064, 0x00, &m_stSlaveParams.GET_BITPOS(ActualPos), eInput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(ActualVel) = CEcatSlaveBase::RegisterPDOEntry(0x606C, 0x00, &m_stSlaveParams.GET_BITPOS(ActualVel), eInput)))
+	m_stSlaveParams.GET_OFFSET(ActualPos) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x606C, 0x00, &m_stSlaveParams.GET_BITPOS(ActualVel), eInput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(ActualTor) = CEcatSlaveBase::RegisterPDOEntry(0x6077, 0x00, &m_stSlaveParams.GET_BITPOS(ActualTor), eInput)))
+	m_stSlaveParams.GET_OFFSET(ActualVel) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6077, 0x00, &m_stSlaveParams.GET_BITPOS(ActualTor), eInput)))
 		return FALSE;
-	if (0 > (m_stSlaveParams.GET_OFFSET(DriveModeDisplay) = CEcatSlaveBase::RegisterPDOEntry(0x6061, 0x00, &m_stSlaveParams.GET_BITPOS(DriveModeDisplay), eInput)))
+	m_stSlaveParams.GET_OFFSET(ActualTor) = (UINT32)nPdoOff;
+	if (0 > (nPdoOff = CEcatSlaveBase::RegisterPDOEntry(0x6061, 0x00, &m_stSlaveParams.GET_BITPOS(DriveModeDisplay), eInput)))
 		return FALSE;
+	m_stSlaveParams.GET_OFFSET(DriveModeDisplay) = (UINT32)nPdoOff;
 	// if (0 > (m_stSlaveParams.GET_OFFSET(ErrorCode) = CEcatSlaveBase::RegisterPDOEntry(0x603F, 0x00, &m_stSlaveParams.GET_BITPOS(ErrorCode), eInput)))
 	// 	return FALSE;
 
