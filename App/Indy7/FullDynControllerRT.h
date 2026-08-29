@@ -56,6 +56,8 @@ public:
     bool IsTrajectoryDone() const { return !m_traj.active; }
     const RigidBodyDynamics::Math::VectorNd& GetTrajGoal() const { return m_traj.q_goal; }
     BOOL StartJointTrajectory(const RigidBodyDynamics::Math::VectorNd& q_goal, double T);
+    BOOL IsJointStopped(void);
+    const RigidBodyDynamics::Math::VectorNd& GetCurrentJoints() const { return m_Q; }
   
 
     // Controller modes
@@ -243,7 +245,6 @@ private:
     BOOL ComputeInverseKinematics_6dof(std::vector<double>& avOutputTorque);
 
     BOOL IsJointSettled(double vel_threshold);
-    BOOL IsJointStopped(void);
     void PrintTcpVerificationResult();
     
 };

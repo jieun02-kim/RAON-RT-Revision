@@ -698,4 +698,4 @@ obj/Indy7Ctrl.o: Indy7Ctrl.cpp /usr/include/stdc-predef.h Indy7Ctrl.h \
  /home/raimlab/visp/modules/core/include/visp3/core/vpRzyxVector.h \
  /home/raimlab/visp/modules/core/include/visp3/core/vpRzyzVector.h \
  /home/raimlab/visp/modules/core/include/visp3/core/vpTranslationVector.h \
- VisualServo.h
+ VisualServo.h ../../CRobot/ExtInterface.h

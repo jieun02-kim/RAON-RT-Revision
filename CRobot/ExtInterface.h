@@ -43,6 +43,8 @@ typedef enum
 	CMD_ECAT_MASTER	= 0x77, // 'M'
 	CMD_ECAT_SLAVE	= 0x83, // 'S'
 	CMD_BINARY_RESPONSE = 0x66, // 'B'
+	CMD_CONTROL = 0x43, // 'C' — mode/log/VS control (UI → Robot)
+	CMD_STATE   = 0x53, // 'S' — robot state query/push (bidirectional)
 } eCommand;
 
 typedef enum
@@ -60,8 +62,54 @@ typedef enum
 	SUBCMD_GET_TOR,
 	SUB_CMD_ACK = 0xFE,
 	SUB_CMD_NACK = 0xFF,
-	
+
 }eSubCommand;
+
+/* Sub-commands for CMD_CONTROL (UI → Robot) */
+typedef enum
+{
+	SUBCMD_CTRL_SET_MODE        = 0x01, // data[0] = control mode code (see below)
+	SUBCMD_CTRL_TRIGGER_LOG     = 0x02, // trigger TCP trajectory logging
+	SUBCMD_CTRL_VS_TOGGLE       = 0x03, // toggle visual servoing on/off
+	SUBCMD_CTRL_SAVE_POSE       = 0x04, // capture current TCP as 'm' mode target
+	SUBCMD_CTRL_SET_TARGET_POSE = 0x05, // set target pose from UI: 6×double LE (x,y,z,roll,pitch,yaw)
+	SUBCMD_CTRL_HOME            = 0x06, // move all joints to zero (home position)
+	SUBCMD_CTRL_VS_REINIT       = 0x07, // Stop → Init (reload rPc.yaml) → Start VS
+} eCtrlSubCommand;
+
+/* Control mode codes for SUBCMD_CTRL_SET_MODE — must match eControlMode enum */
+#define CTRL_MODE_GRAV_COMP  0x00
+#define CTRL_MODE_FULL_DYN   0x01
+#define CTRL_MODE_CTC        0x02
+#define CTRL_MODE_IK         0x03  // 'i' key
+#define CTRL_MODE_IK_6DOF    0x04  // 'm' key
+
+/* Sub-commands for CMD_STATE */
+typedef enum
+{
+	SUBCMD_STATE_QUERY = 0x01, // UI requests current state
+	SUBCMD_STATE_PUSH  = 0x02, // Robot sends state (response or unsolicited)
+} eStateSubCommand;
+
+/* State packet payload for CMD_STATE + SUBCMD_STATE_PUSH:
+ *   [0]     btControlMode  (uint8) — matches eControlMode enum
+ *   [1]     btVSState      (uint8) — 0=IDLE,1=TRACKING,2=TAG_LOST,3=SINGULARITY
+ *   [2]     btIsLogging    (uint8) — 0/1
+ *   [3-10]  x    (double, 8 bytes little-endian)
+ *   [11-18] y    (double)
+ *   [19-26] z    (double)
+ *   [27-34] roll (double, rpy[0])
+ *   [35-42] pitch(double, rpy[1])
+ *   [43-50] yaw  (double, rpy[2])
+ */
+typedef struct
+{
+	uint8_t btControlMode{0};
+	uint8_t btVSState{0};
+	uint8_t btIsLogging{0};
+	double  dX{0.}, dY{0.}, dZ{0.};
+	double  dRoll{0.}, dPitch{0.}, dYaw{0.};
+} ST_ROBOT_STATE;
 
 
 class CExtInterface
@@ -89,12 +137,20 @@ public:
 	void			UpdateEcatMetadata			(UINT16 ausSlaveNo, UINT8 abtMaster, UINT8 abtSlave, UINT8 abtDomain);
 	void			RegisterCallbackAxisCmd		(CALLBACK_FN afnCallback);
 
+	/* UI control interface */
+	void			RegisterCallbackControlCmd	(CALLBACK_FN afnCallback);
+	void			UpdateRobotState			(uint8_t btMode, uint8_t btVSState, uint8_t btLogging,
+											 double x, double y, double z,
+											 double roll, double pitch, double yaw);
+
 private:
 	BOOL							m_bInRTContext;
 	ST_ECAT_METADATA				m_stEcatMetadata;
 	std::vector< ST_AXIS_METADATA>	m_vecStAxisMetadata;
 	std::vector<ST_AXIS_STATE>		m_vecStAxisState;
 	CALLBACK_FN						m_pCallbackAxisCommand;
+	CALLBACK_FN						m_pCallbackControlCmd;
+	ST_ROBOT_STATE					m_stRobotState;
 
 private:
 	void        OnSocketOpen				(PVOID, PVOID, PVOID, PVOID);
@@ -113,6 +169,10 @@ private:
 	void		InterpretCmdAxis			(BYTE anSubCmd, BYTEARRAY apData);
 	void		InterpretCmdEcatMaster		(BYTE anSubCmd, BYTEARRAY apData);
 	void		InterpretCmdEcatSlave		(BYTE anSubCmd, BYTEARRAY apData);
+	void		InterpretCmdControl			(BYTE anSubCmd, BYTEARRAY apData);
+	void		InterpretCmdState			(BYTE anSubCmd, BYTEARRAY apData);
+	BOOL		SendRobotState				(	);
+	static void	AppendDouble				(BYTEARRAY& arr, double d);
 
 
 private:

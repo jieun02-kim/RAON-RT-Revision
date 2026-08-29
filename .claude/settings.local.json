@@ -16,7 +16,26 @@
       "Bash(pkg-config --cflags rtposix)",
       "Bash(ldconfig -p)",
       "Bash(git -C /home/raimlab/RAON-RT show :App/Indy7/DataRecorder.h)",
-      "Bash(sudo ls:*)"
+      "Bash(sudo ls:*)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-raimlab-RAON-RT-App-Indy7/75c18f90-e8b4-44c2-99d0-21599de85c4e/scratchpad)",
+      "Bash(code --list-extensions)",
+      "Read(//home/raimlab/.config/Code/User/**)",
+      "Bash(find /home/raimlab/RAON-RT/App/Indy7 -iname \"SensorFT*\"; find /home/raimlab/RAON-RT -iname \"SensorFT*\")",
+      "Read(//home/raimlab/RAON-RT/**)",
+      "Bash(node test.mjs tc.mmd)",
+      "Bash(npm install *)",
+      "Read(//home/raimlab/.cache/puppeteer/**)",
+      "Read(//home/raimlab/.cache/puppeteer/chrome-headless-shell/linux-151.0.7922.47/**)",
+      "Read(//home/raimlab/.cache/puppeteer/chrome-headless-shell/**)",
+      "Bash(mkdir -p pngtest)",
+      "Bash(PUPPETEER_EXECUTABLE_PATH=/home/raimlab/.cache/puppeteer/chrome-headless-shell/linux-151.0.7922.47/chrome-headless-shell-linux64/chrome-headless-shell npx mmdc -i final1.mmd -o pngtest/test1.png -b transparent)",
+      "Bash(npx mmdc *)",
+      "Bash(mkdir -p /home/raimlab/RAON-RT/docs/diagrams)",
+      "Bash(PUPPETEER_EXECUTABLE_PATH=/home/raimlab/.cache/puppeteer/chrome-headless-shell/linux-151.0.7922.47/chrome-headless-shell-linux64/chrome-headless-shell npx --prefix /tmp/claude-1000/-home-raimlab-RAON-RT-App-Indy7/261b8b46-8e48-4d76-8129-ac8023d0e718/scratchpad/mermaid-check mmdc -i README.md -o docs/ARCHITECTURE.md -a docs/diagrams -w 1600 -s 2 -b white)",
+      "Bash(mkdir -p readme && mv docs/diagrams/*.png readme/ && rm -f docs/ARCHITECTURE.md && rmdir docs/diagrams docs 2>/dev/null; ls -la readme/; echo \"---docs check---\"; ls docs 2>&1)"
+    ],
+    "additionalDirectories": [
+      "/home/raimlab/RAON-RT/docs/diagrams"
     ]
   }
 }

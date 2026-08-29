@@ -137,6 +137,10 @@ void CSlaveNrmkEndtool::WriteToSlave()
                 break;
             case FT_SET_BIAS:
                 m_stSlaveParams.stOutPDOs.FTConfigParam = GetFTBiasCmd(m_bFTBiasing);
+                m_eFTState = FT_RUNNING;
+                break;
+            case FT_RUNNING:
+                m_stSlaveParams.stOutPDOs.FTConfigParam = FT_START_DATA_OUTPUT;
                 break;
             case FT_FAULT:
                 m_stSlaveParams.stOutPDOs.FTConfigParam = FT_STOP_DATA_OUTPUT;

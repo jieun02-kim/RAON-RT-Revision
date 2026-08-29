@@ -205,6 +205,13 @@ void VisualServo::Loop()
             printf("[VisualServo] Tag recovered after %d frames\n", m_lostCount);
             m_state = State::TRACKING;
         }
+        else if (m_state.load() == State::SINGULARITY)
+        {
+            // 중력보상으로 감속 후 태그 재감지 → 자동 복귀
+            printf("[VisualServo] Auto-recover from SINGULARITY — tag found, resuming\n");
+            m_state = State::TRACKING;
+            m_valid.store(false);   // 필터 초기화 방지용: 다음 사이클에 fresh goal 적용
+        }
         m_lostCount = 0;
 
         vpHomogeneousMatrix goal = m_pImpl->rMc * cMo_vec[0] * s_Toffset;

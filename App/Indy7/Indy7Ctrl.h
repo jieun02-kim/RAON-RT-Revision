@@ -74,6 +74,7 @@ protected:
 	virtual BOOL	InitEtherCAT			(	);
 	virtual BOOL	InitConfig				(	);
 	virtual void	DoAgingTest				(	);
+	virtual void	UpdateExtInterfaceData	(	) override;
 
 	CAxisNRMKCore**			m_pEcatAxis;
 	CSensorNRMKEndTool**	m_pEcatSensor;
@@ -140,6 +141,14 @@ private:
 	// Visual Servoing
 	VisualServo                     m_visualServo;
 	std::atomic<bool>               m_bVSTrigger{false};
+
+	// Home
+	std::atomic<bool>               m_bHomePending{false};
+	RigidBodyDynamics::Math::VectorNd m_qHome;  // 시작 시 절대엔코더 기준 홈 관절 각도
+
+	// FT Sensor
+	std::atomic<bool>               m_bFTStarted{false};
+	std::atomic<bool>               m_bFTPrint{false};
 
 	//=====================================================
 

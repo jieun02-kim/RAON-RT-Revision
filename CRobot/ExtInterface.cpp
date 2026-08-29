@@ -19,6 +19,7 @@ CExtInterface::CExtInterface()
 	m_pRecvBuffer.clear();
 	m_bInRTContext = FALSE;
 	m_vecStAxisMetadata.clear();
+	m_stRobotState = ST_ROBOT_STATE{};
 }
 
 CExtInterface::~CExtInterface()
@@ -150,6 +151,71 @@ CExtInterface::RegisterCallbackAxisCmd(CALLBACK_FN afnCallback)
 	{
 		m_pCallbackAxisCommand = std::move(afnCallback);
 	}
+}
+
+void
+CExtInterface::RegisterCallbackControlCmd(CALLBACK_FN afnCallback)
+{
+	if (NULL == m_pCallbackControlCmd)
+	{
+		m_pCallbackControlCmd = std::move(afnCallback);
+	}
+}
+
+void
+CExtInterface::UpdateRobotState(uint8_t btMode, uint8_t btVSState, uint8_t btLogging,
+                                double x, double y, double z,
+                                double roll, double pitch, double yaw)
+{
+	m_stRobotState.btControlMode = btMode;
+	m_stRobotState.btVSState     = btVSState;
+	m_stRobotState.btIsLogging   = btLogging;
+	m_stRobotState.dX     = x;
+	m_stRobotState.dY     = y;
+	m_stRobotState.dZ     = z;
+	m_stRobotState.dRoll  = roll;
+	m_stRobotState.dPitch = pitch;
+	m_stRobotState.dYaw   = yaw;
+}
+
+void
+CExtInterface::AppendDouble(BYTEARRAY& arr, double d)
+{
+	const uint8_t* p = reinterpret_cast<const uint8_t*>(&d);
+	arr.insert(arr.end(), p, p + 8);
+}
+
+BOOL
+CExtInterface::SendRobotState()
+{
+	BYTEARRAY vData;
+	vData.push_back(m_stRobotState.btControlMode);
+	vData.push_back(m_stRobotState.btVSState);
+	vData.push_back(m_stRobotState.btIsLogging);
+	AppendDouble(vData, m_stRobotState.dX);
+	AppendDouble(vData, m_stRobotState.dY);
+	AppendDouble(vData, m_stRobotState.dZ);
+	AppendDouble(vData, m_stRobotState.dRoll);
+	AppendDouble(vData, m_stRobotState.dPitch);
+	AppendDouble(vData, m_stRobotState.dYaw);
+	return SendPacket((BYTE)CMD_STATE, (BYTE)SUBCMD_STATE_PUSH, vData);
+}
+
+void
+CExtInterface::InterpretCmdControl(BYTE anSubCmd, BYTEARRAY apData)
+{
+	if (NULL == m_pCallbackControlCmd)
+		return;
+
+	uint8_t subCmd = anSubCmd;
+	m_pCallbackControlCmd(&subCmd, &apData, NULL, NULL);
+}
+
+void
+CExtInterface::InterpretCmdState(BYTE anSubCmd, BYTEARRAY apData)
+{
+	if (anSubCmd == (BYTE)SUBCMD_STATE_QUERY)
+		SendRobotState();
 }
 
 
@@ -344,6 +410,14 @@ CExtInterface::InterpretPacket(const BYTEARRAY aPacket)
 
 	case CMD_ECAT_SLAVE:
 		InterpretCmdEcatSlave(btSubCmd, vData);
+		break;
+
+	case CMD_CONTROL:
+		InterpretCmdControl(btSubCmd, vData);
+		break;
+
+	case CMD_STATE:
+		InterpretCmdState(btSubCmd, vData);
 		break;
 
 	case CMD_NOTHING:

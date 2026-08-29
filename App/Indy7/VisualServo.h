@@ -18,7 +18,7 @@ public:
         SINGULARITY,
     };
 
-    explicit VisualServo(const std::string& calibDir = "/home/raimlab/RAON-RT/App/CalibUtils");
+    explicit VisualServo(const std::string& calibDir = "/home/raimlab/RAON-RT/App/CalibUtils/eye_to_hand");
     ~VisualServo();
 
     bool Init();

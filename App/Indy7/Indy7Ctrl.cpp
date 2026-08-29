@@ -7,11 +7,12 @@
 *****************************************************************************/
 #include "Indy7Ctrl.h"
 #include "CalibCapture.h"
+#include "ExtInterface.h"
 #include <unistd.h>
 #include <cmath>
 #include <sys/stat.h>
 
-CalibCapture s_calibCapture("/home/raimlab/RAON-RT/App/CalibUtils");
+CalibCapture s_calibCapture("/home/raimlab/RAON-RT/App/CalibUtils/eye_to_hand");
 
 #define CTRL_MODE_GRAV_COMP     0
 #define CTRL_MODE_FULL_DYN      1
@@ -97,7 +98,166 @@ CRobotIndy7::Init(BOOL abSim)
     if (!CRobot::Init(abSim))
         return FALSE;
 
+    /* Register UI control callback with ExtInterface */
+    if (m_pcExtInterface)
+    {
+        m_pcExtInterface->RegisterCallbackControlCmd(
+            [this](PVOID apSubCmd, PVOID apData, PVOID, PVOID)
+            {
+                uint8_t subCmd = *(uint8_t*)apSubCmd;
+                BYTEARRAY& data = *(BYTEARRAY*)apData;
+
+                switch (subCmd)
+                {
+                case SUBCMD_CTRL_SET_MODE:
+                {
+                    if (data.empty()) break;
+                    uint8_t mode = data[0];
+                    switch (mode)
+                    {
+                    case CTRL_MODE_GRAV_COMP:
+                        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+                        break;
+                    case CTRL_MODE_FULL_DYN:
+                        SetControllerMode(CControllerFullDynamicsRT::eFullDynamics);
+                        break;
+                    case CTRL_MODE_CTC:
+                        SetControllerMode(CControllerFullDynamicsRT::eComputedTorque);
+                        break;
+                    case CTRL_MODE_IK:
+                        m_pController->goal_tcpPose.m_position = m_Pose.m_position;
+                        SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+                        m_pController->m_bIkTrigger = TRUE;
+                        DBG_LOG_INFO("(UI) Mode -> IK (i)");
+                        break;
+                    case CTRL_MODE_IK_6DOF:
+                        if (m_pController->SetTargetPose(m_Pose))
+                        {
+                            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+                            DBG_LOG_INFO("(UI) Mode -> IK 6DOF (m)");
+                        }
+                        else
+                            DBG_LOG_ERROR("(UI) IK 6DOF: SetTargetPose FAILED — send SAVE_POSE first");
+                        break;
+                    default:
+                        break;
+                    }
+                    break;
+                }
+                case SUBCMD_CTRL_TRIGGER_LOG:
+                    m_bLogTrigger = TRUE;
+                    DBG_LOG_INFO("(UI) Log triggered");
+                    break;
+
+                case SUBCMD_CTRL_VS_TOGGLE:
+                    if (!m_bVSTrigger.load())
+                    {
+                        m_visualServo.Start();
+                        SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+                        m_bVSTrigger = true;
+                        DBG_LOG_INFO("(UI) Visual Servoing ON");
+                    }
+                    else
+                    {
+                        m_visualServo.Stop();
+                        m_bVSTrigger = false;
+                        m_pController->SetControlMode(CControllerFullDynamicsRT::eGravityCompensation);
+                        DBG_LOG_INFO("(UI) Visual Servoing OFF");
+                    }
+                    break;
+
+                case SUBCMD_CTRL_SAVE_POSE:
+                    m_pController->GetCurrentPose(m_Pose);
+                    DBG_LOG_INFO("(UI) Target pose saved: X=%.4f Y=%.4f Z=%.4f",
+                                 m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
+                    break;
+
+                case SUBCMD_CTRL_HOME:
+                    DBG_LOG_WARN("(UI) Home mode disabled");
+                    break;
+
+                case SUBCMD_CTRL_VS_REINIT:
+                {
+                    bool wasRunning = m_bVSTrigger.load();
+                    if (wasRunning)
+                    {
+                        m_visualServo.Stop();
+                        m_bVSTrigger = false;
+                        m_pController->SetControlMode(CControllerFullDynamicsRT::eGravityCompensation);
+                    }
+                    bool ok = m_visualServo.Init();
+                    DBG_LOG_INFO("(UI) VS Re-Init (reload rPc.yaml): %s", ok ? "OK" : "FAILED");
+                    if (ok && wasRunning)
+                    {
+                        m_visualServo.Start();
+                        SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
+                        m_bVSTrigger = true;
+                        DBG_LOG_INFO("(UI) VS restarted after Re-Init");
+                    }
+                    break;
+                }
+
+                case SUBCMD_CTRL_SET_TARGET_POSE:
+                {
+                    if (data.size() < 48) break;
+                    double x, y, z, roll, pitch, yaw;
+                    std::memcpy(&x,     &data[0],  8);
+                    std::memcpy(&y,     &data[8],  8);
+                    std::memcpy(&z,     &data[16], 8);
+                    std::memcpy(&roll,  &data[24], 8);
+                    std::memcpy(&pitch, &data[32], 8);
+                    std::memcpy(&yaw,   &data[40], 8);
+
+                    m_Pose.m_position[0] = x;
+                    m_Pose.m_position[1] = y;
+                    m_Pose.m_position[2] = z;
+
+                    double cr = std::cos(roll),  sr = std::sin(roll);
+                    double cp = std::cos(pitch), sp = std::sin(pitch);
+                    double cy = std::cos(yaw),   sy = std::sin(yaw);
+                    m_Pose.m_rotation <<
+                        cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr,
+                        sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr,
+                        -sp,    cp*sr,              cp*cr;
+
+                    DBG_LOG_INFO("(UI) Target pose set: X=%.4f Y=%.4f Z=%.4f R=%.4f P=%.4f Y=%.4f",
+                                 x, y, z, roll, pitch, yaw);
+                    break;
+                }
+
+                default:
+                    break;
+                }
+            });
+    }
+
     return TRUE;
+}
+
+void
+CRobotIndy7::UpdateExtInterfaceData()
+{
+    CRobot::UpdateExtInterfaceData();
+
+    if (!m_pcExtInterface || !m_pController)
+        return;
+
+    const auto& pose = m_pController->GetTcpPose();
+    const auto& R    = pose.m_rotation;
+
+    // ZYX RPY from rotation matrix (atan2 is RT-safe floating-point)
+    double roll  = std::atan2(R(2,1), R(2,2));
+    double pitch = std::atan2(-R(2,0), std::sqrt(R(2,1)*R(2,1) + R(2,2)*R(2,2)));
+    double yaw   = std::atan2(R(1,0), R(0,0));
+
+    uint8_t mode    = (uint8_t)m_pController->GetControlMode();
+    uint8_t vsState = (uint8_t)m_visualServo.GetState();
+    uint8_t isLog   = m_bLogTrigger.load() ? 1 : 0;
+
+    m_pcExtInterface->UpdateRobotState(
+        mode, vsState, isLog,
+        pose.m_position[0], pose.m_position[1], pose.m_position[2],
+        roll, pitch, yaw);
 }
 
 BOOL
@@ -447,6 +607,7 @@ CRobotIndy7::DoInput()
             m_pEcatSensor[0]->LED_OFF();
         case 'h':
         case 'H':
+            DBG_LOG_WARN(">>> Home mode disabled");
             break;
         case 'e':
         case 'E':
@@ -502,6 +663,7 @@ CRobotIndy7::DoInput()
         case 'I':
             m_pEcatSensor[0]->LED_RED(TRUE);
             DBG_LOG_INFO(">>> RT Controller: Jacobian IK Mode");
+            m_pController->goal_tcpPose.m_position = m_Pose.m_position;
             SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
             m_pController->m_bIkTrigger = TRUE;
             break;
@@ -510,10 +672,7 @@ CRobotIndy7::DoInput()
             m_pEcatSensor[0]->LED_RED(TRUE);
             DBG_LOG_INFO(">>> RT Controller: RBDL IK (6DOF) Mode");
             if (m_pController->SetTargetPose(m_Pose))
-            {
                 SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-                m_bLogTrigger = TRUE;
-            }
             else
                 DBG_LOG_ERROR(">>> SetTargetPose FAILED — press 's' first to set target pose");
             break;
@@ -566,8 +725,8 @@ CRobotIndy7::DoInput()
             break;
 
 
-        case 'q':
-        case 'Q':
+        case 'p':
+        case 'P':
         {
             DBG_LOG_INFO(">>> ISO Cube Hardware Test Start");
             const CControllerFullDynamicsRT::Pose& cur = m_pController->GetTcpPose();
@@ -588,7 +747,7 @@ CRobotIndy7::DoInput()
             m_isoClearance.m_rotation    = cur.m_rotation;
             DBG_LOG_INFO("[ISO-HW] Center: X=%.4f Y=%.4f Z=%.4f", cx, cy, cz);
 
-            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+            SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics);
             m_nISOPointIdx  = 0;
             m_nISOCycle     = 0;
             m_bISOCmdSent   = false;
@@ -658,6 +817,16 @@ CRobotIndy7::DoInput()
             break;
         }
 
+        case 'j':
+        case 'J':
+            m_bFTPrint = !m_bFTPrint.load();
+            printf("[FT] Print %s\n", m_bFTPrint.load() ? "ON" : "OFF");
+            break;
+        case 'b':
+        case 'B':
+            m_pEcatSensor[0]->Calibrate(eSensorCalibrationZero);
+            printf("[FT] Zero bias applied\n");
+            break;
         default:
             break;
     }
@@ -737,7 +906,7 @@ void proc_main_control(void* apRobot)
     RTTIME tPrev = read_timer();
     uint64_t max_calc_ns = 0, avg_calc_ns = 0, samp = 0;
     long cycle = 0;
-
+    bool bGoalInitialized = false;
 
     while (!pRobot->CheckStopTask())
     {
@@ -758,6 +927,18 @@ void proc_main_control(void* apRobot)
                 pRobot->m_vCurrentTor[nCnt] = ax->GetCurrentTor();
             }
         }
+
+        // 첫 사이클: 절대엔코더 기준 홈 위치 + goal_tcpPose 초기화
+        if (bUseRTController && !bGoalInitialized)
+        {
+            pRTController->ComputeTcpFK();
+            pRTController->goal_tcpPose = pRTController->GetTcpPose();
+            pRobot->m_qHome = pRTController->GetCurrentJoints();
+            bGoalInitialized = true;
+            DBG_LOG_INFO("(proc_main_control) goal_tcpPose and q_home initialized from absolute encoder");
+        }
+
+
 
         // Compute control torques (Update 먼저 → tcpPose 갱신)
         if (bUseRTController)
@@ -946,10 +1127,33 @@ void proc_main_control(void* apRobot)
                 break;
         }
 
-        // if (++cycle % 1000 == 0) 
+        // FT sensor: print every 1s (1000 cycles) when enabled
+        if (pRobot->m_bFTPrint.load() && (++cycle % 1000 == 0))
+        {
+            printf("[FT] on=%d err=0x%02X  "
+                   "Fx=%+7.3f Fy=%+7.3f Fz=%+7.3f (N)  "
+                   "Tx=%+7.4f Ty=%+7.4f Tz=%+7.4f (N·m)  "
+                   "raw=(%d,%d,%d,%d,%d,%d)\n",
+                   (int)pRobot->m_pEcatSensor[0]->IsFTSensorOn(),
+                   (unsigned)pRobot->m_pEcatSensor[0]->GetFTErrorFlag(),
+                   pRobot->m_pEcatSensor[0]->GetFx(),
+                   pRobot->m_pEcatSensor[0]->GetFy(),
+                   pRobot->m_pEcatSensor[0]->GetFz(),
+                   pRobot->m_pEcatSensor[0]->GetTx(),
+                   pRobot->m_pEcatSensor[0]->GetTy(),
+                   pRobot->m_pEcatSensor[0]->GetTz(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawFx(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawFy(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawFz(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawTx(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawTy(),
+                   (int)pRobot->m_pEcatSensor[0]->GetRawTz());
+        }
+
+        // if (++cycle % 1000 == 0)
         // {
         //     RTTIME now = read_timer();
-        //     if (bUseRTController) 
+        //     if (bUseRTController)
         //     {
         //         auto perf = pRTController->GetPerformance();
         //         DBG_LOG_TRACE("[RT-Controller] period=%lld µs max_calc=%llu µs avg_calc=%llu µs violations=%llu",
@@ -1001,6 +1205,19 @@ proc_ethercat_control(void* apRobot)
         if (TRUE == pRobot->m_pcEcatMaster->IsAllSlavesOp() && TRUE == pRobot->m_pcEcatMaster->IsMasterOp())
         {
             pRobot->m_bEcatOP = TRUE;
+
+            // FT sensor: start once on first successful OP cycle
+            if (!pRobot->m_bFTStarted.load())
+            {
+                if (pRobot->m_pEcatSensor[0]->Start())
+                {
+                    pRobot->m_bFTStarted.store(true);
+                    DBG_LOG_INFO("(proc_ethercat_control) FT Sensor started");
+                }
+            }
+
+            // FT sensor: update PDO data every cycle
+            pRobot->m_pEcatSensor[0]->ReadData();
         }
         tmSend = read_timer();
         pRobot->m_pcEcatMaster->WriteSlaves(tmSend);

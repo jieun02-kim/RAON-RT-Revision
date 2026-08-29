@@ -185,6 +185,7 @@ public:
         FT_SET_FILTER,
         FT_SET_START,
         FT_SET_BIAS,
+        FT_RUNNING,
         FT_FAULT
     };
 

@@ -73,8 +73,8 @@ BOOL CSensorNRMKEndTool::DeInit()
 
 BOOL CSensorNRMKEndTool::Start()
 {
-    if (!IsOnline()) {
-        DBG_LOG_ERROR("(%s) Cannot start - sensor not online", "CSensorNRMKEndTool");
+    if (!m_bSlaveInitialized) {
+        DBG_LOG_ERROR("(%s) Cannot start - slave not initialized", "CSensorNRMKEndTool");
         return FALSE;
     }
     
@@ -232,9 +232,10 @@ BOOL CSensorNRMKEndTool::InitSlave(CEcatMaster& apEcmaster)
     
     m_pEcMaster = &apEcmaster;
     m_pEcMaster->AddSlave(&m_cNrmkSlave);
-    
+    m_bSlaveInitialized = TRUE;
+
     DBG_LOG_INFO("(%s) EtherCAT slave initialized", "CSensorNRMKEndTool");
-    
+
     return TRUE;
 }
 
@@ -328,8 +329,12 @@ void CSensorNRMKEndTool::UpdateRawData(INT16 anFx, INT16 anFy, INT16 anFz, INT16
     // Call base class method
     CSensorFT::UpdateRawData(anFx, anFy, anFz, anTx, anTy, anTz);
     
-    // Write data to slave
-    m_cNrmkSlave.WriteToSlave();
+    // NOTE: WriteToSlave() removed here - it duplicated the call already made once per
+    // cycle by CEcatMasterBase::WriteSlaves(), advancing the FT state machine an extra
+    // step before ecrt_master_send() ever transmitted it. This caused FT_START_DATA_OUTPUT
+    // to be overwritten by the next state's command before reaching the wire, so the
+    // sensor never started streaming and all Fx/Fy/Fz/Tx/Ty/Tz read as 0.
+    // m_cNrmkSlave.WriteToSlave();
 }
 
 void CSensorNRMKEndTool::HandleFTErrors()
