@@ -47,7 +47,7 @@ CMD_ROBOT   = 0x82;  CMD_AXIS  = 0x65;  CMD_ECAT_MASTER = 0x77
 SUBCMD_CTRL_SET_MODE        = 0x01;  SUBCMD_CTRL_TRIGGER_LOG     = 0x02
 SUBCMD_CTRL_VS_TOGGLE       = 0x03;  SUBCMD_CTRL_SAVE_POSE       = 0x04
 SUBCMD_CTRL_SET_TARGET_POSE = 0x05;  SUBCMD_CTRL_HOME            = 0x06
-SUBCMD_CTRL_VS_REINIT       = 0x07
+SUBCMD_CTRL_VS_REINIT       = 0x07;  SUBCMD_CTRL_RECT_TOGGLE     = 0x08
 SUBCMD_STATE_QUERY = 0x01;  SUBCMD_STATE_PUSH = 0x02
 SUBCMD_GET_METADATA = 0x01
 _PRECISION  = 1000
@@ -430,7 +430,7 @@ class MainWindow(QMainWindow):
         right_spl = QSplitter(Qt.Vertical)
         right_spl.addWidget(self._make_cam_panel())
         right_spl.addWidget(self._make_plot_panel())
-        right_spl.setSizes([560, 380])
+        right_spl.setSizes([440, 500])
         root.addWidget(right_spl, stretch=1)
 
         self.setStatusBar(QStatusBar())
@@ -496,6 +496,12 @@ class MainWindow(QMainWindow):
             b = QPushButton(lbl);  b.setEnabled(False);  b.setMinimumHeight(30)
             b.clicked.connect(lambda _, c=code: self._set_mode(c))
             kl.addWidget(b);  self._mode_btns.append(b)
+
+        self._b_rect = QPushButton("Rectangle Mode  (n)")
+        self._b_rect.setEnabled(False);  self._b_rect.setMinimumHeight(30)
+        self._b_rect.clicked.connect(self._toggle_rect)
+        kl.addWidget(self._b_rect)
+
         v.addWidget(kbox)
 
         # Tools
@@ -557,7 +563,7 @@ class MainWindow(QMainWindow):
 
         self._cam_label = QLabel("Camera not started")
         self._cam_label.setAlignment(Qt.AlignCenter)
-        self._cam_label.setFixedSize(640, 480)
+        self._cam_label.setFixedSize(640, 360)
         self._cam_label.setStyleSheet("background-color:#111; color:#777;")
         self._cam_label.setFont(QFont("Monospace", 11))
         cl.addWidget(self._cam_label)
@@ -914,7 +920,7 @@ class MainWindow(QMainWindow):
         self._b_conn.setText("Disconnect");  self._b_conn.setEnabled(True)
         self._e_host.setEnabled(False);  self._e_port.setEnabled(False)
         for b in self._mode_btns + [self._b_home, self._b_vs, self._b_save, self._b_log,
-                                      self._b_set_target, self._b_fill_target]:
+                                      self._b_set_target, self._b_fill_target, self._b_rect]:
             b.setEnabled(True)
         self.statusBar().showMessage(f"Connected  ·  {self._e_host.text()}:{self._e_port.text()}")
         self._log(f"Connected to {self._e_host.text()}:{self._e_port.text()}")
@@ -929,7 +935,7 @@ class MainWindow(QMainWindow):
         self._b_conn.setText("Connect");  self._b_conn.setEnabled(True)
         self._e_host.setEnabled(True);  self._e_port.setEnabled(True)
         for b in self._mode_btns + [self._b_home, self._b_vs, self._b_save, self._b_log,
-                                      self._b_set_target, self._b_fill_target]:
+                                      self._b_set_target, self._b_fill_target, self._b_rect]:
             b.setEnabled(False)
         self.statusBar().showMessage("Disconnected");  self._log("Disconnected")
 
@@ -1021,11 +1027,14 @@ class MainWindow(QMainWindow):
     def _toggle_vs(self):
         self._send(CMD_CONTROL, SUBCMD_CTRL_VS_TOGGLE);  self._log("→ VS toggle")
 
+    def _toggle_rect(self):
+        self._send(CMD_CONTROL, SUBCMD_CTRL_RECT_TOGGLE);  self._log("→ Rectangle mode toggle")
+
     def _save_pose(self):
         self._send(CMD_CONTROL, SUBCMD_CTRL_SAVE_POSE);  self._log("→ Target pose saved")
 
     def _trigger_log(self):
-        self._send(CMD_CONTROL, SUBCMD_CTRL_TRIGGER_LOG);  self._log("→ Log triggered (5 s)")
+        self._send(CMD_CONTROL, SUBCMD_CTRL_TRIGGER_LOG);  self._log("→ Log triggered (10 s)")
 
     def _send_target_pose(self):
         try:

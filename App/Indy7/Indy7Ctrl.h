@@ -136,6 +136,7 @@ private:
 	CControllerFullDynamicsRT::Pose	m_Pose;
 	void SaveISOHWResults();
 	void SaveRobotPose();
+	void ToggleRectMode();
 	int  m_nPoseCapture{0};
 
 	// Visual Servoing

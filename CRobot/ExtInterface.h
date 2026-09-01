@@ -75,6 +75,7 @@ typedef enum
 	SUBCMD_CTRL_SET_TARGET_POSE = 0x05, // set target pose from UI: 6×double LE (x,y,z,roll,pitch,yaw)
 	SUBCMD_CTRL_HOME            = 0x06, // move all joints to zero (home position)
 	SUBCMD_CTRL_VS_REINIT       = 0x07, // Stop → Init (reload rPc.yaml) → Start VS
+	SUBCMD_CTRL_RECT_TOGGLE     = 0x08, // toggle rectangle trajectory mode on/off ('n' key)
 } eCtrlSubCommand;
 
 /* Control mode codes for SUBCMD_CTRL_SET_MODE — must match eControlMode enum */

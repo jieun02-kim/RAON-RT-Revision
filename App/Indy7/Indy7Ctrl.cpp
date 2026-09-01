@@ -176,6 +176,11 @@ CRobotIndy7::Init(BOOL abSim)
                     DBG_LOG_WARN("(UI) Home mode disabled");
                     break;
 
+                case SUBCMD_CTRL_RECT_TOGGLE:
+                    ToggleRectMode();
+                    DBG_LOG_INFO("(UI) Rectangle mode toggled");
+                    break;
+
                 case SUBCMD_CTRL_VS_REINIT:
                 {
                     bool wasRunning = m_bVSTrigger.load();
@@ -678,50 +683,7 @@ CRobotIndy7::DoInput()
             break;
         case 'n':
         case 'N':
-            if (m_bRectTrigger.load()) {
-                m_bRectTrigger = false;
-                m_eRectState   = eRECT_IDLE;
-                m_bLogTrigger  = FALSE;
-                SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
-                DBG_LOG_INFO(">>> Rectangle Mode STOP");
-            } else {
-                // gravity comp 먼저: RT 루프가 m_traj를 소비 중이면 중단
-                SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
-
-                // n 시작 순간 현재 TCP 위치를 중심으로 사각형 계산
-                m_pController->GetCurrentPose(m_Pose);
-                const double d = 0.25;
-                const double offsets[4][2] = {{+d,+d},{-d,+d},{-d,-d},{+d,-d}};
-                for (int i = 0; i < 4; ++i) {
-                    m_rectCorners[i].m_position[0] = m_Pose.m_position[0];
-                    m_rectCorners[i].m_position[1] = m_Pose.m_position[1] + offsets[i][0];
-                    m_rectCorners[i].m_position[2] = m_Pose.m_position[2] + offsets[i][1];
-                    m_rectCorners[i].m_rotation    = m_Pose.m_rotation;
-                }
-
-                // 4개 꼭짓점 IK 미리 계산 (위치만, 키보드 스레드 non-RT에서 안전)
-                bool all_ok = true;
-                for (int i = 0; i < 4; ++i) {
-                    if (!m_pController->SetTargetPosePositionOnly(m_rectCorners[i])) {
-                        DBG_LOG_ERROR(">>> [RECT] IK failed for corner %d — abort", i+1);
-                        all_ok = false;
-                        break;
-                    }
-                    m_rectJointTargets[i] = m_pController->GetTrajGoal();
-                }
-                if (!all_ok) break;
-
-                // 첫 번째 꼭짓점으로 1.5s 궤적 시작
-                m_nRectCornerIdx = 0;
-                m_nRectWaitCount = 0;
-                m_eRectState     = eRECT_TO_CORNER;
-                m_pEcatSensor[0]->LED_RED(TRUE);
-                m_pController->StartJointTrajectory(m_rectJointTargets[0], 2.0);
-                SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
-                m_bRectTrigger = true;
-                DBG_LOG_INFO(">>> Rectangle Mode START: Center X=%.4f Y=%.4f Z=%.4f",
-                    m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
-            }
+            ToggleRectMode();
             break;
 
 
@@ -1380,8 +1342,8 @@ proc_logger(void* apRobot)
         DBG_LOG_INFO("(proc_logger) Trigger received. Flushing old buffer...");
         while (pRobot->m_logBuffer.pop(entry)) {}
 
-        DBG_LOG_INFO("(proc_logger) Collecting 24 seconds of data...");
-        sleep(24);
+        DBG_LOG_INFO("(proc_logger) Collecting 10 seconds of data...");
+        sleep(10);
 
         pRobot->m_bLogTrigger.store(false, std::memory_order_release);
 
@@ -1450,6 +1412,56 @@ make_csv(CRobotIndy7* pRobot)
 }
 
 
+
+void
+CRobotIndy7::ToggleRectMode()
+{
+    if (m_bRectTrigger.load()) {
+        m_bRectTrigger = false;
+        m_eRectState   = eRECT_IDLE;
+        m_bLogTrigger  = FALSE;
+        SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+        DBG_LOG_INFO(">>> Rectangle Mode STOP");
+        return;
+    }
+
+    // gravity comp 먼저: RT 루프가 m_traj를 소비 중이면 중단
+    SetControllerMode(CControllerFullDynamicsRT::eGravityCompensation);
+
+    // 시작 순간 현재 TCP 위치를 중심으로 사각형 계산
+    m_pController->GetCurrentPose(m_Pose);
+    const double d = 0.15;
+    const double offsets[4][2] = {{+d,+d},{-d,+d},{-d,-d},{+d,-d}};
+    for (int i = 0; i < 4; ++i) {
+        m_rectCorners[i].m_position[0] = m_Pose.m_position[0];
+        m_rectCorners[i].m_position[1] = m_Pose.m_position[1] + offsets[i][0];
+        m_rectCorners[i].m_position[2] = m_Pose.m_position[2] + offsets[i][1];
+        m_rectCorners[i].m_rotation    = m_Pose.m_rotation;
+    }
+
+    // 4개 꼭짓점 IK 미리 계산 (위치만, 키보드/UI 스레드 non-RT에서 안전)
+    bool all_ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (!m_pController->SetTargetPosePositionOnly(m_rectCorners[i])) {
+            DBG_LOG_ERROR(">>> [RECT] IK failed for corner %d — abort", i+1);
+            all_ok = false;
+            break;
+        }
+        m_rectJointTargets[i] = m_pController->GetTrajGoal();
+    }
+    if (!all_ok) return;
+
+    // 첫 번째 꼭짓점으로 궤적 시작
+    m_nRectCornerIdx = 0;
+    m_nRectWaitCount = 0;
+    m_eRectState     = eRECT_TO_CORNER;
+    m_pEcatSensor[0]->LED_RED(TRUE);
+    m_pController->StartJointTrajectory(m_rectJointTargets[0], 2.0);
+    SetControllerMode(CControllerFullDynamicsRT::eInverseKinematics_6dof);
+    m_bRectTrigger = true;
+    DBG_LOG_INFO(">>> Rectangle Mode START: Center X=%.4f Y=%.4f Z=%.4f",
+        m_Pose.m_position[0], m_Pose.m_position[1], m_Pose.m_position[2]);
+}
 
 void
 CRobotIndy7::SaveRobotPose()

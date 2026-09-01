@@ -1,0 +1,166 @@
+================================================================================
+ Indy7 (RAON-RT App/Indy7) — 키보드 매핑 & UI 버튼 기능 정리
+================================================================================
+정리 대상 코드:
+  - 키보드 입력   : App/Indy7/Indy7Ctrl.cpp  (CRobotIndy7::DoInput, ~L592-835)
+  - UI 커맨드 처리 : App/Indy7/Indy7Ctrl.cpp  (CRobotIndy7::Init 내 콜백, ~L104-231)
+  - UI(Python)    : App/Indy7/indy7_ui.py
+
+================================================================================
+1. 키보드 매핑  (DoInput, 로봇 제어 PC에서 직접 키 입력 시)
+================================================================================
+※ 대소문자 구분 없음(둘 다 동일 동작). 실행 중 proc_keyboard_control 스레드가
+   1글자 입력을 받아 m_cKeyPress에 저장하면 RT 루프가 DoInput()에서 소비.
+
+  키    기능
+---   --------------------------------------------------------------------
+{자주 사용하는 매핑키}
+  G     제어 모드 → Gravity Compensation(중력보상)
+  F     제어 모드 → Full Dynamics(풀 다이나믹스)
+  C     제어 모드 → Computed Torque(계산토크)
+  L     로깅 트리거 (TCP 궤적 데이터 수집 시작, m_bLogTrigger=TRUE)
+        - proc_logger 스레드가 트리거 감지 시 기존 버퍼 비우고 "10초간" 데이터 수집
+          (sleep(10), proc_logger 함수 내 하드코딩값) 후 CSV로 저장
+          (2026-09-01: 기존 24초 → 10초로 단축, UI 로그 문구도 동일하게 맞춤)
+        - 수집 중 재트리거해도 무시됨 (진행 중인 10초 수집이 끝나야 다음 트리거 반응)
+  I     제어 모드 → Jacobian IK 모드 (현재 pose를 목표로 IK 트리거)
+  M     제어 모드 → RBDL IK(6DOF) 모드
+        - 사전에 SetTargetPose 필요 (보통 'S'로 목표 pose 저장 후 사용)
+        - 실패 시 "SetTargetPose FAILED — press 's' first" 에러
+
+  ▶ I vs M 비교
+      구분        I (Jacobian IK)                 M (RBDL IK 6DOF)
+      ----------  ------------------------------  --------------------------------
+      제어모드    eInverseKinematics              eInverseKinematics_6dof
+      목표값      위치(position)만 사용            위치+자세(orientation) 전체 사용
+                  (goal_tcpPose.position=m_Pose)   (SetTargetPose(m_Pose) 로 6DOF 설정)
+      사전조건    없음 — 누르면 즉시 트리거         SetTargetPose()가 IK 수렴에 성공해야 함
+                                                    실패 시 's'로 먼저 목표 pose 저장 필요
+      목표 출처   현재 m_Pose의 위치값 그대로       's'/'a'/UI Set Target 등으로 미리
+                                                    채워둔 m_Pose(위치+자세) 사용
+      한줄요약    위치만 맞추는 간단/즉시 모드       위치+자세까지 맞추는 정밀 모드
+
+  N     사각형(Rectangle) 궤적 모드 토글 (시작/정지)
+        - 시작 시 현재 TCP 위치를 중심으로 ±0.15m 오프셋 4개 꼭짓점(한 변 0.3m 정사각형)
+          계산 후 IK로 순회  (2026-09-01: 안전을 위해 기존 ±0.25m → ±0.15m로 축소)
+        - 이미 실행 중이면 정지하고 Gravity Comp로 복귀
+  P     ISO 9283 큐브 하드웨어 테스트 시작
+        - 현재 TCP 기준 5개 포인트(중심+4모서리, a=0.1m) 좌표 계산 후 IK 이동 시퀀스 시작
+  D     현재 pose 기준 거리 오차(Distance Error) 로그 출력
+  S     현재 TCP pose를 저장(SaveRobotPose) + 캘리브레이션 캡처(s_calibCapture) +
+        pose(x,y,z / 회전행렬) 콘솔 출력
+        - M(IK 6DOF), A키 사용 전 목표 pose 지정용으로도 사용됨
+  V     비주얼 서보잉(Visual Servo) 토글 (ON/OFF)
+        - ON: IK 모드로 전환 + VisualServo 시작
+        - OFF: Gravity Compensation으로 복귀 + VisualServo 정지
+
+{자주 사용하지 않음/비활성화 및 미구현}
+  Y     엔드툴 센서 LED GREEN 켜기
+  U     엔드툴 센서 LED RED 켜기
+  O     엔드툴 센서 LED OFF
+        (주의: 'O' case에 break 없음 → fallthrough로 바로 아래 'H' 케이스까지
+         같이 실행됨. 즉 'O' 입력 시 LED OFF + "Home mode disabled" 로그가 같이 찍힘)
+  H     [비활성화됨] 호밍 모드 — "Home mode disabled" 경고만 출력, 실제 동작 없음
+  E     전축(全軸) 비상정지(EmgStopAxis) — 모든 모터 즉시 비상 정지
+  X     전축 정지(StopAxis) — 일반 정지
+  T     전축 드라이브 모드를 CST(Cyclic Synchronous Torque)로 변경
+  R     [되도록 누르지 말 것] RT 컨트롤러 Enable/Disable 토글 (현재 상태의 반대로 전환)
+  A     사전 정의된 기준 pose(ref_pose, 하드코딩된 X/Y/Z/RPY 값)로 IK 6DOF 이동
+        - SetTargetPose 성공 시 로깅도 함께 트리거
+  J     FT(힘/토크) 센서 값 콘솔 출력(Print) 토글 ON/OFF
+  B     FT 센서 영점(Zero Bias) 보정 실행
+
+  ※ 그 외 키(default) : 아무 동작 없음
+
+================================================================================
+2. UI (indy7_ui.py) 버튼별 기능
+================================================================================
+
+[Connection 패널]
+  Connect / Disconnect     : Host:Port(기본 localhost:7420)로 접속/해제.
+                              연결 성공 시 나머지 제어 버튼들이 활성화(Enabled)됨.
+
+[Dynamics Control 패널] — 연결 후에만 활성화
+  Gravity Comp     : 중력보상 모드
+  Full Dynamics    : 풀 다이나믹스 모드
+  Comp. Torque     : 계산토크 모드
+
+[Kinematics Control 패널]
+  x/y/z/roll/pitch/yaw 입력창 : 목표 pose 수동 입력 (m, rad 단위)
+  Set Target       : 입력창 값을 로봇 목표 pose로 전송
+  Fill from TCP    : 현재 수신된 TCP pose 값을 입력창에 채워넣기 (로컬 UI 동작, 로봇 통신 없음)
+  IK  (i)          : 키보드 'i'에 대응하는 IK 모드
+  IK 6DOF  (m)     : 키보드 'm'에 대응하는 IK 6DOF 모드
+  Rectangle Mode  (n) : 키보드 'n'에 대응하는 사각형 궤적 모드 토글 (2026-09-01 추가)
+        - 클릭 시마다 시작/정지 토글, 현재 TCP 중심 ±0.15m(한 변 0.3m) 정사각형 순회
+        - 서버 쪽 실제 토글 여부를 UI가 실시간으로 되받지 않으므로(상태 push 미지원),
+          버튼 자체는 체크 상태를 표시하지 않는 일반 클릭 버튼으로 구현됨
+
+[Tools 패널]
+  Home  (h)              : [비활성화 상태] 로그만 찍히고 실제 호밍 안 됨
+  Visual Servo  (v)       : 키보드 'v'와 동일, 비주얼 서보 ON/OFF (체크형 버튼)
+  Save Target Pose  (s)   : 현재 pose를 목표 pose로 저장
+  Trigger Log  (l)        : TCP 궤적 로깅 트리거 (10초간 데이터 수집, 위 1번 L 항목 참고)
+
+[Robot State 패널] (읽기 전용, 실시간 상태 표시)
+  Mode  : 현재 제어 모드 이름 (Gravity Comp / Full Dynamics / Comp. Torque / IK(i) / IK 6DOF(m))
+  VS    : Visual Servo 상태 (IDLE / TRACKING / TAG_LOST / SINGULARITY, 색상으로도 표시)
+  Log   : 로깅 ON/OFF 여부
+
+[TCP Pose 패널] (읽기 전용)
+  x, y, z, roll, pitch, yaw 현재 TCP pose 실시간 표시
+
+[Status Log 패널]
+  모든 송신 커맨드 / 수신 이벤트 / 에러 로그가 타임스탬프와 함께 누적 표시
+
+[우측 RealSense Camera 패널]
+  실시간 카메라 프리뷰 표시. VS(Visual Servo) 활성화 시 카메라 장치를 C++쪽에
+  넘겨주기 위해 UI 쪽 카메라 스트림을 자동 정지, VS 종료 시 0.8s 후 자동 재시작.
+
+[우측 하단 Plots 탭]
+  Data Log 탭
+    Browse DataLog CSV…  : rt_log_results 폴더에서 CSV 로그 파일 선택 (다중 선택 가능)
+    Plot                 : 선택한 CSV들로 3D 궤적 / XY 투영 / TCP-시간 그래프 +
+                            pose·orientation 오차 바 차트 생성
+    Save PNG              : 그려진 그래프를 rt_log_results/plots/에 PNG로 저장
+
+  Metadata 탭
+    로봇 이름/축 개수/시뮬레이션 여부/EtherCAT 상태, 마스터·슬레이브·도메인 상태,
+    각 축(Axis)별 위치/속도/가속도 범위 등 로봇 메타데이터를 텍스트로 표시
+    (통신 없이 로봇에서 push되는 메타데이터를 수신해 표시만 함)
+
+  Calibration 탭 (Eye-to-Hand 캘리브레이션 워크플로우, 모두 외부 프로세스 실행)
+    Step 1) Run save_camera_params → camera.xml
+        : 카메라 내부 파라미터 저장 프로그램 실행
+    Step 2) Start New Session
+        : 기존 캡처 파일(pose_cPo_*.yaml, image*.png) 삭제 후 세션 초기화
+      Capture #N
+        : 현재 로봇 pose(rPe) + 카메라 프레임을 동시 캡처하여 저장 (백그라운드 스레드)
+    Step 3) Run visp-compute-apriltag-poses
+        : 캡처된 이미지들에서 AprilTag pose(cPo) 계산
+    Step 4) Run eye_to_hand_calib.py
+        : AX=ZB 캘리브레이션 계산 → rPc.yaml 생성, 계산 후 자동으로 시각화 갱신
+      Apply to VS
+        : rPc.yaml 확인 후 로봇에 VS_REINIT 명령 전송 → VisualServo가 새 캘리브레이션 값 재로드
+    Show / Refresh (우측 시각화)
+        : rPc.yaml 기반으로 로봇 베이스-카메라 좌표계 관계를 3D로 시각화,
+          캡처된 rPe 포인트들도 함께 표시
+
+--------------------------------------------------------------------------------
+[참고] 통신 방식 (간략)
+  UI는 TCP 소켓으로 로봇 제어 프로세스와 통신한다. 버튼을 누르면 종류별로
+  구분된 짧은 커맨드 코드가 전송되고(Set Target Pose만 x/y/z/roll/pitch/yaw
+  6개 double 값을 함께 실어 보냄), 로봇 쪽 콜백이 이를 받아 위 표에 정리된
+  동작을 실행한다. Home 버튼도 이 경로로 커맨드는 정상 전송되지만, 로봇 쪽
+  핸들러가 "Home mode disabled" 로그만 남기는 빈 처리로 되어 있어 실제
+  동작으로 이어지지 않는다.
+--------------------------------------------------------------------------------
+
+================================================================================
+3. 요약 — 호밍(Home) 관련 현재 상태
+================================================================================
+  - 키보드 'H'/'h'      : "Home mode disabled" 경고만 출력, 동작 없음
+  - UI "Home (h)" 버튼   : 커맨드는 전송되나 로봇 쪽에서 동일하게
+                           "Home mode disabled" 로그만 출력, 동작 없음
+  - CRobotIndy7::DoHoming() : 빈 함수 `{}` (Indy7Ctrl.h), 어디서도 호출되지 않음
+  → 안정성 문제로 인해 UI/키보드 양쪽 경로 모두 의도적으로 막아놓은 상태(TEMPORARY 주석).
